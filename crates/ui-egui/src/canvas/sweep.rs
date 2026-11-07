@@ -1,6 +1,7 @@
-//! Gradual full redraws of a large GPU canvas. Where the canvas would recomposite the whole
-//! document in one frame (a change nothing bounded), it redraws it in blocks instead, a frame's
-//! budget at a time, the blocks in view first. On a gigapixel canvas the one-frame redraw took over
+//! Gradual redraws of a large GPU canvas. Where the canvas would recomposite a large area in one
+//! frame (the whole document for a change nothing bounded, the first draw of a document, or a
+//! change that bounded but large, like committing a transform of a big layer), it redraws it in
+//! blocks instead, a frame's budget at a time, the blocks in view first. On a gigapixel canvas the one-frame redraw took over
 //! a second on the UI thread, long enough for a Wayland compositor to drop the window; in blocks
 //! the window keeps answering, and until a block is redrawn it shows what it showed before.
 //!
@@ -25,6 +26,10 @@ use crate::gpu_canvas::GpuCanvas;
 
 /// Canvases this large (64 MP: 8192 × 8192) redraw in blocks; smaller ones are quick in one go.
 pub(crate) const SWEEP_MIN_PX: u64 = 64 << 20;
+
+/// On such a canvas, a redraw of at least this area goes in blocks too (16 MP, a few tenths of
+/// a second in one frame on the gigapixel canvas this was measured on).
+pub(crate) const SWEEP_REGION_PX: u64 = 16 << 20;
 
 /// A block in document pixels: 2 MP, whole render tiles, a few milliseconds each, and under
 /// [`crate::gpu_canvas::DEFER_PX`], so the compositor treats each as a small refresh.
@@ -71,6 +76,18 @@ pub(crate) fn running(app: &PhotocraftApp, doc: DocId) -> bool {
 pub(crate) fn start(app: &mut PhotocraftApp, doc: &Document, visible: Rect) {
     let state = app.canvas_states.entry(doc.id).or_default();
     state.pending = blocks(doc.bounds(), visible);
+}
+
+/// Add `region` of `doc`'s canvas to its sweep, drawn before what was already pending.
+pub(crate) fn add(app: &mut PhotocraftApp, doc: &Document, region: Rect, visible: Rect) {
+    let region = region.intersect(&doc.bounds());
+    if region.is_empty() {
+        return;
+    }
+    let state = app.canvas_states.entry(doc.id).or_default();
+    // Popped from the end: the new blocks first. A block pending twice is drawn twice, which
+    // is only wasted time, never a wrong pixel.
+    state.pending.extend(blocks(region, visible));
 }
 
 /// Forget a sweep that failed, after a full refresh landed.

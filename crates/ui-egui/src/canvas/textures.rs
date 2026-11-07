@@ -591,12 +591,27 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
         return false;
     }
     let partial = present && damage.is_some();
-    // Everything changed (or nothing says what): on a large canvas, redraw it in blocks over the
-    // next frames instead of in this one (`sweep`), the view first.
-    if !partial && present && crate::canvas::sweep::eligible(app, &doc) {
+    // On a large canvas, a large redraw goes in blocks over the next frames instead of all in
+    // this one (`sweep`), the view first: everything (nothing says what changed), the first draw
+    // of the document, or a large changed area (a big layer's transform committed).
+    let sweep = if !crate::canvas::sweep::eligible(app, &doc) {
+        None
+    } else if partial {
+        damage.filter(|r| r.size().area() >= crate::canvas::sweep::SWEEP_REGION_PX).map(|r| (r, false))
+    } else if present || gpu.prepare_texture(id.0, &doc).is_some() {
+        Some((doc.bounds(), true))
+    } else {
+        None
+    };
+    if let Some((region, everything)) = sweep {
         crate::background_redraw::cancel(app, id);
-        gpu_budget(app, &gpu, idx, false, visible);
-        crate::canvas::sweep::start(app, &doc, visible);
+        gpu_budget(app, &gpu, idx, partial, visible);
+        // A compared change (`from_diff`) sweeps everything: the safety net below, in one.
+        if everything || from_diff {
+            crate::canvas::sweep::start(app, &doc, visible);
+        } else {
+            crate::canvas::sweep::add(app, &doc, region, visible);
+        }
         if crate::canvas::sweep::step(app, ctx, &gpu, &doc, display.as_deref()) != crate::canvas::sweep::Step::Failed {
             crate::render_path::note(app, id.0, crate::render_path::Path::Gpu { full: false });
             crate::canvas::sweep::shown(app, &doc, display_key);
@@ -609,6 +624,9 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
             return true;
         }
         // A block didn't redraw on the GPU: redraw in one go, as before.
+        if let Some(s) = app.canvas_states.get_mut(&id) {
+            s.shown = None;
+        }
     }
     let budget_start = crate::gpu_canvas::now_ms();
     gpu_budget(app, &gpu, idx, partial, visible);
