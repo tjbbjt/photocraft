@@ -1,11 +1,16 @@
 use super::PhotocraftApp;
 
-/// `surface`'s pixels in `b` as straight RGBA8 bytes, row by row.
+/// `surface`'s pixels in `b` as straight RGBA8 bytes, row by row (read in parallel bands).
 fn rgba8(surface: &photocraft_raster::Surface, b: photocraft_geom::Rect) -> Vec<u8> {
-    let mut px = vec![[0u8; 4]; b.width() as usize * b.height() as usize];
-    surface.read_rgba8_into(b, &mut px);
-    px.into_flattened()
+    photocraft_algo::selection::rgba8_image(surface, b).into_flattened()
 }
+
+/// The largest copy mirrored to the OS clipboard, in pixels (64 MP: 256 MiB of RGBA, an
+/// 8192 × 8192 image). Larger clips stay PhotoCraft's own: Paste inside PhotoCraft is
+/// unaffected. Beyond this the mirror costs gigabytes of RGBA, and the clipboard library
+/// encodes it as PNG on the UI thread when the OS takes it, which froze the window for as long
+/// as that took; few other apps could open such an image anyway.
+pub(crate) const MAX_OS_CLIPBOARD_PIXELS: u64 = 64 << 20;
 
 fn clip_signature(w: u32, h: u32, px: &[u8]) -> u64 {
     let mut sig = (w as u64) << 32 | h as u64;
@@ -105,6 +110,10 @@ impl PhotocraftApp {
         let Some(clip) = self.session.clipboard.as_ref() else { return };
         let b = clip.bounds;
         if b.is_empty() {
+            return;
+        }
+        if b.size().area() > MAX_OS_CLIPBOARD_PIXELS {
+            log::info!("copy of {}×{} px kept in PhotoCraft: too large for the system clipboard", b.width(), b.height());
             return;
         }
         if self.background_jobs {

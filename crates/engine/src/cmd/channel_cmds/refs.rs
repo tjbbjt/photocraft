@@ -289,6 +289,48 @@ pub(super) fn resolve_source(s: &Session, p: &Value, cmd: &str, gray: bool) -> R
 }
 
 impl ResolvedSource {
+    /// A layer's transparency over only the part of the canvas it can cover, as `(band, plane)`:
+    /// the plane is the layer's alpha inside `band` and the layer is transparent outside it.
+    /// `None` when the source is not one layer's own transparency with a transparent default
+    /// pixel (merged, inverted, a Background without alpha, a shape with no pixel cache): use
+    /// [`Self::planes`] then.
+    ///
+    /// [`Self::planes`] reads the whole canvas as RGBA `f32` to keep one channel of it: on a
+    /// gigapixel canvas that is tens of gigabytes of working memory and seconds of conversion,
+    /// even for a layer that covers a corner. This reads the alpha samples alone, only inside
+    /// the layer's tiles, in parallel rows.
+    pub(super) fn transparency_band(&self) -> Option<(photocraft_geom::Rect, Vec<f32>)> {
+        if self.r != ChanRef::Transparency || self.merged_transparency || self.invert {
+            return None;
+        }
+        let doc = &*self.doc;
+        let s = doc.layer(self.layer.or(self.active)?)?.surface()?;
+        let fmt = s.format();
+        if !fmt.alpha {
+            return None;
+        }
+        let a = fmt.mode.color_channels();
+        // Untiled pixels read as the default pixel: it must be transparent for them to be skipped.
+        if s.default_pixel().get(a).is_none_or(|v| *v != 0.0) {
+            return None;
+        }
+        let band = s.tile_bounds().intersect(&doc.bounds());
+        if band.is_empty() {
+            return Some((photocraft_geom::Rect::EMPTY, Vec::new()));
+        }
+        let w = band.width() as usize;
+        let mut plane = vec![0.0f32; w * band.height() as usize];
+        let row = |(i, out): (usize, &mut [f32])| s.sample_row_strided(band.y0 + i as i32, band.x0, 1, a, out);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            plane.par_chunks_mut(w).enumerate().for_each(row);
+        }
+        #[cfg(target_arch = "wasm32")]
+        plane.chunks_mut(w).enumerate().for_each(row);
+        Some((band, plane))
+    }
+
     /// The source's planes over its document's canvas (the heavy part of [`source`]).
     pub(super) fn planes(&self, cmd: &str) -> Result<Vec<Vec<f32>>> {
         let doc = &*self.doc;

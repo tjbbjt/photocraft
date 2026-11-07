@@ -108,6 +108,13 @@ pub(super) fn load_selection(s: &mut Session, p: &Value) -> Result<Value> {
         true,
         move |ctx| {
             ctx.progress(0.0, "Reading channel");
+            // A layer's transparency (⌘-click its thumbnail): only the part the layer covers,
+            // combined as a band, never a canvas-sized plane (see `transparency_band`).
+            if let Some((band, plane)) = src.transparency_band() {
+                ctx.check()?;
+                ctx.progress(0.5, "Making selection");
+                return Ok(sel::combine_band(old.as_ref(), &plane, band, mode));
+            }
             let plane = src.planes(cmd)?.into_iter().next().ok_or_else(|| bad(cmd, "the channel has no pixels"))?;
             ctx.check()?;
             ctx.progress(0.5, "Making selection");

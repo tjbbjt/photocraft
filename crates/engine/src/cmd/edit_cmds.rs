@@ -219,6 +219,8 @@ fn lift(src: &Surface, sel: Option<&Surface>, canvas: Rect) -> Result<Clip> {
     // Only the selected area is read: converting the whole layer (a 24 MP Background gaining
     // alpha) cost about a second per Layer via Copy (#668).
     let mut shared = Vec::new();
+    let mut convert = Vec::new();
+    let blank_default = fmt.alpha && src.default_pixel().iter().all(|v| *v == 0.0);
     for tc in area.tiles() {
         let tr = tc.rect().intersect(&area);
         if fmt.alpha
@@ -230,8 +232,33 @@ fn lift(src: &Surface, sel: Option<&Surface>, canvas: Rect) -> Result<Clip> {
             shared.push((tc, tile.clone()));
             continue;
         }
-        let px = lift_region(src, sel, tr, with_alpha.channels())?;
-        out.try_write_region(tr, &px).map_err(|e| EngineError::Other(format!("not enough memory while copying pixels ({e}); the document was not changed")))?;
+        // Nothing to copy where the layer has no tiles and its default pixel is all zero: the
+        // clip's own default, so converting would write tiles that `prune` drops again.
+        if blank_default && !src.has_tiles_in(tr) {
+            continue;
+        }
+        convert.push(tr);
+    }
+    // The rest is converted tile by tile in parallel (a layer without alpha, a partial
+    // selection: every tile on a gigapixel canvas), a bounded batch at a time so at most a
+    // few tiles per thread are held as `f32` at once. Same pixels as converting them in order.
+    let n = with_alpha.channels();
+    #[cfg(not(target_arch = "wasm32"))]
+    let batch = rayon::current_num_threads().max(1) * 4;
+    #[cfg(target_arch = "wasm32")]
+    let batch = 1;
+    for rects in convert.chunks(batch) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let lifted: Vec<Result<Vec<f32>>> = {
+            use rayon::prelude::*;
+            rects.par_iter().map(|tr| lift_region(src, sel, *tr, n)).collect()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let lifted: Vec<Result<Vec<f32>>> = rects.iter().map(|tr| lift_region(src, sel, *tr, n)).collect();
+        for (tr, px) in rects.iter().zip(lifted) {
+            out.try_write_region(*tr, &px?)
+                .map_err(|e| EngineError::Other(format!("not enough memory while copying pixels ({e}); the document was not changed")))?;
+        }
     }
     out.put_tiles(shared);
     out.prune();
