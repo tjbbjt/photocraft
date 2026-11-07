@@ -1,0 +1,46 @@
+# Build an unsigned single-file Flatpak from this branch, for testing a fix before a release.
+# Run it from the Actions tab (Flatpak test build > Run workflow); the .flatpak is attached to
+# the run as an artifact. Install it with:
+#
+#   flatpak install --user ./photocraft-<version>-linux-x86_64.flatpak
+#
+# It uses the same scripts as the release (packaging/linux/package.sh and flatpak-bundle.sh)
+# but none of the signing secrets, so it works in a fork.
+name: Flatpak test build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  flatpak:
+    # Same base as the release binaries: glibc 2.35, so they run on newer distros.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
+            libgtk-3-dev flatpak flatpak-builder librsvg2-common appstream desktop-file-utils
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build and package the Linux tarball
+        run: packaging/linux/package.sh --formats tar
+
+      - name: Repackage it as a Flatpak bundle
+        run: packaging/linux/flatpak-bundle.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-flatpak
+          path: dist/release/*.flatpak
+          retention-days: 14

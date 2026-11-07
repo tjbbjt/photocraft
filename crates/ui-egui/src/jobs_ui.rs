@@ -462,6 +462,7 @@ pub fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
     for e in app.session.poll_jobs() {
         on_event(app, ctx, e);
     }
+    app.poll_os_clipboard_export(ctx);
     // A focused open tab that ended (or was cancelled elsewhere) gives way to the documents.
     if app.jobs.focus.is_some_and(|j| !app.jobs.opens.iter().any(|o| o.job == j)) {
         app.jobs.focus = app.jobs.opens.last().map(|o| o.job);
@@ -641,6 +642,23 @@ fn on_event(app: &mut PhotocraftApp, ctx: &egui::Context, e: JobEvent) {
         JobOutcome::Done(ref result) if matches!(e.command.as_str(), "file.print" | "file.printOneCopy") => {
             app.sync_views();
             crate::file_ui::print_status(app, result);
+        }
+        JobOutcome::Done(_) if matches!(e.command.as_str(), "edit.copy" | "edit.copyMerged") => {
+            // As for an inline copy: the clip is ours now, and goes to the OS clipboard.
+            app.clip_external = false;
+            app.export_os_clipboard();
+            app.ui.status = e.label;
+            app.ui.status_error = false;
+        }
+        JobOutcome::Done(ref result) if e.command == "select.loadSelection" => {
+            app.sync_views();
+            // As for an inline selection command (#5597): a new selection shows its outline
+            // even after View > Extras was hidden.
+            if result.get("selected") == Some(&Value::Bool(true)) {
+                app.ui.view.extras = true;
+            }
+            app.ui.status = e.label;
+            app.ui.status_error = false;
         }
         JobOutcome::Done(_) if cancelled_batch => {
             app.ui.status = crate::i18n::fmt(tl!("Cancelled {label}"), &[("label", &e.label)]);
