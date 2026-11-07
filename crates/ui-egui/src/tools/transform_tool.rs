@@ -107,6 +107,55 @@ enum WarpDrag {
 
 /// Preview state that isn't serialisable: the document without the transformed pixels, and
 /// full-resolution textures of those pixels (transform_tex.rs).
+/// A large layer's box being prepared as a job (`begin::on_prepared` opens it when it lands).
+pub(crate) struct Preparing {
+    job: JobId,
+    out: Arc<std::sync::Mutex<Option<begin::Prepared>>>,
+    finish: Box<dyn FnOnce(&mut PhotocraftApp, begin::Prepared) -> Result<(), String>>,
+}
+
+/// The canvas key of an open box's preview document (`display_doc`).
+pub(crate) fn preview_key(session: u64) -> u64 {
+    (1 << 40) + session
+}
+
+/// Where the document under an open box differs from the document itself: the moving layer
+/// (hidden, or its selected pixels lifted out) and the layers drawn over the box instead
+/// ([`preview::Above`]). Kept from when the box opens until the next one, so opening, cancelling
+/// and committing redraw that area instead of the whole canvas.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OpenArea {
+    pub doc: DocId,
+    pub key: u64,
+    /// The document revision the preview was built from.
+    pub revision: u64,
+    pub area: photocraft_geom::Rect,
+}
+
+/// The canvas damage between the document and an open box's preview of it, either way, at the
+/// revision the box opened on; on a commit (one revision later) also what the commit changed.
+/// `None` (redraw everything) for anything else, e.g. a box that followed an edit while open.
+pub(crate) fn damage(
+    app: &PhotocraftApp,
+    doc: DocId,
+    seen: (u64, u64),
+    now: (u64, u64),
+    last_damage: Option<photocraft_geom::Rect>,
+) -> Option<photocraft_geom::Rect> {
+    let o = app.transform_area.filter(|o| o.doc == doc)?;
+    let opening = seen.1 == 0 && now.1 == o.key && seen.0 == o.revision && now.0 == o.revision;
+    let cancelled = seen.1 == o.key && now.1 == 0 && seen.0 == o.revision && now.0 == o.revision;
+    if opening || cancelled {
+        return Some(o.area);
+    }
+    // Committed: the box's preview, replaced by the document with the transform applied.
+    if seen.1 == o.key && now.1 == 0 && seen.0 == o.revision && now.0 == o.revision + 1 {
+        let done = last_damage?;
+        return Some(if done.is_empty() { o.area } else { o.area.union(&done) });
+    }
+    None
+}
+
 pub struct TransformPreview {
     pub session: u64,
     pub doc: Arc<Document>,

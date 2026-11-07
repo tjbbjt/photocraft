@@ -584,6 +584,40 @@ fn paste_into_each_selected_layer_masks_one_copy_to_each_layer() {
 }
 
 #[test]
+fn paste_into_each_uses_the_thumbnails_that_built_the_selection() {
+    let mut s = session(8);
+    let first = active(&s).id;
+    paint_square(&mut s, Rect::new(0, 0, 10, 10), [1.0, 0.0, 0.0, 1.0]);
+    s.execute("layer.new.layer", json!({})).unwrap();
+    let second = active(&s).id;
+    paint_square(&mut s, Rect::new(20, 10, 30, 20), [0.0, 1.0, 0.0, 1.0]);
+    s.execute("layer.new.layer", json!({})).unwrap();
+    paint_square(&mut s, Rect::new(14, 4, 18, 8), [0.0, 0.0, 1.0, 1.0]);
+    s.execute("select.all", json!({})).unwrap();
+    s.execute("edit.copy", json!({})).unwrap();
+    // ⌘-click the first frame's thumbnail, ⌘⇧-click the second's; only the art layer is
+    // selected in the Layers panel.
+    let load = |s: &mut Session, id: LayerId, op: &str| {
+        s.execute("select.loadSelection", json!({"channel": "transparency", "layer": id.0, "operation": op})).unwrap();
+    };
+    load(&mut s, first, "new");
+    load(&mut s, second, "add");
+    assert_eq!(s.active().unwrap().selection_sources(), Some(vec![first, second]));
+    let layers_before = doc(&s).layers.len();
+    let made = s.execute("edit.pasteSpecial.pasteIntoEach", json!({})).unwrap()["layers"].as_array().unwrap().len();
+    assert_eq!(made, 2, "one copy per clicked thumbnail");
+    assert_eq!(doc(&s).layers.len(), layers_before + 2);
+
+    // Any other change to the selection forgets the thumbnails.
+    load(&mut s, first, "new");
+    s.execute("select.rect", json!({"x": 0, "y": 0, "width": 4, "height": 4})).unwrap();
+    assert_eq!(s.active().unwrap().selection_sources(), None);
+    load(&mut s, first, "new");
+    load(&mut s, second, "subtract");
+    assert_eq!(s.active().unwrap().selection_sources(), None, "only ⌘-click and ⌘⇧-click build the list");
+}
+
+#[test]
 fn option_click_eye_shows_one_layer_then_restores() {
     let mut s = session(8);
     s.execute("layer.new.layer", json!({})).unwrap();

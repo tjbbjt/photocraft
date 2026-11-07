@@ -622,6 +622,12 @@ pub struct PhotocraftApp {
     /// The session clipboard's RGBA8 pixels, being converted on a worker for the OS clipboard
     /// (see `export_os_clipboard`); `None` when no conversion is running.
     os_clip_export: Option<std::sync::mpsc::Receiver<(u32, u32, Vec<u8>)>>,
+    /// The canvas area the last Free Transform box's preview changes (`transform_tool::damage`).
+    transform_area: Option<crate::transform_tool::OpenArea>,
+    /// A large layer's Free Transform box being prepared in the background.
+    transform_preparing: Option<crate::transform_tool::Preparing>,
+    /// Per document: what its GPU canvas last showed and any redraw in blocks (`canvas::sweep`).
+    pub(crate) canvas_states: crate::canvas::sweep::CanvasStates,
     /// The session clipboard currently holds an image imported from the OS clipboard: it has no
     /// original position, so Paste centres it (see `menus` "edit.paste").
     pub(crate) clip_external: bool,

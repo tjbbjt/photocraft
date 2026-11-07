@@ -339,6 +339,13 @@ pub(crate) fn damage_since(app: &PhotocraftApp, idx: usize, seen: (u64, u64), no
     if seen.1 == now.1 ^ display_key && seen.0 + 1 == now.0 {
         return last_damage;
     }
+    // Opening, cancelling or committing a Free Transform box: the moving layer and the layers
+    // drawn over the box, not the whole document (a gigapixel canvas took over a second).
+    if let Some(st) = app.session.documents().get(idx)
+        && let Some(r) = crate::transform_tool::damage(app, st.doc.id, (seen.0, seen.1 ^ display_key), now, last_damage)
+    {
+        return Some(if r.is_empty() { r } else { r.inflate(effect_reach(&st.doc.layers)) });
+    }
     if seen.0 == now.0
         && let Some(st) = app.session.documents().get(idx)
         && let Some(r) = crate::type_transform::damage(app, st.doc.id, now.0, seen.1 ^ display_key, now.1)
@@ -492,6 +499,19 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
         damage = Some(crate::adjust_preview::live_switch_damage(app, raw_key, r, visible));
     }
     let preview_key = raw_key ^ display_key;
+    // Nothing said what changed: compare with the document the canvas last showed
+    // (`doc_diff`), so a change no tool or preview bounds still redraws only where it can
+    // differ. A sweep then redraws the rest as a safety net (below).
+    let mut from_diff = false;
+    // Desktop only, as the sweep that backs it up (`sweep::eligible`).
+    if damage.is_none()
+        && app.background_jobs
+        && seen.is_some_and(|s| s != (revision, preview_key))
+        && let Some(r) = crate::canvas::sweep::changed_since_shown(app, &doc, display_key)
+    {
+        damage = Some(if r.is_empty() { r } else { r.inflate(effect_reach(&doc.layers)) });
+        from_diff = true;
+    }
     // The Navigator may draw this texture while it holds the plain document or a drag preview
     // that updates the full texture (not an adjustment preview composited only where the view is).
     if raw_key == 0 || navigator_waits_for_drag(app, idx) {
@@ -530,6 +550,17 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
         let fit = gpu.measure_fit(&doc).unwrap_or(crate::gpu_canvas::LayerFit { doc: id.0, needed: 0, budget: 0 });
         crate::render_path::layer_fit(app, fit);
     }
+    if present && current && crate::canvas::sweep::running(app, id) {
+        gpu_budget(app, &gpu, idx, true, visible);
+        if crate::canvas::sweep::step(app, ctx, &gpu, &doc, display.as_deref()) == crate::canvas::sweep::Step::Failed {
+            // Redraw in one go next frame, as before sweeps.
+            if let Some(c) = app.canvases.get_mut(&(id, GPU_OUTPUT)) {
+                c.revision = 0;
+            }
+            ctx.request_repaint();
+        }
+        return true;
+    }
     if present && current {
         // An adjustment preview composited where the view was: catch up where it moved to.
         if let Some(r) = crate::adjust_preview::uncovered(app, id, raw_key, visible) {
@@ -560,6 +591,25 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
         return false;
     }
     let partial = present && damage.is_some();
+    // Everything changed (or nothing says what): on a large canvas, redraw it in blocks over the
+    // next frames instead of in this one (`sweep`), the view first.
+    if !partial && present && crate::canvas::sweep::eligible(app, &doc) {
+        crate::background_redraw::cancel(app, id);
+        gpu_budget(app, &gpu, idx, false, visible);
+        crate::canvas::sweep::start(app, &doc, visible);
+        if crate::canvas::sweep::step(app, ctx, &gpu, &doc, display.as_deref()) != crate::canvas::sweep::Step::Failed {
+            crate::render_path::note(app, id.0, crate::render_path::Path::Gpu { full: false });
+            crate::canvas::sweep::shown(app, &doc, display_key);
+            if let Some(cache) = app.canvases.get_mut(&(id, GPU_OUTPUT)) {
+                cache.revision = revision;
+                cache.preview_key = preview_key;
+                cache.on_gpu = true;
+                cache.texture = None;
+            }
+            return true;
+        }
+        // A block didn't redraw on the GPU: redraw in one go, as before.
+    }
     let budget_start = crate::gpu_canvas::now_ms();
     gpu_budget(app, &gpu, idx, partial, visible);
     app.perf.stage.damage_ms += crate::gpu_canvas::now_ms() - budget_start;
@@ -598,6 +648,24 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     }
     if r.kind.starts_with("gpu") {
         app.perf.gpu_uploads = r.uploads;
+    }
+    // Drawn on the GPU, or nothing to draw ("rect" without a fallback): the texture holds `doc`.
+    if r.fallback.is_none() && (r.kind.starts_with("gpu") || r.kind == "rect") {
+        if r.kind == "gpu-full" {
+            crate::canvas::sweep::full_refresh_landed(app, id);
+        }
+        crate::canvas::sweep::shown(app, &doc, display_key);
+        // The compared area was drawn; redraw the rest in blocks too, so anything the
+        // comparison missed shows only for a moment.
+        if from_diff && crate::canvas::sweep::eligible(app, &doc) {
+            crate::canvas::sweep::start(app, &doc, visible);
+            ctx.request_repaint();
+        }
+    } else {
+        // Not drawn on the GPU this time: nothing to compare against next time.
+        if let Some(s) = app.canvas_states.get_mut(&id) {
+            s.shown = None;
+        }
     }
     let Some(cache) = app.canvases.get_mut(&(id, GPU_OUTPUT)) else { return true };
     cache.revision = revision;

@@ -299,6 +299,13 @@ impl ResolvedSource {
     /// gigapixel canvas that is tens of gigabytes of working memory and seconds of conversion,
     /// even for a layer that covers a corner. This reads the alpha samples alone, only inside
     /// the layer's tiles, in parallel rows.
+    /// The layer whose own transparency this loads (⌘-click on its thumbnail), if any, and only
+    /// in the document `doc_id`: what Paste Into Each Selected Layer remembers per click.
+    pub(super) fn transparency_layer(&self, doc_id: photocraft_doc::DocId) -> Option<LayerId> {
+        let own = self.r == ChanRef::Transparency && !self.merged_transparency && !self.invert && self.doc.id == doc_id;
+        own.then(|| self.layer.or(self.active)).flatten()
+    }
+
     pub(super) fn transparency_band(&self) -> Option<(photocraft_geom::Rect, Vec<f32>)> {
         if self.r != ChanRef::Transparency || self.merged_transparency || self.invert {
             return None;
