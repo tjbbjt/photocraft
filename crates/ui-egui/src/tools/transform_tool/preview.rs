@@ -78,9 +78,6 @@ pub(super) struct Above {
     pub(super) max_side: usize,
     /// The covering layers (whole layers or groups, at any depth).
     pub(super) ids: Vec<LayerId>,
-    /// Adjustment layers over the covering ones: they stay in the document under the box as well,
-    /// and are composited with the covering layers so those keep the adjustment.
-    pub(super) applied: Vec<LayerId>,
     /// Their composite and the canvas area it covers; `None` when nothing visible covers the layer.
     pub(super) shown: Option<(crate::transform_tex::PreviewTextures, photocraft_geom::Rect)>,
 }
@@ -89,7 +86,6 @@ pub(super) struct Above {
 /// [`Above`], so the composite ([`AbovePlan::image`]) can run off the UI thread.
 pub(super) struct AbovePlan {
     pub(super) ids: Vec<LayerId>,
-    pub(super) applied: Vec<LayerId>,
     up: Document,
     rect: photocraft_geom::Rect,
 }
@@ -111,7 +107,7 @@ impl AbovePlan {
             .filter(|l| l.visible)
             .fold(photocraft_geom::Rect::EMPTY, |r, l| r.union(&photocraft_compose::composite_bounds(l, canvas).unwrap_or(canvas)))
             .intersect(&canvas);
-        Self { ids, applied, up, rect }
+        Self { ids, up, rect }
     }
 
     /// How many canvas pixels the covering composite spans.
@@ -162,7 +158,7 @@ impl Above {
         shown: Option<crate::transform_tex::PreviewTextures>,
     ) -> Self {
         let shown = shown.map(|t| (t, plan.rect));
-        Self { ctx: ctx.clone(), name, max_side, ids: plan.ids, applied: plan.applied, shown }
+        Self { ctx: ctx.clone(), name, max_side, ids: plan.ids, shown }
     }
 
     /// Composite what covers layer `id` of `doc` (the live document) again.
