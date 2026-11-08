@@ -59,6 +59,60 @@ struct Totals {
     gpu_px: u64,
     /// Layer tiles the blocks uploaded to the GPU (pages it didn't hold).
     uploads: u64,
+    /// What the compositor did over the sweep (summed) and planning the document once (timed when
+    /// the sweep starts): where a slow sweep's UI-thread time goes.
+    work: Work,
+}
+
+/// Compositor work summed over a sweep's blocks, for its log line.
+#[derive(Clone, Copy, Debug, Default)]
+struct Work {
+    plan_ms: f64,
+    passes: usize,
+    fx_layers: usize,
+    chunks: u64,
+    batched: u64,
+    prefix_hits: u64,
+    fx_programs: u64,
+    fx_px: u64,
+    evicted: u64,
+    flushes: u64,
+}
+
+impl Work {
+    /// Plan `doc` once and time it: every block plans the whole document again.
+    fn planned(doc: &Document) -> Self {
+        let t0 = crate::gpu_canvas::now_ms();
+        let (passes, fx_layers) = photocraft_gpu::plan(doc).map_or((0, 0), |p| (p.passes.len(), p.fx.len()));
+        Work { plan_ms: crate::gpu_canvas::now_ms() - t0, passes, fx_layers, ..Work::default() }
+    }
+
+    fn add(&mut self, s: &photocraft_gpu::Stats) {
+        self.chunks += s.chunks as u64;
+        self.batched += s.layers_batched as u64;
+        self.prefix_hits += s.prefix_hits as u64;
+        self.fx_programs += s.fx_programs as u64;
+        self.fx_px += s.fx_pixels;
+        self.evicted += s.evicted as u64;
+        self.flushes += s.flushes as u64;
+    }
+
+    /// "; plan 0.4 ms × 378 blocks, 12 passes (1 with effects), 4536 chunks, …"
+    fn describe(&self, blocks: u32) -> String {
+        format!(
+            "; plan {:.1} ms x {blocks} blocks, {} passes ({} effect layers), {} chunks, {} layers batched, {} prefix reuses, {} effect maps ({:.0} MP), {} pages evicted, {} flushes",
+            self.plan_ms,
+            self.passes,
+            self.fx_layers,
+            self.chunks,
+            self.batched,
+            self.prefix_hits,
+            self.fx_programs,
+            self.fx_px as f64 / 1_048_576.0,
+            self.evicted,
+            self.flushes,
+        )
+    }
 }
 
 /// Per document: the document its GPU canvas last showed (what [`super::doc_diff`] compares
@@ -155,7 +209,7 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
     let started = crate::gpu_canvas::now_ms();
     let mut gpu_estimate = 0.0;
     if let Some(s) = app.canvas_states.get_mut(&doc.id) {
-        let totals = s.totals.get_or_insert(Totals { started_ms: started, ..Totals::default() });
+        let totals = s.totals.get_or_insert_with(|| Totals { started_ms: started, work: Work::planned(doc), ..Totals::default() });
         totals.frames += 1;
     }
     loop {
@@ -208,6 +262,9 @@ impl CanvasState {
             totals.px += block.size().area();
             totals.cpu_ms += r.composite_ms;
             totals.uploads += r.uploads;
+            if let Some(stats) = &r.stats {
+                totals.work.add(stats);
+            }
             if let Some(t) = r.gpu {
                 totals.gpu_ms += t.ms;
                 totals.gpu_px += t.px;
@@ -228,7 +285,7 @@ fn finish(app: &mut PhotocraftApp, gpu: &GpuCanvas, doc: DocId, step: Step) -> S
         let resident = gpu.compositor_bytes().map_or(0, |(pages, _)| pages);
         let budget = gpu.memory_budget().map_or_else(|| "?".into(), |b| mb(b).to_string());
         log::info!(
-            "canvas: redrew {:.0} MP in {} blocks over {} frames, {:.0} ms ({:.0} ms encoding on the UI thread; GPU {gpu_rate}; uploaded {} layer tiles; layer pages {} of {budget} MB){}",
+            "canvas: redrew {:.0} MP in {} blocks over {} frames, {:.0} ms ({:.0} ms encoding on the UI thread; GPU {gpu_rate}; uploaded {} layer tiles; layer pages {} of {budget} MB{}){}",
             t.px as f64 / 1_048_576.0,
             t.blocks,
             t.frames,
@@ -236,6 +293,7 @@ fn finish(app: &mut PhotocraftApp, gpu: &GpuCanvas, doc: DocId, step: Step) -> S
             t.cpu_ms,
             t.uploads,
             mb(resident),
+            t.work.describe(t.blocks),
             if step == Step::Failed { "; stopped" } else { "" },
         );
     }
