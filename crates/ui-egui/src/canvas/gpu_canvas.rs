@@ -394,12 +394,6 @@ impl GpuCanvas {
         Some((d.format, bytes))
     }
 
-    /// The GPU memory the wgpu compositor may hold for layer pages and caches, as last set.
-    pub fn memory_budget(&self) -> Option<u64> {
-        let r = self.rs.renderer.read();
-        r.callback_resources.get::<Resources>()?.compositor_budget
-    }
-
     /// Set the GPU memory the wgpu compositor may hold for layer pages and caches (see
     /// [`memory_budget`]); pages beyond it are evicted least recently used first.
     pub fn set_memory_budget(&self, bytes: u64) {
