@@ -39,6 +39,9 @@ pub struct PreviewTextures {
 /// A source pixel shown at this many screen pixels or more counts as "zoomed in" (nearest).
 const CRISP_ZOOM: f32 = 2.0;
 
+/// [`PreviewTextures::mip_chain`] stops at a level this small; smaller ones are built on use.
+const CHAIN_MIN_SIDE: usize = 256;
+
 impl PreviewTextures {
     /// `image` covers the source with `base_uv` of its extent; `name` keys the texture in egui.
     pub fn new(ctx: &egui::Context, name: String, image: ColorImage, base_uv: [f32; 2]) -> Self {
@@ -51,6 +54,31 @@ impl PreviewTextures {
             base_uv,
             uploaded: Mutex::new(vec![Level { level: 0, display_key: 0, nearest: false, tex, uv: base_uv }]),
         }
+    }
+
+    /// [`Self::new`] for a mip chain built ahead ([`Self::mip_chain`], off the UI thread). Nothing
+    /// is uploaded until a level is drawn, and then only that level: zoomed out on a large layer
+    /// that is a small one, where uploading the full-resolution level at once (up to the GPU's
+    /// texture limit, hundreds of megabytes) stalled the frame the box opened in.
+    pub fn from_chain(name: String, chain: Vec<Arc<ColorImage>>, base_uv: [f32; 2]) -> Self {
+        let chain = if chain.is_empty() { vec![Arc::new(ColorImage::new([1, 1], vec![Color32::TRANSPARENT]))] } else { chain };
+        let base_uv = [base_uv[0].clamp(0.0, 1.0), base_uv[1].clamp(0.0, 1.0)];
+        Self { name, images: Mutex::new(chain), base_uv, uploaded: Mutex::new(Vec::new()) }
+    }
+
+    /// `image` and its box-filtered levels down to [`CHAIN_MIN_SIDE`] (any thread): what
+    /// [`Self::level_image`] would build on the UI thread when the level is first drawn.
+    pub fn mip_chain(image: ColorImage) -> Vec<Arc<ColorImage>> {
+        let mut chain = vec![Arc::new(image)];
+        loop {
+            let Some(last) = chain.last() else { break };
+            if last.size[0].max(last.size[1]) <= CHAIN_MIN_SIDE {
+                break;
+            }
+            let next = Arc::new(halve(last));
+            chain.push(next);
+        }
+        chain
     }
 
     /// Size of the full-resolution level in texels.
@@ -163,13 +191,21 @@ fn halve(img: &ColorImage) -> ColorImage {
     let (nw, nh) = (w.div_ceil(2).max(1), h.div_ceil(2).max(1));
     let mut out = vec![Color32::TRANSPARENT; nw * nh];
     let px = |x: usize, y: usize| img.pixels.get(y.min(h.saturating_sub(1)) * w + x.min(w.saturating_sub(1))).copied().unwrap_or_default();
-    for (y, row) in out.chunks_mut(nw).enumerate() {
+    let row = |(y, row): (usize, &mut [Color32])| {
         for (x, o) in row.iter_mut().enumerate() {
             let q = [px(2 * x, 2 * y), px(2 * x + 1, 2 * y), px(2 * x, 2 * y + 1), px(2 * x + 1, 2 * y + 1)];
             let avg = |c: fn(&Color32) -> u8| ((q.iter().map(|p| u32::from(c(p))).sum::<u32>() + 2) / 4) as u8;
             *o = Color32::from_rgba_premultiplied(avg(Color32::r), avg(Color32::g), avg(Color32::b), avg(Color32::a));
         }
+    };
+    // Rows in parallel: a level of a large layer is tens of megapixels.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        out.par_chunks_mut(nw).enumerate().for_each(row);
     }
+    #[cfg(target_arch = "wasm32")]
+    out.chunks_mut(nw).enumerate().for_each(row);
     ColorImage::new([nw, nh], out)
 }
 

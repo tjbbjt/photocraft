@@ -266,13 +266,26 @@ pub fn cancel(app: &mut PhotocraftApp) {
         crate::jobs_ui::cancel(app, job);
         return;
     }
+    let started = crate::gpu_canvas::now_ms();
     let transform = app.ui.transform.take();
     let preview = app.transform_preview.take();
-    if let (Some(t), Some(pv)) = (transform, preview)
+    if let (Some(t), Some(pv)) = (transform, preview.as_ref())
         && t.made.is_some()
     {
         take_back_made(app, pv.doc.id, LayerId(t.layer));
     }
+    if let Some(pv) = preview {
+        release(pv);
+    }
+    super::begin::log_slow("canceling", started);
+}
+
+/// Free a closed box's preview images on another thread: for a large layer they are hundreds of
+/// megabytes, and returning that much memory took a noticeable part of a frame.
+fn release(pv: super::TransformPreview) {
+    let super::TransformPreview { texture, above, .. } = pv;
+    // If the thread can't start, the images are freed here as before.
+    let _ = std::thread::Builder::new().name("photocraft-transform-release".into()).spawn(move || drop((texture, above)));
 }
 
 /// The session's starting box: where Undo stops.

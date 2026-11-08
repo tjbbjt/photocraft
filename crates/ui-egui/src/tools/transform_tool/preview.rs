@@ -149,7 +149,19 @@ impl Above {
 
     /// An `Above` from its plan and the composite made from it (on the UI thread: textures).
     pub(super) fn from_plan(ctx: &egui::Context, name: String, max_side: usize, plan: AbovePlan, image: Option<(egui::ColorImage, [f32; 2])>) -> Self {
-        let shown = image.map(|(image, uv)| (crate::transform_tex::PreviewTextures::new(ctx, name.clone(), image, uv), plan.rect));
+        let shown = image.map(|(image, uv)| crate::transform_tex::PreviewTextures::new(ctx, name.clone(), image, uv));
+        Self::with_textures(ctx, name, max_side, plan, shown)
+    }
+
+    /// [`Self::from_plan`] with the composite's textures already made.
+    pub(super) fn with_textures(
+        ctx: &egui::Context,
+        name: String,
+        max_side: usize,
+        plan: AbovePlan,
+        shown: Option<crate::transform_tex::PreviewTextures>,
+    ) -> Self {
+        let shown = shown.map(|t| (t, plan.rect));
         Self { ctx: ctx.clone(), name, max_side, ids: plan.ids, applied: plan.applied, shown }
     }
 
