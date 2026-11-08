@@ -17,7 +17,7 @@ permissions:
 jobs:
   binaries:
     # Same base as the release binaries: glibc 2.35, so they run on newer distros.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v5
