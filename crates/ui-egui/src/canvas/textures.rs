@@ -606,9 +606,14 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     if let Some((region, everything)) = sweep {
         crate::background_redraw::cancel(app, id);
         gpu_budget(app, &gpu, idx, partial, visible);
-        // A compared change (`from_diff`) sweeps everything: the safety net below, in one.
-        if everything || from_diff {
+        // A compared change (`from_diff`) sweeps everything, the safety net below in one, but
+        // the area it found changed is drawn first: on a canvas of hundreds of layers the whole
+        // sweep takes seconds, and what changed showed only when the sweep reached it.
+        if everything {
             crate::canvas::sweep::start(app, &doc, visible);
+        } else if from_diff {
+            crate::canvas::sweep::safety_net(app, &doc, visible);
+            crate::canvas::sweep::add(app, &doc, region, visible);
         } else {
             crate::canvas::sweep::add(app, &doc, region, visible);
         }
@@ -676,7 +681,7 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
         // The compared area was drawn; redraw the rest in blocks too, so anything the
         // comparison missed shows only for a moment.
         if from_diff && crate::canvas::sweep::eligible(app, &doc) {
-            crate::canvas::sweep::start(app, &doc, visible);
+            crate::canvas::sweep::safety_net(app, &doc, visible);
             ctx.request_repaint();
         }
     } else {

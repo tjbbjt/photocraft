@@ -158,6 +158,16 @@ pub(crate) fn start(app: &mut PhotocraftApp, doc: &Document, visible: Rect) {
     state.pending = blocks(doc.bounds(), visible, block_size(state.gpu_ms_per_mp));
 }
 
+/// The safety net behind a change bounded by comparing documents ([`super::doc_diff`]): redraw
+/// everything in blocks. A sweep already running is that net for the blocks it hasn't drawn, and
+/// restarting it would throw away the ones it has (each change, such as a transform's commit and
+/// the selection update after it, restarted a whole-canvas redraw), so it carries on instead.
+pub(crate) fn safety_net(app: &mut PhotocraftApp, doc: &Document, visible: Rect) {
+    if !running(app, doc.id) {
+        start(app, doc, visible);
+    }
+}
+
 /// Add `region` of `doc`'s canvas to its sweep, drawn before what was already pending.
 pub(crate) fn add(app: &mut PhotocraftApp, doc: &Document, region: Rect, visible: Rect) {
     let region = region.intersect(&doc.bounds());
