@@ -153,6 +153,8 @@ impl PhotocraftApp {
             os_clip_svg: None,
             clip_unmirrored: true,
             os_clip_export: None,
+            os_clip_left_app: true,
+            os_clip_exported_px: 0,
             transform_area: None,
             transform_preparing: None,
             canvas_states: Default::default(),

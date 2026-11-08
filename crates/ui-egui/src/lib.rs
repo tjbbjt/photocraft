@@ -622,6 +622,11 @@ pub struct PhotocraftApp {
     /// The session clipboard's RGBA8 pixels, being converted on a worker for the OS clipboard
     /// (see `export_os_clipboard`); `None` when no conversion is running.
     os_clip_export: Option<std::sync::mpsc::Receiver<(u32, u32, Vec<u8>)>>,
+    /// The window lost focus since our last image reached the OS clipboard, so another app may
+    /// have copied something (see `import_os_clipboard`).
+    os_clip_left_app: bool,
+    /// Pixels of our last image on the OS clipboard.
+    os_clip_exported_px: u64,
     /// The canvas area the last Free Transform box's preview changes (`transform_tool::damage`).
     transform_area: Option<crate::transform_tool::OpenArea>,
     /// A large layer's Free Transform box being prepared in the background.

@@ -24,8 +24,9 @@ use photocraft_geom::Rect;
 use crate::PhotocraftApp;
 use crate::gpu_canvas::GpuCanvas;
 
-/// Canvases this large (64 MP: 8192 × 8192) redraw in blocks; smaller ones are quick in one go.
-pub(crate) const SWEEP_MIN_PX: u64 = 64 << 20;
+/// Canvases this large (32 MP, about 8192 × 4096) redraw in blocks; smaller ones are quick in
+/// one go. (A 46 MP image's first draw took 0.8 s in one frame at 64 MP.)
+pub(crate) const SWEEP_MIN_PX: u64 = 32 << 20;
 
 /// On such a canvas, a redraw of at least this area goes in blocks too (16 MP, a few tenths of
 /// a second in one frame on the gigapixel canvas this was measured on).
@@ -56,6 +57,8 @@ struct Totals {
     cpu_ms: f64,
     gpu_ms: f64,
     gpu_px: u64,
+    /// Layer tiles the blocks uploaded to the GPU (pages it didn't hold).
+    uploads: u64,
 }
 
 /// Per document: the document its GPU canvas last showed (what [`super::doc_diff`] compares
@@ -156,7 +159,7 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
         totals.frames += 1;
     }
     loop {
-        let Some(block) = app.canvas_states.get_mut(&doc.id).and_then(|s| s.pending.pop()) else { return finish(app, doc.id, Step::Done) };
+        let Some(block) = app.canvas_states.get_mut(&doc.id).and_then(|s| s.pending.pop()) else { return finish(app, gpu, doc.id, Step::Done) };
         let r = gpu.refresh_with(doc.id.0, doc, Some(block), display, false);
         match (r.kind, &r.fallback) {
             ("gpu-rect" | "rect", None) => {}
@@ -165,7 +168,7 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
                 if let Some(s) = app.canvas_states.get_mut(&doc.id) {
                     s.pending.clear();
                 }
-                return finish(app, doc.id, Step::Done);
+                return finish(app, gpu, doc.id, Step::Done);
             }
             _ => {
                 log::info!("canvas: redrawing in blocks stopped ({}); redrawing in one go", r.kind);
@@ -173,14 +176,14 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
                     s.pending.clear();
                     s.failed = true;
                 }
-                return finish(app, doc.id, Step::Failed);
+                return finish(app, gpu, doc.id, Step::Failed);
             }
         }
         if let Some(s) = app.canvas_states.get_mut(&doc.id) {
             gpu_estimate += s.account(block, &r);
         }
         if !running(app, doc.id) {
-            return finish(app, doc.id, Step::Done);
+            return finish(app, gpu, doc.id, Step::Done);
         }
         let spent = (crate::gpu_canvas::now_ms() - started).max(gpu_estimate);
         if spent >= FRAME_BUDGET_MS {
@@ -204,6 +207,7 @@ impl CanvasState {
             totals.blocks += 1;
             totals.px += block.size().area();
             totals.cpu_ms += r.composite_ms;
+            totals.uploads += r.uploads;
             if let Some(t) = r.gpu {
                 totals.gpu_ms += t.ms;
                 totals.gpu_px += t.px;
@@ -214,19 +218,24 @@ impl CanvasState {
 }
 
 /// End of a sweep (or of its last frame): log its totals once it is over.
-fn finish(app: &mut PhotocraftApp, doc: DocId, step: Step) -> Step {
+fn finish(app: &mut PhotocraftApp, gpu: &GpuCanvas, doc: DocId, step: Step) -> Step {
     if step != Step::Continuing
         && let Some(t) = app.canvas_states.get_mut(&doc).and_then(|s| s.totals.take())
         && t.blocks > 0
     {
-        let gpu = if t.gpu_px > 0 { format!("{:.2} ms/MP", t.gpu_ms / (t.gpu_px as f64 / 1_048_576.0)) } else { "not measured".into() };
+        let gpu_rate = if t.gpu_px > 0 { format!("{:.2} ms/MP", t.gpu_ms / (t.gpu_px as f64 / 1_048_576.0)) } else { "not measured".into() };
+        let mb = |b: u64| b / (1 << 20);
+        let resident = gpu.compositor_bytes().map_or(0, |(pages, _)| pages);
+        let budget = gpu.memory_budget().map_or_else(|| "?".into(), |b| mb(b).to_string());
         log::info!(
-            "canvas: redrew {:.0} MP in {} blocks over {} frames, {:.0} ms ({:.0} ms encoding on the UI thread; GPU {gpu}){}",
+            "canvas: redrew {:.0} MP in {} blocks over {} frames, {:.0} ms ({:.0} ms encoding on the UI thread; GPU {gpu_rate}; uploaded {} layer tiles; layer pages {} of {budget} MB){}",
             t.px as f64 / 1_048_576.0,
             t.blocks,
             t.frames,
             crate::gpu_canvas::now_ms() - t.started_ms,
             t.cpu_ms,
+            t.uploads,
+            mb(resident),
             if step == Step::Failed { "; stopped" } else { "" },
         );
     }
