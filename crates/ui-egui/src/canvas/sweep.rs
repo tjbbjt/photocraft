@@ -155,7 +155,7 @@ pub(crate) fn running(app: &PhotocraftApp, doc: DocId) -> bool {
 /// (Re)start a sweep of all of `doc`'s canvas, the blocks nearest `visible` first.
 pub(crate) fn start(app: &mut PhotocraftApp, doc: &Document, visible: Rect) {
     let state = app.canvas_states.entry(doc.id).or_default();
-    state.pending = blocks(doc.bounds(), visible, block_size(state.gpu_ms_per_mp));
+    state.pending = blocks(doc.bounds(), doc.bounds(), visible, block_size(state.gpu_ms_per_mp));
 }
 
 /// The safety net behind a change bounded by comparing documents ([`super::doc_diff`]): redraw
@@ -182,9 +182,15 @@ pub(crate) fn add(app: &mut PhotocraftApp, doc: &Document, region: Rect, visible
         return;
     }
     let state = app.canvas_states.entry(doc.id).or_default();
-    // Popped from the end: the new blocks first. A block pending twice is drawn twice, which
-    // is only wasted time, never a wrong pixel.
-    state.pending.extend(blocks(region, visible, block_size(state.gpu_ms_per_mp)));
+    // Blocks sit on one grid over the canvas, so a block already pending is the same rectangle:
+    // it moves to the front instead of being queued again. A Move drag of a large layer adds its
+    // old and new place every frame; queued again each time, the sweep grew to several times
+    // the canvas (6375 MP over a minute) and the blocks of earlier places waited behind the
+    // newer ones. Popped from the end: the new blocks first.
+    let new = blocks(region, doc.bounds(), visible, block_size(state.gpu_ms_per_mp));
+    let queued: std::collections::HashSet<(i32, i32, i32, i32)> = new.iter().map(|b| (b.x0, b.y0, b.x1, b.y1)).collect();
+    state.pending.retain(|b| !queued.contains(&(b.x0, b.y0, b.x1, b.y1)));
+    state.pending.extend(new);
 }
 
 /// Forget a sweep that failed, after a full refresh landed.
@@ -319,13 +325,19 @@ fn finish(app: &mut PhotocraftApp, gpu: &GpuCanvas, doc: DocId, step: Step) -> S
 
 /// Blocks covering `bounds`, in drawing order from the end (they are popped): the blocks the view
 /// shows, nearest its centre first, then the rest by distance.
-fn blocks(bounds: Rect, visible: Rect, (block_w, block_h): (i32, i32)) -> Vec<Rect> {
+/// On one grid over `canvas`, so the same block of two regions is the same rectangle.
+fn blocks(region: Rect, canvas: Rect, visible: Rect, (block_w, block_h): (i32, i32)) -> Vec<Rect> {
+    let region = region.intersect(&canvas);
     let mut out = Vec::new();
-    let mut y = bounds.y0;
-    while y < bounds.y1 {
-        let mut x = bounds.x0;
-        while x < bounds.x1 {
-            out.push(Rect::new(x, y, (x + block_w).min(bounds.x1), (y + block_h).min(bounds.y1)));
+    if region.is_empty() || block_w <= 0 || block_h <= 0 {
+        return out;
+    }
+    let snap = |v: i32, origin: i32, step: i32| origin + (v - origin).div_euclid(step) * step;
+    let mut y = snap(region.y0, canvas.y0, block_h);
+    while y < region.y1 {
+        let mut x = snap(region.x0, canvas.x0, block_w);
+        while x < region.x1 {
+            out.push(Rect::new(x, y, (x + block_w).min(canvas.x1), (y + block_h).min(canvas.y1)));
             x += block_w;
         }
         y += block_h;
@@ -348,7 +360,7 @@ mod tests {
     fn blocks_cover_the_canvas_once_and_draw_the_view_first() {
         let bounds = Rect::new(0, 0, 10_000, 5_000);
         let visible = Rect::new(6_000, 1_000, 8_000, 3_000);
-        let b = blocks(bounds, visible, BLOCK_SIZES[0]);
+        let b = blocks(bounds, bounds, visible, BLOCK_SIZES[0]);
         let area: u64 = b.iter().map(|r| r.size().area()).sum();
         assert_eq!(area, bounds.size().area(), "every pixel once");
         let first = *b.last().unwrap();
@@ -365,5 +377,20 @@ mod tests {
         for (w, h) in BLOCK_SIZES {
             assert!((w as u64) * (h as u64) < crate::gpu_canvas::DEFER_PX, "{w}x{h} stays a small refresh");
         }
+    }
+
+    #[test]
+    fn blocks_of_overlapping_regions_are_the_same_rectangles() {
+        let canvas = Rect::new(0, 0, 10_000, 5_000);
+        let size = BLOCK_SIZES[0];
+        let a = blocks(Rect::new(100, 100, 3_000, 1_500), canvas, canvas, size);
+        let b = blocks(Rect::new(200, 50, 3_100, 1_400), canvas, canvas, size);
+        let set = |v: &[Rect]| v.iter().map(|r| (r.x0, r.y0, r.x1, r.y1)).collect::<std::collections::HashSet<_>>();
+        assert_eq!(set(&a), set(&b), "both regions fall on the same grid blocks");
+        for r in &a {
+            assert!(r.x0 % size.0 == 0 && r.y0 % size.1 == 0, "on the grid: {r:?}");
+        }
+        let covered = a.iter().fold(Rect::EMPTY, |u, r| if u.is_empty() { *r } else { u.union(r) });
+        assert!(covered.contains_rect(&Rect::new(100, 100, 3_000, 1_500)), "the region is covered: {covered:?}");
     }
 }

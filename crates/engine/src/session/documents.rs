@@ -197,6 +197,24 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Close document `index` as [`Session::close`] does, and free it off the UI thread. A
+    /// gigapixel document and its history are millions of tiles: dropping them where the command
+    /// ran took over a second, long enough for a Wayland compositor to drop the window. Returns
+    /// whether there was such a document.
+    pub fn close_and_release(&mut self, index: usize) -> bool {
+        let Some(closed) = self.close(index) else { return false };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // If the thread can't start, the closure (and the document) drops here instead.
+            let _ = std::thread::Builder::new().name("photocraft-close".into()).spawn(move || drop(closed));
+        }
+        #[cfg(target_arch = "wasm32")]
+        drop(closed);
+        true
+    }
+}
+
 pub(super) fn fix_active(st: &mut DocState) {
     if st.active_layer.is_none_or(|id| st.doc.layer(id).is_none()) {
         st.active_layer = st.doc.top_layer();
