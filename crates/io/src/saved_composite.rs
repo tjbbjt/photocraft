@@ -28,14 +28,116 @@ pub struct SavedComposite {
     pub rgba: Vec<u8>,
 }
 
+/// The facts about a file's composite that decoding it needs.
+struct Layout {
+    width: u32,
+    height: u32,
+    planes: usize,
+    depth: u16,
+    psb: bool,
+    /// Colour channels read: 3 (RGB) or 1 (Grayscale).
+    color: usize,
+    /// The plane holding the composite's transparency, if it has one.
+    alpha: Option<usize>,
+    compression: Compression,
+}
+
 /// Reads `path`'s stored composite reduced so its longer side is at most `max_side`. `Ok(None)`
 /// when the file has none to show (see the module notes); `cancelled` is asked between rows.
+///
+/// Only the header, the image resources (for the "real merged data" flag) and the start of the
+/// layer section (for its layer count, whose sign marks a transparent composite) are read before
+/// seeking past the layers to the composite: parsing the layer records of a gigapixel PSB took
+/// seconds and isn't needed here.
 #[cfg(any(unix, windows))]
 pub fn saved_composite_at(path: &std::path::Path, max_side: u32, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<Option<SavedComposite>, IoError> {
-    let read_failed = |e: String| IoError::Read(format!("{}: {e}", path.display()));
-    let source = photocraft_psd::source::FileSource::open(path).map_err(|e| read_failed(e.to_string()))?;
-    let file = PsdFile::from_source(photocraft_psd::source::Source::new(source)).map_err(|e| read_failed(e.to_string()))?;
-    saved_composite(&file, max_side, cancelled)
+    use photocraft_psd::source::ReadAt;
+    let failed = |e: String| IoError::Read(format!("{}: {e}", path.display()));
+    let src = photocraft_psd::source::FileSource::open(path).map_err(|e| failed(e.to_string()))?;
+    let total = src.len();
+    let at = |offset: u64, len: usize| -> Result<Vec<u8>, IoError> {
+        let mut buf = vec![0u8; len];
+        src.read_at(offset, &mut buf).map_err(|e| failed(e.to_string()))?;
+        Ok(buf)
+    };
+    let be16 = |b: &[u8]| u16::from_be_bytes([b[0], b[1]]);
+    let be32 = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    let h = at(0, 26)?;
+    if &h[0..4] != b"8BPS" {
+        return Ok(None);
+    }
+    let psb = match be16(&h[4..6]) {
+        1 => false,
+        2 => true,
+        _ => return Ok(None),
+    };
+    let (planes, height, width, depth, mode) = (be16(&h[12..14]), be32(&h[14..18]), be32(&h[18..22]), be16(&h[22..24]), be16(&h[24..26]));
+    let color = match mode {
+        3 => 3usize,
+        1 => 1,
+        _ => return Ok(None),
+    };
+    if !matches!(depth, 8 | 16) || width == 0 || height == 0 || usize::from(planes) < color {
+        return Ok(None);
+    }
+    // Colour mode data, then the image resources.
+    let mut pos = 26u64;
+    pos += 4 + u64::from(be32(&at(pos, 4)?));
+    let res_len = u64::from(be32(&at(pos, 4)?));
+    let res_end = pos + 4 + res_len;
+    let mut r = pos + 4;
+    while r + 12 <= res_end {
+        let head = at(r, 7)?;
+        if &head[0..4] != b"8BIM" && &head[0..4] != b"MeSa" {
+            break;
+        }
+        let id = be16(&head[4..6]);
+        // A Pascal name padded to an even length, its length byte included.
+        let name = 1 + u64::from(head[6]);
+        let name = name + name % 2;
+        let size = u64::from(be32(&at(r + 6 + name, 4)?));
+        let data = r + 6 + name + 4;
+        if id == 1057 && size >= 5 && at(data + 4, 1)?[0] == 0 {
+            return Ok(None); // a placeholder composite (saved without Maximize Compatibility)
+        }
+        r = data + size + size % 2;
+    }
+    // The layer and mask section: its length, then the layer info's length and layer count.
+    let wide = if psb { 8usize } else { 4 };
+    let len_at = |p: u64| -> Result<u64, IoError> {
+        let b = at(p, wide)?;
+        Ok(if psb { u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) } else { u64::from(be32(&b)) })
+    };
+    let lm = res_end;
+    let lm_len = len_at(lm)?;
+    let mut alpha = None;
+    if lm_len >= (wide + 2) as u64 && len_at(lm + wide as u64)? >= 2 {
+        let count = i16::from_be_bytes({
+            let b = at(lm + 2 * wide as u64, 2)?;
+            [b[0], b[1]]
+        });
+        if count < 0 && usize::from(planes) > color {
+            alpha = Some(color);
+        }
+    } else if usize::from(planes) > color {
+        // No layers: an extra channel is the composite's transparency.
+        alpha = Some(color);
+    }
+    let image = lm + wide as u64 + lm_len;
+    if image + 2 > total {
+        return Ok(None);
+    }
+    let compression = Compression::from_u16(be16(&at(image, 2)?));
+    let data = image + 2;
+    let layout = Layout { width, height, planes: usize::from(planes), depth, psb, color, alpha, compression };
+    let read = |offset: u64, len: u64| -> Result<Vec<u8>, IoError> {
+        let end = data.checked_add(offset).and_then(|o| o.checked_add(len));
+        if end.is_none_or(|e| e > total) {
+            return Err(IoError::Read("the stored composite couldn't be read: a row lies past the end of the file".into()));
+        }
+        at(data + offset, usize::try_from(len).map_err(|_| IoError::Read("a row too long to read".into()))?)
+    };
+    decode(&layout, &read, max_side, cancelled)
 }
 
 /// [`saved_composite_at`] for a parsed file (its composite in memory or still in its source).
@@ -52,18 +154,16 @@ pub fn saved_composite(file: &PsdFile, max_side: u32, cancelled: &(dyn Fn() -> b
     if file.has_real_merged_data() == Some(false) {
         return Ok(None);
     }
-    let compression = file.image_data.compression;
-    if !matches!(compression, Compression::Raw | Compression::Rle) {
-        return Ok(None);
-    }
-    let alpha = file.merged_has_alpha().then_some(color);
-    let (w, hgt) = (h.width as usize, h.height as usize);
-    let planes = usize::from(h.channels);
-    let bps = usize::from(h.depth / 8);
-    let row_bytes = w * bps;
-    let factor = h.width.max(h.height).div_ceil(max_side.max(1)).max(1);
-    let f = factor as usize;
-    let (ow, oh) = (w.div_ceil(f), hgt.div_ceil(f));
+    let layout = Layout {
+        width: h.width,
+        height: h.height,
+        planes: usize::from(h.channels),
+        depth: h.depth,
+        psb: h.version == Version::Psb,
+        color,
+        alpha: file.merged_has_alpha().then_some(color),
+        compression: file.image_data.compression,
+    };
     let read = |offset: u64, len: u64| -> Result<Vec<u8>, IoError> {
         let failed = |e: String| IoError::Read(format!("the stored composite couldn't be read: {e}"));
         match &file.image_data.stored {
@@ -82,10 +182,33 @@ pub fn saved_composite(file: &PsdFile, max_side: u32, cancelled: &(dyn Fn() -> b
             }
         }
     };
+    decode(&layout, &read, max_side, cancelled)
+}
+
+/// Decodes the composite `l` describes, reading its encoded bytes (from the start of the image
+/// data, after the compression field) through `read`.
+fn decode(
+    l: &Layout,
+    read: &(dyn Fn(u64, u64) -> Result<Vec<u8>, IoError> + Sync),
+    max_side: u32,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<SavedComposite>, IoError> {
+    let compression = l.compression;
+    if !matches!(compression, Compression::Raw | Compression::Rle) {
+        return Ok(None);
+    }
+    let (color, alpha) = (l.color, l.alpha);
+    let (w, hgt) = (l.width as usize, l.height as usize);
+    let planes = l.planes;
+    let bps = usize::from(l.depth / 8);
+    let row_bytes = w * bps;
+    let factor = l.width.max(l.height).div_ceil(max_side.max(1)).max(1);
+    let f = factor as usize;
+    let (ow, oh) = (w.div_ceil(f), hgt.div_ceil(f));
     // Where each encoded row of each plane starts and how long it is.
     let rows = planes * hgt;
     let (table_len, starts, lens) = if compression == Compression::Rle {
-        let cs: usize = if h.version == Version::Psb { 4 } else { 2 };
+        let cs: usize = if l.psb { 4 } else { 2 };
         let table = read(0, (rows * cs) as u64)?;
         let lens: Vec<u64> = table
             .chunks_exact(cs)
@@ -151,7 +274,7 @@ pub fn saved_composite(file: &PsdFile, max_side: u32, cancelled: &(dyn Fn() -> b
     for b in bands {
         rgba.extend_from_slice(&b?);
     }
-    Ok(Some(SavedComposite { width: ow as u32, height: oh as u32, doc_width: h.width, doc_height: h.height, factor, rgba }))
+    Ok(Some(SavedComposite { width: ow as u32, height: oh as u32, doc_width: l.width, doc_height: l.height, factor, rgba }))
 }
 
 /// The colour `v` held before it was matted against white at alpha `a`.
@@ -190,6 +313,22 @@ mod tests {
             let px = |x: u32, y: u32| &c.rgba[((y * c.width + x) * 4) as usize..][..4];
             assert_eq!(px(10, 10), [255, 0, 0, 255], "left half red");
             assert_eq!(px(90, 10), [0, 0, 255, 255], "right half blue");
+        }
+    }
+
+    /// Reading from the file (header and resources only, then a seek past the layers) gives the
+    /// same picture as reading the parsed file.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn reading_the_file_directly_matches_the_parsed_file() {
+        for psb in [false, true] {
+            let bytes = psd_bytes(&two_tone(400, 100), psb);
+            let path = std::env::temp_dir().join(format!("saved-composite-{}-{psb}.psd", std::process::id()));
+            std::fs::write(&path, &bytes).unwrap();
+            let direct = saved_composite_at(&path, 100, &|| false);
+            let _ = std::fs::remove_file(&path);
+            let parsed = saved_composite(&PsdFile::from_bytes(&bytes).unwrap(), 100, &|| false).unwrap();
+            assert_eq!(direct.unwrap(), parsed, "psb {psb}");
         }
     }
 

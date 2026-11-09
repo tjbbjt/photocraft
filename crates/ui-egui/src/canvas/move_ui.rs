@@ -489,6 +489,11 @@ pub(crate) fn damage(app: &PhotocraftApp, doc: DocId, revision: u64, seen: u64, 
     })
 }
 
+/// Whether a Move drag shows (or is about to show) a snapshot of its layers rather than an arrow.
+pub(crate) fn snapshot_drag(app: &PhotocraftApp) -> bool {
+    app.move_preview.as_ref().is_some_and(|p| p.snapshot.is_some())
+}
+
 /// Whether the canvas shows a Move drag's layers at the pointer.
 pub(crate) fn showing(app: &PhotocraftApp) -> bool {
     app.move_preview.as_ref().is_some_and(|p| p.shown.is_some())

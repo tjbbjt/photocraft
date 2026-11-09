@@ -459,8 +459,20 @@ fn close_after_saves(app: &mut PhotocraftApp, ctx: &egui::Context) {
 /// Per frame: apply finished jobs and react to them; keep frames coming while jobs run; Esc
 /// cancels the job in view.
 pub fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
-    for e in app.session.poll_jobs() {
+    let t0 = crate::gpu_canvas::now_ms();
+    let events = app.session.poll_jobs();
+    let applied = crate::gpu_canvas::now_ms() - t0;
+    if applied > 250.0 {
+        let names: Vec<&str> = events.iter().map(|e| e.command.as_str()).collect();
+        log::info!("slow step: landing finished jobs {names:?} took {applied:.0} ms");
+    }
+    for e in events {
+        let (t1, name) = (crate::gpu_canvas::now_ms(), e.command.clone());
         on_event(app, ctx, e);
+        let ms = crate::gpu_canvas::now_ms() - t1;
+        if ms > 250.0 {
+            log::info!("slow step: reacting to finished job {name} took {ms:.0} ms");
+        }
     }
     app.poll_os_clipboard_export(ctx);
     // A focused open tab that ended (or was cancelled elsewhere) gives way to the documents.

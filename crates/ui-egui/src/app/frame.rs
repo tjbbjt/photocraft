@@ -92,7 +92,7 @@ impl PhotocraftApp {
         // Background jobs: apply finished ones, keep frames coming, Esc cancels (before the
         // shortcuts see Esc).
         if !screen_picker::tick(self, ctx) {
-            jobs_ui::tick(self, ctx);
+            crate::frame_stages::timed("finished jobs", || jobs_ui::tick(self, ctx));
             #[cfg(not(target_arch = "wasm32"))]
             crate::dialogs::filter_preview_worker::discard_closed(self);
             if type_tool::in_ui_pass(ctx) {

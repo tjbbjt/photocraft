@@ -133,6 +133,18 @@ impl FrameStages {
     }
 }
 
+/// Runs `f`, logging it by `name` when it held the UI thread past 250 ms: what a slow frame's
+/// unattributed time went to.
+pub(crate) fn timed<T>(name: &str, f: impl FnOnce() -> T) -> T {
+    let t0 = crate::gpu_canvas::now_ms();
+    let r = f();
+    let ms = crate::gpu_canvas::now_ms() - t0;
+    if ms > 250.0 {
+        log::info!("slow step: {name} took {ms:.0} ms");
+    }
+    r
+}
+
 /// The scratch disk's counters at one moment ([`photocraft_raster::spill::stats`]), to log what
 /// it did between two: tiles read back from disk (and the time it took) and tiles spilled to it.
 #[derive(Clone, Copy, Debug, Default)]
@@ -207,7 +219,7 @@ impl SlowFrames {
             let mut since = SINCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let note = since.map_or_else(String::new, |s| s.note_until(&now));
             *since = Some(now);
-            log::info!("{line}{note}");
+            log::info!("{line}; ui build {:.1}{note}", s.ui_ms);
         }
         s
     }
