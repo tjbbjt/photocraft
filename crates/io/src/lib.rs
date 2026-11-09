@@ -76,6 +76,7 @@ pub use psd_budget::{DEFAULT_PSD_IMPORT_PIXEL_BYTES, PsdMemoryEstimate, estimate
 pub mod psd_thumbnail;
 pub mod raw;
 pub mod renderer;
+pub mod saved_composite;
 pub use renderer::{BandRenderer, CpuRenderer, RenderBand, RenderError};
 pub mod slices_map;
 pub mod smart_map;

@@ -633,6 +633,8 @@ pub struct PhotocraftApp {
     transform_preparing: Option<crate::transform_tool::Preparing>,
     /// Per document: what its GPU canvas last showed and any redraw in blocks (`canvas::sweep`).
     pub(crate) canvas_states: crate::canvas::sweep::CanvasStates,
+    /// Stored composites shown while freshly opened PSD/PSBs draw (`canvas::open_preview`).
+    pub(crate) open_previews: HashMap<DocId, crate::canvas::open_preview::OpenPreview>,
     /// The session clipboard currently holds an image imported from the OS clipboard: it has no
     /// original position, so Paste centres it (see `menus` "edit.paste").
     pub(crate) clip_external: bool,
