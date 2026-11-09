@@ -62,9 +62,12 @@ modules:
       - for tool in lp lpoptions lpstat; do install -Dm755 cups-socket.sh "/app/bin/$tool"; done
       - install -Dm644 -t /app/share/licenses/cups LICENSE NOTICE
     sources:
-      - type: archive
-        url: https://github.com/OpenPrinting/cups/releases/download/v2.4.20/cups-2.4.20-source.tar.gz
-        sha256: ab4d9cd7f3e58060091d2b24972223d6401675f11c49b65abf4f6ef31dea22ff
+      # The release tarball's download has been returning 504; the same release from its git
+      # tag (the tag's tree includes configure, LICENSE and NOTICE).
+      - type: git
+        url: https://github.com/OpenPrinting/cups.git
+        tag: v2.4.20
+        commit: ef80eeaea51430a055948240eea3f28ef5354edf
       # Runs each tool. Flatpak mounts the host's CUPS socket at /var/run/cups/cups.sock, choosing
       # it as flatpak-run-cups.c does from the host's CUPS_SERVER, else the first line spelled
       # exactly `ServerName /path` in ~/.cups/client.conf, else the default; it mounts nothing

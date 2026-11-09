@@ -1219,7 +1219,7 @@ impl craft_ui::docking::DockContent<String> for PanelContent<'_> {
         #[cfg(test)]
         ui.ctx().data_mut(|data| data.get_temp_mut_or_default::<Vec<(String, egui::Rect)>>(bodies_id()).push((id.clone(), ui.max_rect())));
         if id == CANVAS {
-            crate::panels::canvas_panel(self.app, ui);
+            crate::frame_stages::timed("canvas panel", || crate::panels::canvas_panel(self.app, ui));
             return;
         }
         let viewport = ui.ctx().viewport_id();
@@ -1231,7 +1231,8 @@ impl craft_ui::docking::DockContent<String> for PanelContent<'_> {
         if !self.collapsed.contains(id) && ui.available_width() >= 200.0 {
             let pro = crate::theme::Tokens::get(ui.ctx()).pro;
             ui.spacing_mut().item_spacing.y = if pro { 0.0 } else { 6.0 };
-            egui::Frame::NONE.inner_margin(crate::widgets::body_margin(pro)).show(ui, |ui| body(self.app, ui, id));
+            let name = format!("{id} panel");
+            crate::frame_stages::timed(&name, || egui::Frame::NONE.inner_margin(crate::widgets::body_margin(pro)).show(ui, |ui| body(self.app, ui, id)));
         }
     }
     fn dock_heights(&self, id: &String) -> Option<DockHeights> {

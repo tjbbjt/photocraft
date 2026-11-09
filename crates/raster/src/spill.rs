@@ -144,6 +144,7 @@ impl Cell {
             return Ok(());
         }
         let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let started = Instant::now();
         let bytes = match slot {
             Some((file, extent)) => {
                 let mut packed = Vec::new();
@@ -168,6 +169,7 @@ impl Cell {
         self.set_error(None);
         M.resident.fetch_add(self.len, Ordering::Relaxed);
         M.reloads.fetch_add(1, Ordering::Relaxed);
+        M.reload_nanos.fetch_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
         Ok(())
     }
 
@@ -247,6 +249,8 @@ struct Manager {
     config: Mutex<Config>,
     evictions: AtomicU64,
     reloads: AtomicU64,
+    /// Time spent reading spilled tiles back (scratch read and unpack), in nanoseconds.
+    reload_nanos: AtomicU64,
     written: AtomicU64,
 }
 
@@ -344,6 +348,7 @@ static M: Manager = Manager {
     config: Mutex::new(Config { dir: None, file: None, last_error: None, budget: 0, paused: None, backoff: RETRY_FIRST, size_cap: None, room: None }),
     evictions: AtomicU64::new(0),
     reloads: AtomicU64::new(0),
+    reload_nanos: AtomicU64::new(0),
     written: AtomicU64::new(0),
 };
 
@@ -994,6 +999,8 @@ pub struct SpillStats {
     pub scratch_bytes: u64,
     pub evictions: u64,
     pub reloads: u64,
+    /// Time spent reading those tiles back, in nanoseconds (scratch read and unpack).
+    pub reload_nanos: u64,
     /// Compressed bytes written to scratch so far.
     pub written_bytes: u64,
     pub last_error: Option<String>,
@@ -1015,6 +1022,7 @@ pub fn stats() -> SpillStats {
         scratch_bytes: c.file.as_ref().map_or(0, |f| f.used()),
         evictions: M.evictions.load(Ordering::Relaxed),
         reloads: M.reloads.load(Ordering::Relaxed),
+        reload_nanos: M.reload_nanos.load(Ordering::Relaxed),
         written_bytes: M.written.load(Ordering::Relaxed),
         last_error: c.last_error.clone(),
         paused: c.paused.is_some(),
@@ -1340,6 +1348,7 @@ mod tests {
             }),
             evictions: AtomicU64::new(0),
             reloads: AtomicU64::new(0),
+            reload_nanos: AtomicU64::new(0),
             written: AtomicU64::new(0),
         };
         let allowed = manager.has_room(&file);

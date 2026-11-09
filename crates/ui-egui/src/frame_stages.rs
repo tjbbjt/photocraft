@@ -117,11 +117,12 @@ impl FrameStages {
         let opt = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.1}"));
         let command = if self.command.is_empty() { String::new() } else { format!(" ({})", self.command) };
         format!(
-            "slow frame: {:.1} ms on the {} path: input {:.1}, command {:.1}{command}, damage {:.1}, composite {:.1}, upload {:.1}, gpu {}, present {}; refresh {} {} px",
+            "slow frame: {:.1} ms on the {} path: input {:.1}, command {:.1}{command}, live stroke {:.1}, damage {:.1}, composite {:.1}, upload {:.1}, gpu {}, present {}; refresh {} {} px",
             self.frame_ms,
             self.path,
             self.input_ms,
             self.command_ms,
+            self.stroke_ms,
             self.damage_ms,
             self.composite_ms,
             self.upload_ms,
@@ -130,6 +131,45 @@ impl FrameStages {
             if self.refresh.is_empty() { "none" } else { self.refresh },
             self.refresh_px,
         )
+    }
+}
+
+/// Runs `f`, logging it by `name` when it held the UI thread past 250 ms: what a slow frame's
+/// unattributed time went to.
+pub(crate) fn timed<T>(name: &str, f: impl FnOnce() -> T) -> T {
+    let t0 = crate::gpu_canvas::now_ms();
+    let r = f();
+    let ms = crate::gpu_canvas::now_ms() - t0;
+    if ms > 250.0 {
+        log::info!("slow step: {name} took {ms:.0} ms");
+    }
+    r
+}
+
+/// The scratch disk's counters at one moment ([`photocraft_raster::spill::stats`]), to log what
+/// it did between two: tiles read back from disk (and the time it took) and tiles spilled to it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ScratchMark {
+    reloads: u64,
+    reload_nanos: u64,
+    evictions: u64,
+}
+
+impl ScratchMark {
+    pub(crate) fn now() -> Self {
+        let s = photocraft_raster::spill::stats();
+        Self { reloads: s.reloads, reload_nanos: s.reload_nanos, evictions: s.evictions }
+    }
+
+    /// "; scratch: 120 tiles read back in 85 ms, 300 spilled" since `self`, or "" when it did
+    /// nothing (spilling off, or everything fit in memory).
+    pub(crate) fn note_until(&self, later: &Self) -> String {
+        let (read, spilled) = (later.reloads.saturating_sub(self.reloads), later.evictions.saturating_sub(self.evictions));
+        if read == 0 && spilled == 0 {
+            return String::new();
+        }
+        let ms = later.reload_nanos.saturating_sub(self.reload_nanos) as f64 / 1e6;
+        format!("; scratch: {read} tiles read back in {ms:.0} ms, {spilled} spilled")
     }
 }
 
@@ -173,7 +213,14 @@ impl SlowFrames {
         s.present_ms = s.cpu_prev_ms.zip(self.prev_ui_ms).map(|(cpu, ui)| (cpu - ui).max(0.0));
         self.prev_ui_ms = Some(s.ui_ms);
         if let Some(line) = self.push(&s) {
-            log::info!("{line}");
+            // What the scratch disk did since the previous slow-frame line: a frame that waited
+            // on tiles read back from disk says so.
+            static SINCE: std::sync::Mutex<Option<ScratchMark>> = std::sync::Mutex::new(None);
+            let now = ScratchMark::now();
+            let mut since = SINCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let note = since.map_or_else(String::new, |s| s.note_until(&now));
+            *since = Some(now);
+            log::info!("{line}; ui build {:.1}{note}", s.ui_ms);
         }
         s
     }

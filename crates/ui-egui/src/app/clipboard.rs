@@ -47,6 +47,10 @@ fn svg_clip_signature(clip: &photocraft_engine::edit_cmds::Clip) -> u64 {
     sig
 }
 
+/// Our own image on the OS clipboard this large isn't read back while PhotoCraft stays in front
+/// (4 MP: a read-back is cheap below that, and small images keep the full check).
+const SKIP_SELF_READ_PX: u64 = 4 << 20;
+
 impl PhotocraftApp {
     /// Capture SVG and its raster mirror together; failures leave the previous copy intact.
     pub(super) fn import_os_svg_clipboard(&mut self) -> Result<bool, String> {
@@ -171,6 +175,10 @@ impl PhotocraftApp {
     /// Hand a finished background conversion (see [`Self::export_os_clipboard`]) to the OS
     /// clipboard. Called every frame; keeps frames coming while a conversion runs.
     pub(crate) fn poll_os_clipboard_export(&mut self, ctx: &egui::Context) {
+        // Another app can only copy something while PhotoCraft isn't the window in front.
+        if !ctx.input(|i| i.focused) {
+            self.os_clip_left_app = true;
+        }
         let Some(rx) = &self.os_clip_export else { return };
         match rx.try_recv() {
             Ok((w, h, bytes)) => {
@@ -196,6 +204,8 @@ impl PhotocraftApp {
         if set(w, h, bytes).is_ok() {
             // A newer copy reached the system clipboard: the notice about an older one is stale.
             self.ui.notices.retain(|n| n.title != KEPT_IN_PHOTOCRAFT);
+            self.os_clip_left_app = false;
+            self.os_clip_exported_px = u64::from(w) * u64::from(h);
             self.os_clip_svg = None;
             self.os_clip_sig = Some(clip_signature(w, h, bytes));
             self.clip_unmirrored = false;
@@ -211,6 +221,17 @@ impl PhotocraftApp {
     pub(crate) fn import_os_clipboard(&mut self) -> Result<bool, String> {
         // Our own copy is still on its way to the OS clipboard: it is the newest, keep it.
         if self.os_clip_export.is_some() {
+            return Ok(false);
+        }
+        // Our own large image is still on the OS clipboard if PhotoCraft has stayed in front
+        // since it went there. Reading it back makes the clipboard encode our pixels as PNG and
+        // decode them again: 1.8 s on the UI thread for a 15 MP copy, every Paste.
+        if !self.os_clip_left_app
+            && !self.clip_unmirrored
+            && !self.clip_external
+            && self.os_clip_exported_px >= SKIP_SELF_READ_PX
+            && self.session.clipboard.is_some()
+        {
             return Ok(false);
         }
         let Some(get) = self.services.clipboard_get_image.as_mut() else { return Ok(false) };

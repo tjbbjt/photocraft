@@ -24,6 +24,9 @@ pub(super) struct Resources {
     pub(super) separate_mip_targets: bool,
     /// The wgpu layer compositor (created on first use).
     pub(super) compositor: Option<photocraft_gpu::Compositor>,
+    /// Bumped whenever the compositor is dropped, so one lent to the redraw thread meanwhile
+    /// isn't put back ([`super::GpuCanvas::composite_lent`]).
+    pub(super) compositor_generation: u64,
     /// Why the wgpu compositor couldn't be created (then the CPU compositor is used).
     pub(super) compositor_failed: Option<photocraft_gpu::Unsupported>,
     /// The device's health: the paint callback issues no GPU work once it's lost.
@@ -364,6 +367,7 @@ impl Resources {
             out_linear: target.is_srgb(),
             separate_mip_targets: false,
             compositor: None,
+            compositor_generation: 0,
             compositor_failed: None,
             health: photocraft_gpu::DeviceHealth::new(),
             compositor_budget: None,

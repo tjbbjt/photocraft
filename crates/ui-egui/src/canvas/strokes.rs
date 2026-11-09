@@ -452,6 +452,10 @@ pub(super) fn feed_live_stroke(app: &mut PhotocraftApp) {
     }
     l.fed = d.points.len();
     let started = crate::gpu_canvas::now_ms();
+    // Held elsewhere too (the canvas keeps the document it shows), the stroke's document is
+    // copied whole before the step draws: reported with a slow step.
+    let shared = std::sync::Arc::strong_count(l.stroke.doc()) > 1;
+    let n = pts.len();
     match l.stroke.push(&pts) {
         Ok(r) => l.damage.push(r),
         Err(e) => {
@@ -466,8 +470,16 @@ pub(super) fn feed_live_stroke(app: &mut PhotocraftApp) {
             }
         }
     }
-    app.perf.stage.stroke_ms += crate::gpu_canvas::now_ms() - started;
+    let ms = crate::gpu_canvas::now_ms() - started;
+    app.perf.stage.stroke_ms += ms;
+    if ms > SLOW_STROKE_STEP_MS {
+        let total = app.drag.as_ref().map_or(0, |d| d.points.len());
+        log::info!("live stroke: one step of {n} point(s) took {ms:.0} ms ({total} points so far; document copied first: {shared})");
+    }
 }
+
+/// A live stroke step slower than this (ms) is logged: what made painting stall.
+const SLOW_STROKE_STEP_MS: f64 = 100.0;
 
 /// The points the live retouching stroke has rendered.
 #[cfg(test)]

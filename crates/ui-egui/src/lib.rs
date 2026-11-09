@@ -649,6 +649,22 @@ pub struct PhotocraftApp {
     /// A newer copy arrived while `os_clip_export` was converting: when that conversion lands it
     /// is dropped and the current clip exported instead, so at most one conversion runs.
     os_clip_export_again: bool,
+    /// The window lost focus since our last image reached the OS clipboard, so another app may
+    /// have copied something (see `import_os_clipboard`).
+    os_clip_left_app: bool,
+    /// Pixels of our last image on the OS clipboard.
+    os_clip_exported_px: u64,
+    /// Stored composites shown while freshly opened PSD/PSBs draw (`canvas::open_preview`).
+    pub(crate) open_previews: HashMap<DocId, crate::canvas::open_preview::OpenPreview>,
+    /// Stored composites being read while their files open, by path (`open_preview::prefetch`).
+    pub(crate) open_preview_reads: HashMap<String, crate::canvas::open_preview::OpenPreview>,
+    /// What the canvas showed over hidden layers, to put back when they are shown again.
+    pub(crate) board_cache: crate::canvas::board_cache::BoardCache,
+    /// Sweeps composited off the UI thread (started on first use), and whether it couldn't start.
+    pub(crate) redraw_thread: Option<crate::canvas::redraw_thread::RedrawThread>,
+    pub(crate) redraw_thread_failed: bool,
+    /// The last snapshot drag's drop, to redraw only where its layers landed.
+    pub(crate) move_drop: Option<crate::canvas::move_ui::MoveDrop>,
     /// The session clipboard currently holds an image imported from the OS clipboard: it has no
     /// original position, so Paste centres it (see `menus` "edit.paste").
     pub(crate) clip_external: bool,

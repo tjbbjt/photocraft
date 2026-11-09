@@ -45,6 +45,8 @@ pub struct Refresh {
     /// leaves out layer-tile uploads (`uploads` above counts them), so a first refresh of a
     /// document under-reports by more than the few per cent of a warm one.
     pub gpu: Option<photocraft_gpu::GpuTiming>,
+    /// What the wgpu compositor did (passes, chunks, effect maps…), for the sweep's log line.
+    pub stats: Option<photocraft_gpu::Stats>,
     /// Why the wgpu compositor wasn't used.
     pub fallback: Option<CpuReason>,
 }
