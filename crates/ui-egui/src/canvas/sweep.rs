@@ -77,6 +77,8 @@ struct Work {
     fx_px: u64,
     evicted: u64,
     flushes: u64,
+    /// The scratch disk's counters when the sweep started.
+    scratch: crate::frame_stages::ScratchMark,
 }
 
 impl Work {
@@ -84,7 +86,7 @@ impl Work {
     fn planned(doc: &Document) -> Self {
         let t0 = crate::gpu_canvas::now_ms();
         let (passes, fx_layers) = photocraft_gpu::plan(doc).map_or((0, 0), |p| (p.passes.len(), p.fx.len()));
-        Work { plan_ms: crate::gpu_canvas::now_ms() - t0, passes, fx_layers, ..Work::default() }
+        Work { plan_ms: crate::gpu_canvas::now_ms() - t0, passes, fx_layers, scratch: crate::frame_stages::ScratchMark::now(), ..Work::default() }
     }
 
     fn add(&mut self, s: &photocraft_gpu::Stats) {
@@ -111,7 +113,7 @@ impl Work {
             self.fx_px as f64 / 1_048_576.0,
             self.evicted,
             self.flushes,
-        )
+        ) + &self.scratch.note_until(&crate::frame_stages::ScratchMark::now())
     }
 }
 

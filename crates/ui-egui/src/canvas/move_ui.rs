@@ -226,8 +226,11 @@ pub(crate) fn display_doc(app: &mut PhotocraftApp, idx: usize) -> Option<(Arc<Do
         let bounds = ids.iter().try_fold(Rect::EMPTY, |acc, id| Some(acc.union(&photocraft_compose::change_bounds(doc.layer(*id)?, all)?)));
         let canvas = doc.bounds();
         let moving = with_descendants(&doc, &ids);
-        let too_big = exceeds(&doc, &ids, LIVE_LIMIT, mask_target);
         let bounds = bounds.map(|b| moving.iter().filter_map(|id| shape_reach(doc.layer(*id)?, canvas)).fold(b, |acc, r| acc.union(&r)));
+        let too_big = exceeds(&doc, &ids, LIVE_LIMIT, mask_target) || costly_to_redraw(&doc, bounds);
+        if too_big {
+            log::info!("move: dragging {} layer(s) as an outline (too costly to redraw live), the release redraws once", ids.len());
+        }
         app.move_preview = Some(MovePreview { doc: doc_id, revision, ids, moving, bounds, canvas, offsets: Vec::new(), shown: None, floating: false, too_big });
     }
     let p = app.move_preview.as_mut()?;
@@ -255,6 +258,24 @@ pub(crate) fn display_doc(app: &mut PhotocraftApp, idx: usize) -> Option<(Arc<Do
     }
     let p = app.move_preview.as_ref()?;
     Some((p.shown.clone()?, p.key()))
+}
+
+/// Fewest layers in a document for [`costly_to_redraw`] to count it as many-layered.
+const MANY_LAYERS: usize = 64;
+/// Smallest area (pixels) the moving layers cover for [`costly_to_redraw`].
+const LARGE_AREA_PX: u64 = 16 << 20;
+
+/// Whether showing a drag live would redraw a large area of a many-layered document every frame:
+/// every pointer move recomposites where the layers were and are through the whole stack, which
+/// on a storyboard of hundreds of layers took about 100 ms a frame and seconds of redrawing after
+/// it. Such a drag shows its outline and arrow instead (as Preferences › Interface › Show
+/// bounding box when dragging layer does) and the release redraws once.
+fn costly_to_redraw(doc: &Document, bounds: Option<Rect>) -> bool {
+    let area = bounds.map_or(u64::MAX, |b| {
+        let b = b.intersect(&doc.bounds());
+        if b.is_empty() { 0 } else { u64::from(b.width()) * u64::from(b.height()) }
+    });
+    area >= LARGE_AREA_PX && doc.walk().len() >= MANY_LAYERS
 }
 
 /// Where shape layer `l` paints, effects included, not cut at the canvas as its rendered pixels

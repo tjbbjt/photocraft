@@ -133,6 +133,33 @@ impl FrameStages {
     }
 }
 
+/// The scratch disk's counters at one moment ([`photocraft_raster::spill::stats`]), to log what
+/// it did between two: tiles read back from disk (and the time it took) and tiles spilled to it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ScratchMark {
+    reloads: u64,
+    reload_nanos: u64,
+    evictions: u64,
+}
+
+impl ScratchMark {
+    pub(crate) fn now() -> Self {
+        let s = photocraft_raster::spill::stats();
+        Self { reloads: s.reloads, reload_nanos: s.reload_nanos, evictions: s.evictions }
+    }
+
+    /// "; scratch: 120 tiles read back in 85 ms, 300 spilled" since `self`, or "" when it did
+    /// nothing (spilling off, or everything fit in memory).
+    pub(crate) fn note_until(&self, later: &Self) -> String {
+        let (read, spilled) = (later.reloads.saturating_sub(self.reloads), later.evictions.saturating_sub(self.evictions));
+        if read == 0 && spilled == 0 {
+            return String::new();
+        }
+        let ms = later.reload_nanos.saturating_sub(self.reload_nanos) as f64 / 1e6;
+        format!("; scratch: {read} tiles read back in {ms:.0} ms, {spilled} spilled")
+    }
+}
+
 /// The last [`SLOW_FRAMES`] frames over the threshold.
 #[derive(Debug)]
 pub struct SlowFrames {
@@ -173,7 +200,14 @@ impl SlowFrames {
         s.present_ms = s.cpu_prev_ms.zip(self.prev_ui_ms).map(|(cpu, ui)| (cpu - ui).max(0.0));
         self.prev_ui_ms = Some(s.ui_ms);
         if let Some(line) = self.push(&s) {
-            log::info!("{line}");
+            // What the scratch disk did since the previous slow-frame line: a frame that waited
+            // on tiles read back from disk says so.
+            static SINCE: std::sync::Mutex<Option<ScratchMark>> = std::sync::Mutex::new(None);
+            let now = ScratchMark::now();
+            let mut since = SINCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let note = since.map_or_else(String::new, |s| s.note_until(&now));
+            *since = Some(now);
+            log::info!("{line}{note}");
         }
         s
     }
