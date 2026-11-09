@@ -1,7 +1,7 @@
 use super::commit::{cancel, commit, start_steps};
 #[cfg(test)]
 use super::draw::texture_quad;
-use super::preview::{Above, AbovePlan, preview_image};
+use super::preview::{Above, AbovePlan, near_area, preview_image};
 use super::{
     Arc, BezierMesh, CAS_ONLY_SCALES, Color32, DocId, Document, Follow, Homography, LOCKED, LayerContent, LayerId, MadeLayer, PhotocraftApp, Several, Steps,
     TransformPreview, TransformSession, Warp, WarpStyle, corners, default_interpolation, json,
@@ -74,7 +74,8 @@ pub fn begin(app: &mut PhotocraftApp, ctx: &egui::Context) -> Result<(), String>
     // egui reports the renderer's limit in the app; offscreen harnesses only through the device.
     let max_side = ctx.input(|i| i.max_texture_side).max(app.gpu.as_ref().map_or(1, |g| g.max_texture_side()));
     // The layers covering the moving pixels draw over them instead of under them.
-    let plan = AbovePlan::new(&doc, id);
+    // Only the layers over where the moving pixels can go: the rest stay on the canvas.
+    let plan = AbovePlan::new(&doc, id, Some(near_area(b)));
     plan.hide_in(&mut pd.layers);
     // What the preview document changes: the moving layer and the covering layers it leaves
     // out, so the canvas redraws only there (`transform_tool::damage`), not the whole document.
@@ -313,7 +314,7 @@ fn begin_several(app: &mut PhotocraftApp, ctx: &egui::Context, doc: Arc<Document
         }
     }
     let max_side = ctx.input(|i| i.max_texture_side).max(app.gpu.as_ref().map_or(1, |g| g.max_texture_side()));
-    let above = Above::new(ctx, format!("transform-{session}-above"), &doc, top, max_side);
+    let above = Above::new(ctx, format!("transform-{session}-above"), &doc, top, Some(near_area(b)), max_side);
     above.hide_in(&mut under.layers);
     // Opacity, fill, masks and styles are in the composite already.
     let mut several = Several {
@@ -482,7 +483,7 @@ pub(crate) fn begin_content_aware(
         s.prune();
     }
     let max_side = ctx.input(|i| i.max_texture_side).max(app.gpu.as_ref().map_or(1, |g| g.max_texture_side()));
-    let above = Above::new(ctx, format!("transform-{session}-above"), &doc, id, max_side);
+    let above = Above::new(ctx, format!("transform-{session}-above"), &doc, id, Some(near_area(region)), max_side);
     above.hide_in(&mut pd.layers);
     let (image, uv) = crate::transform_tex::read_surface(surf, None, region, max_side);
     let texture = crate::transform_tex::PreviewTextures::new(ctx, format!("transform-{session}"), image, uv);

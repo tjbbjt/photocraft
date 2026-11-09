@@ -78,6 +78,9 @@ pub(super) struct Above {
     pub(super) max_side: usize,
     /// The covering layers (whole layers or groups, at any depth).
     pub(super) ids: Vec<LayerId>,
+    /// Where the moving pixels can show while the box is open ([`near_area`]): only layers over
+    /// it cover them. Kept so a rebuild covers the same layers.
+    pub(super) near: Option<photocraft_geom::Rect>,
     /// Their composite and the canvas area it covers; `None` when nothing visible covers the layer.
     pub(super) shown: Option<(crate::transform_tex::PreviewTextures, photocraft_geom::Rect)>,
 }
@@ -86,14 +89,17 @@ pub(super) struct Above {
 /// [`Above`], so the composite ([`AbovePlan::image`]) can run off the UI thread.
 pub(super) struct AbovePlan {
     pub(super) ids: Vec<LayerId>,
+    near: Option<photocraft_geom::Rect>,
     up: Document,
     rect: photocraft_geom::Rect,
 }
 
 impl AbovePlan {
-    pub(super) fn new(doc: &Document, id: LayerId) -> Self {
+    /// `near`: where the moving pixels can show ([`near_area`]); `None` takes every layer over
+    /// `id`.
+    pub(super) fn new(doc: &Document, id: LayerId, near: Option<photocraft_geom::Rect>) -> Self {
         let (mut ids, mut applied) = (Vec::new(), Vec::new());
-        covering(&doc.layers, id, &mut ids, &mut applied);
+        covering_in(&doc.layers, id, near.map(|r| (r, doc.bounds())), &mut ids, &mut applied);
         let mut up = doc.clone();
         let mut covers = doc.clone();
         show_only(&mut covers.layers, &ids);
@@ -109,7 +115,7 @@ impl AbovePlan {
             .filter(|l| l.visible)
             .fold(photocraft_geom::Rect::EMPTY, |r, l| r.union(&photocraft_compose::composite_bounds(l, canvas).unwrap_or(canvas)))
             .intersect(&canvas);
-        Self { ids, up, rect }
+        Self { ids, near, up, rect }
     }
 
     /// How many canvas pixels the covering composite spans.
@@ -139,8 +145,8 @@ fn hide_ids(ids: &[LayerId], layers: &mut [photocraft_doc::Layer]) {
 }
 
 impl Above {
-    pub(super) fn new(ctx: &egui::Context, name: String, doc: &Document, id: LayerId, max_side: usize) -> Self {
-        let plan = AbovePlan::new(doc, id);
+    pub(super) fn new(ctx: &egui::Context, name: String, doc: &Document, id: LayerId, near: Option<photocraft_geom::Rect>, max_side: usize) -> Self {
+        let plan = AbovePlan::new(doc, id, near);
         let image = plan.image(max_side);
         Self::from_plan(ctx, name, max_side, plan, image)
     }
@@ -148,12 +154,12 @@ impl Above {
     /// An `Above` from its plan and the composite made from it (on the UI thread: textures).
     pub(super) fn from_plan(ctx: &egui::Context, name: String, max_side: usize, plan: AbovePlan, image: Option<(egui::ColorImage, [f32; 2])>) -> Self {
         let shown = image.map(|(image, uv)| (crate::transform_tex::PreviewTextures::new(ctx, name.clone(), image, uv), plan.rect));
-        Self { ctx: ctx.clone(), name, max_side, ids: plan.ids, shown }
+        Self { ctx: ctx.clone(), name, max_side, ids: plan.ids, near: plan.near, shown }
     }
 
     /// Composite what covers layer `id` of `doc` (the live document) again.
     pub(super) fn rebuild(&mut self, doc: &Document, id: LayerId) {
-        let plan = AbovePlan::new(doc, id);
+        let plan = AbovePlan::new(doc, id, self.near);
         let image = plan.image(self.max_side);
         *self = Self::from_plan(&self.ctx.clone(), self.name.clone(), self.max_side, plan, image);
     }
@@ -225,6 +231,30 @@ fn plain(l: &photocraft_doc::Layer) -> bool {
 /// box and is composited with them as well, so they keep its adjustment. A clipping group goes as
 /// a whole, and the layers clipped to `id` (or to the group holding it) stay with it.
 pub(super) fn covering(layers: &[photocraft_doc::Layer], id: LayerId, out: &mut Vec<LayerId>, applied: &mut Vec<LayerId>) {
+    covering_in(layers, id, None, out, applied);
+}
+
+/// Where the moving pixels in `frame` can show while the box is open, for [`covering_in`]: the
+/// frame grown by half its longer side each way, so a box scaled up or nudged a fair way still
+/// passes under the layers over it. A layer beyond that stays in the document under the box,
+/// drawn under the moving pixels in the preview if they are dragged that far; the committed
+/// result is exact either way.
+pub(super) fn near_area(frame: photocraft_geom::Rect) -> photocraft_geom::Rect {
+    let grow = (frame.width().max(frame.height()) / 2).min(i32::MAX as u32) as i32;
+    frame.inflate(grow)
+}
+
+/// [`covering`], but with `near` = `(area, canvas)` only the layers over `area` cover: on a
+/// storyboard of hundreds of frames, every layer over the moving one used to be lifted out of the
+/// canvas, so opening and closing the box redrew nearly the whole canvas (seconds on a gigapixel
+/// one) for a layer covering a few frames.
+pub(super) fn covering_in(
+    layers: &[photocraft_doc::Layer],
+    id: LayerId,
+    near: Option<(photocraft_geom::Rect, photocraft_geom::Rect)>,
+    out: &mut Vec<LayerId>,
+    applied: &mut Vec<LayerId>,
+) {
     // Adjustments met since the last covering layer: they count once one lies under them.
     let mut pending: Vec<LayerId> = Vec::new();
     let mut end = layers.len();
@@ -243,14 +273,17 @@ pub(super) fn covering(layers: &[photocraft_doc::Layer], id: LayerId, out: &mut 
                 && matches!(g.blend, photocraft_color::BlendMode::Normal | photocraft_color::BlendMode::PassThrough)
             {
                 let before = out.len();
-                covering(&group.children, id, out, applied);
+                covering_in(&group.children, id, near, out, applied);
                 if out.len() > before {
                     applied.append(&mut pending);
                 }
             }
             return;
         }
-        if unit.iter().all(plain) {
+        let overlaps = |(area, canvas): (photocraft_geom::Rect, photocraft_geom::Rect)| {
+            unit.iter().any(|l| photocraft_compose::change_bounds(l, canvas).is_none_or(|b| !b.intersect(&area).is_empty()))
+        };
+        if unit.iter().all(plain) && near.is_none_or(overlaps) {
             out.extend(unit.iter().map(|l| l.id));
             if unit.iter().any(|l| l.visible) {
                 applied.append(&mut pending);

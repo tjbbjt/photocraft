@@ -909,6 +909,12 @@ pub fn edit_job<R: Send + 'static>(
             let mut doc = (*base).clone();
             let mut active = active;
             let r = f(&mut doc, &mut active, ctx)?;
+            // The layers' bounds, scanned here rather than when the edit lands: working out
+            // what changed, and the canvas planning its redraw, ask every new surface for them,
+            // a scan of every pixel the first time (1.3-2 s on the UI thread for a storyboard
+            // enlarged with Free Transform). Unchanged layers are already in the cache.
+            ctx.progress(1.0, "Finishing");
+            warm_layer_bounds(&doc, || ctx.check())?;
             Ok((doc, active, r))
         },
         move |s, (doc, new_active, r)| {

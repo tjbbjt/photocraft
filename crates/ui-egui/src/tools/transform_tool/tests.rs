@@ -2357,6 +2357,32 @@ fn plain_layers_still_cover_the_moving_one_under_a_blend_or_adjustment_layer() {
     }
 }
 
+/// On a storyboard, only the layers over where the moving pixels can go cover them: a frame far
+/// across the canvas stays on it, so opening and closing the box redraws only near the layer.
+#[test]
+fn only_layers_near_the_moving_one_cover_it() {
+    use photocraft_doc::Layer;
+    let canvas = photocraft_geom::Rect::new(0, 0, 4000, 1000);
+    let frame = |name: &str, r: photocraft_geom::Rect| {
+        let mut l = Layer::raster(name, photocraft_color::PixelFormat::RGBA8);
+        l.surface_mut().unwrap().fill_rect(r, &[1.0, 0.0, 0.0, 1.0]);
+        l
+    };
+    let moving = frame("moving", photocraft_geom::Rect::new(100, 100, 300, 300));
+    let near = frame("near", photocraft_geom::Rect::new(250, 250, 500, 500));
+    let far = frame("far", photocraft_geom::Rect::new(3500, 100, 3900, 900));
+    let (m, n, f) = (moving.id, near.id, far.id);
+    let layers = vec![moving, near, far];
+    let covers = |area: Option<photocraft_geom::Rect>| {
+        let mut out = Vec::new();
+        super::preview::covering_in(&layers, m, area.map(|a| (a, canvas)), &mut out, &mut Vec::new());
+        out
+    };
+    assert_eq!(covers(None), [f, n], "without an area: every layer over it, as before");
+    let area = super::preview::near_area(photocraft_geom::Rect::new(100, 100, 300, 300));
+    assert_eq!(covers(Some(area)), [n], "the far frame stays on the canvas");
+}
+
 #[test]
 fn plain_layers_from_the_top_cover_the_moving_one() {
     use photocraft_color::BlendMode;
@@ -2377,7 +2403,7 @@ fn plain_layers_from_the_top_cover_the_moving_one() {
     assert_eq!(covers(&layers, c), [tp, inner], "a clipped layer: covered by what is over its clipping group");
 
     // Under the box, the covering layers leave the document; over it, they alone show.
-    let above = Above { ctx: egui::Context::default(), name: String::new(), max_side: 64, ids: vec![tp, inner], shown: None };
+    let above = Above { ctx: egui::Context::default(), name: String::new(), max_side: 64, ids: vec![tp, inner], near: None, shown: None };
     let mut under = layers.clone();
     above.hide_in(&mut under);
     let vis = |ls: &[Layer]| [ls[0].visible, ls[1].visible, ls[2].visible];
