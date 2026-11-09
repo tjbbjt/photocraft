@@ -246,13 +246,12 @@ pub(super) fn covering(layers: &[photocraft_doc::Layer], id: LayerId, out: &mut 
 }
 
 /// Where the moving pixels in `frame` can show while the box is open, for [`covering_in`]: the
-/// frame grown by half its longer side each way, so a box scaled up or nudged a fair way still
-/// passes under the layers over it. A layer beyond that stays in the document under the box,
-/// drawn under the moving pixels in the preview if they are dragged that far; the committed
-/// result is exact either way.
+/// frame itself. A layer over the moving one but outside its frame stays in the document under the
+/// box (its frame-mates on a storyboard stay put instead of redrawing), so if the box is dragged
+/// or scaled over such a layer, the preview draws the moving pixels over it until Enter; the
+/// committed result is exact either way.
 pub(super) fn near_area(frame: photocraft_geom::Rect) -> photocraft_geom::Rect {
-    let grow = (frame.width().max(frame.height()) / 2).min(i32::MAX as u32) as i32;
-    frame.inflate(grow)
+    frame
 }
 
 /// [`covering`], but with `near` = `(area, canvas)` only the layers over `area` cover: on a

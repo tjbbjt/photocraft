@@ -2321,7 +2321,6 @@ fn only_layers_near_the_moving_one_cover_it() {
     };
     assert_eq!(covers(None), [f, n], "without an area: every layer over it, as before");
     let area = near_area(photocraft_geom::Rect::new(100, 100, 300, 300));
-    assert_eq!(area, photocraft_geom::Rect::new(0, 0, 400, 400), "grown by half its longer side");
     assert_eq!(covers(Some(area)), [n], "the far frame stays on the canvas");
 }
 

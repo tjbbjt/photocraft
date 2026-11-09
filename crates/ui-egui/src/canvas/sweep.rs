@@ -162,7 +162,14 @@ pub(crate) fn start(app: &mut PhotocraftApp, doc: &Document, visible: Rect) {
 /// everything in blocks. A sweep already running is that net for the blocks it hasn't drawn, and
 /// restarting it would throw away the ones it has (each change, such as a transform's commit and
 /// the selection update after it, restarted a whole-canvas redraw), so it carries on instead.
+///
+/// Off unless `PHOTOCRAFT_SWEEP_SAFETY_NET` is set: on a storyboard of hundreds of layers the net
+/// redrew the whole canvas (about 5 s) after every bounded change, such as a layer dropped from
+/// another document, though the comparison had already redrawn what changed.
 pub(crate) fn safety_net(app: &mut PhotocraftApp, doc: &Document, visible: Rect) {
+    if std::env::var_os("PHOTOCRAFT_SWEEP_SAFETY_NET").is_none() {
+        return;
+    }
     if !running(app, doc.id) {
         start(app, doc, visible);
     }
