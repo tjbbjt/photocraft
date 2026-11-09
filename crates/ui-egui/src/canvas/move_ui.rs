@@ -199,7 +199,13 @@ fn start_snapshot(doc: &Document, moving: &[LayerId], rect: Rect) -> Option<Snap
     #[cfg(not(target_arch = "wasm32"))]
     {
         let started = std::thread::Builder::new().name("photocraft-drag-snapshot".into()).spawn(move || {
-            let _ = tx.send(photocraft_compose::render_reduced_rect(&only, rect, w, h));
+            // On a small pool of its own: in the shared one its tiles queued ahead of the redraw
+            // thread's uploads, and the canvas blocks drawn meanwhile took 100–260 ms each.
+            let picture = match snapshot_pool() {
+                Some(pool) => pool.install(|| photocraft_compose::render_reduced_rect(&only, rect, w, h)),
+                None => photocraft_compose::render_reduced_rect(&only, rect, w, h),
+            };
+            let _ = tx.send(picture);
         });
         started.ok()?;
     }
@@ -208,6 +214,18 @@ fn start_snapshot(doc: &Document, moving: &[LayerId], rect: Rect) -> Option<Snap
         let _ = tx.send(photocraft_compose::render_reduced_rect(&only, rect, w, h));
     }
     Some(Snapshot { rect, rx: Some(rx), texture: None })
+}
+
+/// The thread pool drag snapshots render on: half the cores, so the redraw thread's work on the
+/// shared pool goes on meanwhile. `None` if it couldn't be built (the shared pool is used).
+#[cfg(not(target_arch = "wasm32"))]
+fn snapshot_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(1));
+        rayon::ThreadPoolBuilder::new().num_threads(n).thread_name(|i| format!("photocraft-snapshot-{i}")).build().ok()
+    })
+    .as_ref()
 }
 
 /// Draws a costly drag's snapshot at the pointer, once its render has arrived (taking it).

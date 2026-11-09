@@ -64,7 +64,25 @@ struct Totals {
     work: Work,
     /// Blocks were composited on the redraw thread ([`super::redraw_thread`]).
     threaded: bool,
+    /// Time the sweep was under way while its document was shown (ms): a background tab's sweep
+    /// waits until it is shown again, and its wall-clock time read as a 18 s redraw.
+    active_ms: f64,
+    last_frame_ms: f64,
 }
+
+impl Totals {
+    /// Count a frame of the sweep at `now`; gaps longer than a few frames are time it waited.
+    fn frame(&mut self, now: f64) {
+        self.frames += 1;
+        if self.last_frame_ms > 0.0 {
+            self.active_ms += (now - self.last_frame_ms).clamp(0.0, MAX_FRAME_GAP_MS);
+        }
+        self.last_frame_ms = now;
+    }
+}
+
+/// A gap between a sweep's frames longer than this (ms) counts as waiting, not redrawing.
+const MAX_FRAME_GAP_MS: f64 = 250.0;
 
 /// Compositor work summed over a sweep's blocks, for its log line.
 #[derive(Clone, Copy, Debug, Default)]
@@ -288,7 +306,7 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
     let mut gpu_estimate = 0.0;
     if let Some(s) = app.canvas_states.get_mut(&doc.id) {
         let totals = s.totals.get_or_insert_with(|| Totals { started_ms: started, work: Work::planned(doc), ..Totals::default() });
-        totals.frames += 1;
+        totals.frame(crate::gpu_canvas::now_ms());
     }
     let mut batches = true;
     loop {
@@ -364,8 +382,7 @@ fn step_threaded(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, 
     super::redraw_thread::publish(app, doc, display.is_some_and(|d| d.encode_srgb));
     if let Some(s) = app.canvas_states.get_mut(&doc.id) {
         let totals = s.totals.get_or_insert_with(|| Totals { started_ms: now, work: Work::planned(doc), ..Totals::default() });
-        totals.frames += 1;
-        totals.threaded = true;
+        totals.frame(crate::gpu_canvas::now_ms());
     }
     let failed = app.canvas_states.get(&doc.id).is_some_and(|s| s.thread_failed || s.thread_wait_until > now);
 
@@ -418,6 +435,9 @@ fn land_finished(app: &mut PhotocraftApp) {
                     ..Default::default()
                 };
                 s.account(px, done.blocks.len() as u32, &r);
+                if let Some(t) = s.totals.as_mut() {
+                    t.threaded = true;
+                }
             }
             // Not ready yet (the compositor still building at startup, or out on a UI-thread
             // render): the blocks wait a moment and go again.
@@ -537,13 +557,20 @@ fn finish(app: &mut PhotocraftApp, gpu: &GpuCanvas, doc: DocId, step: Step) -> S
             t.px as f64 / 1_048_576.0,
             t.blocks,
             t.frames,
-            crate::gpu_canvas::now_ms() - t.started_ms,
+            {
+                let now = crate::gpu_canvas::now_ms();
+                t.active_ms + (now - t.last_frame_ms).clamp(0.0, MAX_FRAME_GAP_MS)
+            },
             t.cpu_ms,
             if t.threaded { "on the redraw thread" } else { "on the UI thread" },
             t.uploads,
             mb(resident),
             t.work.describe(t.blocks) + &t.work.stages(t.blocks, t.cpu_ms),
-            if step == Step::Failed { "; stopped" } else { "" },
+            {
+                let waited = (crate::gpu_canvas::now_ms() - t.started_ms) - t.active_ms;
+                let waited = if waited > 1000.0 { format!("; waited {:.1} s while not shown", waited / 1000.0) } else { String::new() };
+                waited + if step == Step::Failed { "; stopped" } else { "" }
+            },
         );
     }
     step
