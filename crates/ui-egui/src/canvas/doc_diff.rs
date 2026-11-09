@@ -29,13 +29,33 @@ pub(crate) fn changed_area(old: &Document, new: &Document) -> Option<Rect> {
     }
     let canvas = old.bounds();
     let mut area = Changed::Nothing;
-    diff_list(&old.layers, &new.layers, canvas, &mut area);
+    let mut view_only = false;
+    diff_list(&old.layers, &new.layers, canvas, &mut area, &mut view_only);
     match area {
         Changed::Area(r) => Some(r.intersect(&canvas)),
+        // Only groups opened or closed in the Layers panel (a view change kept in the document,
+        // `Group::expanded`): no pixel differs. Counted as a property change, it redrew a whole
+        // storyboard folder each time selecting one revealed it.
+        Changed::Nothing if view_only => Some(Rect::EMPTY),
         // No visible difference here is still a change the caller saw: something this doesn't
         // look at (a display setting, a view state) may have changed, so redraw everything.
         Changed::Nothing | Changed::Unknown => None,
     }
+}
+
+/// Whether `new` composites exactly as `old` does, as far as this comparison can tell: the same
+/// document, or one whose only differences are view state (the selection, groups opened or
+/// closed). Lets a picture of `old` (the stored composite shown while a file opens) stay up.
+pub(crate) fn same_pixels(old: &Document, new: &Document) -> bool {
+    if std::ptr::eq(old, new) {
+        return true;
+    }
+    if old.size != new.size || !same_outside_layers(old, new) {
+        return false;
+    }
+    let mut area = Changed::Nothing;
+    diff_list(&old.layers, &new.layers, old.bounds(), &mut area, &mut false);
+    area == Changed::Nothing
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,7 +82,7 @@ fn same_outside_layers(old: &Document, new: &Document) -> bool {
 }
 
 /// Compare two sibling lists layer by layer. The same layers in the same order, or `Unknown`.
-fn diff_list(old: &[Layer], new: &[Layer], canvas: Rect, area: &mut Changed) {
+fn diff_list(old: &[Layer], new: &[Layer], canvas: Rect, area: &mut Changed, view_only: &mut bool) {
     if old.len() != new.len() || old.iter().zip(new).any(|(a, b)| a.id != b.id) {
         area.add(None);
         return;
@@ -71,18 +91,23 @@ fn diff_list(old: &[Layer], new: &[Layer], canvas: Rect, area: &mut Changed) {
         if *area == Changed::Unknown {
             return;
         }
-        diff_layer(a, b, canvas, area);
+        diff_layer(a, b, canvas, area, view_only);
     }
 }
 
-fn diff_layer(a: &Layer, b: &Layer, canvas: Rect, area: &mut Changed) {
+fn diff_layer(a: &Layer, b: &Layer, canvas: Rect, area: &mut Changed, view_only: &mut bool) {
     if same_props(a, b) {
+        if let (LayerContent::Group(ga), LayerContent::Group(gb)) = (&a.content, &b.content)
+            && ga.expanded != gb.expanded
+        {
+            *view_only = true;
+        }
         match (&a.content, &b.content) {
             // Only pixels changed: where their tiles differ. Blending, clipping and effects act
             // pixel by pixel (effects spread further, which the caller's effect reach covers).
             (LayerContent::Raster(sa), LayerContent::Raster(sb)) => area.add(tile_diff(sa, sb, canvas)),
             // Only children changed: where they did.
-            (LayerContent::Group(ga), LayerContent::Group(gb)) => diff_list(&ga.children, &gb.children, canvas, area),
+            (LayerContent::Group(ga), LayerContent::Group(gb)) => diff_list(&ga.children, &gb.children, canvas, area, view_only),
             // `same_props` compares every other kind of content in full: nothing differs.
             _ => {}
         }
@@ -95,13 +120,17 @@ fn diff_layer(a: &Layer, b: &Layer, canvas: Rect, area: &mut Changed) {
     area.add(photocraft_compose::change_bounds(b, canvas));
 }
 
-/// The layers equal except for a pixel layer's own pixels and a group's children.
+/// The layers equal except for a pixel layer's own pixels, a group's children and whether the
+/// group is open in the Layers panel (no pixel depends on that).
 fn same_props(a: &Layer, b: &Layer) -> bool {
     fn shell(l: &Layer) -> Layer {
         let mut l = l.clone();
         match &mut l.content {
             LayerContent::Raster(s) => *s = Surface::new(s.format()),
-            LayerContent::Group(g) => g.children.clear(),
+            LayerContent::Group(g) => {
+                g.children.clear();
+                g.expanded = false;
+            }
             _ => {}
         }
         l
@@ -199,5 +228,23 @@ mod tests {
             assert_eq!(changed_area(&before, &after), None);
         }
         let _ = a;
+    }
+
+    #[test]
+    fn opening_or_closing_a_group_changes_no_pixels() {
+        let (mut s, a, _) = doc_with_two_layers();
+        paint(&mut s, a, Rect::new(100, 100, 300, 200));
+        s.select_layer(a).unwrap();
+        s.execute("layer.new.groupFromLayers", json!({"name": "G"})).unwrap();
+        let before = s.active().unwrap().doc.clone();
+        assert!(before.walk().iter().any(|(_, _, l)| l.is_group()), "the test needs a group");
+        s.execute("layer.setExpanded", json!({"all": true})).unwrap();
+        let after = s.active().unwrap().doc.clone();
+        assert!(!std::sync::Arc::ptr_eq(&before, &after), "expanding gave a new document");
+        assert_eq!(changed_area(&before, &after), Some(Rect::EMPTY));
+        assert!(same_pixels(&before, &after));
+        // A real change still shows.
+        paint(&mut s, a, Rect::new(1500, 600, 1520, 620));
+        assert!(!same_pixels(&before, &s.active().unwrap().doc.clone()));
     }
 }

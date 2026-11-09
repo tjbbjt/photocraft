@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use photocraft_doc::DocId;
+use photocraft_doc::{DocId, Document};
 use photocraft_geom::Rect;
 
 use crate::PhotocraftApp;
@@ -22,11 +22,12 @@ pub(crate) enum OpenPreview {
     Loading {
         rx: Receiver<Option<photocraft_io::saved_composite::SavedComposite>>,
         cancel: Arc<AtomicBool>,
-        revision: u64,
+        /// The document the composite stands for (`None` until the read is attached to one).
+        doc: Option<Arc<Document>>,
     },
     Ready {
         texture: egui::TextureHandle,
-        revision: u64,
+        doc: Option<Arc<Document>>,
     },
     /// None to show, or no longer needed: never read again for this document.
     Done,
@@ -53,57 +54,91 @@ fn readable(path: &str) -> bool {
     matches!(ext.as_deref(), Some("psd" | "psb"))
 }
 
+/// Starts reading `path`'s stored composite on a thread.
+fn spawn_read(path: String, ctx: &egui::Context) -> OpenPreview {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let ctx2 = ctx.clone();
+        let started = std::thread::Builder::new().name("photocraft-open-preview".into()).spawn(move || {
+            let t0 = std::time::Instant::now();
+            let read = photocraft_io::saved_composite::saved_composite_at(std::path::Path::new(&path), MAX_SIDE, &|| flag.load(Ordering::Relaxed));
+            match &read {
+                Ok(Some(c)) => {
+                    log::info!("open preview: stored composite read at {}×{} (1/{}) in {} ms", c.width, c.height, c.factor, t0.elapsed().as_millis())
+                }
+                Ok(None) => log::info!("open preview: the file has no stored composite to show"),
+                Err(e) => log::info!("open preview: the stored composite couldn't be read: {e}"),
+            }
+            let _ = tx.send(read.ok().flatten());
+            ctx2.request_repaint();
+        });
+        if started.is_ok() { OpenPreview::Loading { rx, cancel, doc: None } } else { OpenPreview::Done }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (path, ctx);
+        OpenPreview::Done
+    }
+}
+
+/// Starts reading the stored composite of each PSD/PSB being opened in the background, so it is
+/// ready by the time the document arrives rather than seconds into its first draw. Reads whose
+/// open ended without a document are dropped. Called once per frame.
+pub(crate) fn prefetch(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    let opening: Vec<String> = app.jobs.opens.iter().filter_map(|o| o.path.clone()).filter(|p| readable(p)).collect();
+    for path in &opening {
+        if !app.open_preview_reads.contains_key(path) {
+            let read = spawn_read(path.clone(), ctx);
+            app.open_preview_reads.insert(path.clone(), read);
+        }
+    }
+    let docs: Vec<String> = app.session.documents().iter().filter_map(|d| d.path.clone()).collect();
+    app.open_preview_reads.retain(|p, _| opening.contains(p) || docs.contains(p));
+}
+
 /// Starts reading the stored composite of the document at `idx` when it has just opened, takes a
 /// finished read, and drops what is no longer needed. Called once per frame per shown document.
 fn update(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) -> Option<DocId> {
     let st = app.session.documents().get(idx)?;
-    let (id, revision, path) = (st.doc.id, st.revision, st.path.clone());
+    // Kept while the document composites as it did: selecting a layer moves the revision, and
+    // selecting a storyboard's folder opens its parents (a new document, no pixel changed); either
+    // dropped the preview mid-draw, and the storyboard looked as if it started drawing again.
+    let (id, now, path) = (st.doc.id, st.doc.clone(), st.path.clone());
     let done = first_draw_done(app, id);
     match app.open_previews.get_mut(&id) {
         None => {
-            // Only a document opened from a PSD/PSB, before its canvas has ever been drawn.
+            // Only a document opened from a PSD/PSB, before its canvas has ever been drawn: the
+            // read started while the file was opening, if it was, else now.
             let path = path.filter(|p| readable(p) && !done)?;
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let cancel = Arc::new(AtomicBool::new(false));
-                let flag = cancel.clone();
-                let ctx2 = ctx.clone();
-                let started = std::thread::Builder::new().name("photocraft-open-preview".into()).spawn(move || {
-                    let t0 = std::time::Instant::now();
-                    let read = photocraft_io::saved_composite::saved_composite_at(std::path::Path::new(&path), MAX_SIDE, &|| flag.load(Ordering::Relaxed));
-                    match &read {
-                        Ok(Some(c)) => {
-                            log::info!("open preview: stored composite read at {}×{} (1/{}) in {} ms", c.width, c.height, c.factor, t0.elapsed().as_millis())
-                        }
-                        Ok(None) => log::info!("open preview: the file has no stored composite to show"),
-                        Err(e) => log::info!("open preview: the stored composite couldn't be read: {e}"),
-                    }
-                    let _ = tx.send(read.ok().flatten());
-                    ctx2.request_repaint();
-                });
-                let preview = if started.is_ok() { OpenPreview::Loading { rx, cancel, revision } } else { OpenPreview::Done };
-                app.open_previews.insert(id, preview);
+            let mut preview = app.open_preview_reads.remove(&path).unwrap_or_else(|| spawn_read(path, ctx));
+            if let OpenPreview::Loading { doc, .. } = &mut preview {
+                *doc = Some(now);
             }
-            #[cfg(target_arch = "wasm32")]
-            {
-                let _ = (path, ctx);
-                app.open_previews.insert(id, OpenPreview::Done);
-            }
+            app.open_previews.insert(id, preview);
         }
         Some(p) => {
             let stale = match p {
-                OpenPreview::Loading { revision: r, .. } | OpenPreview::Ready { revision: r, .. } => *r != revision || done,
+                OpenPreview::Loading { doc, .. } | OpenPreview::Ready { doc, .. } => {
+                    let same = doc.as_ref().is_some_and(|d| Arc::ptr_eq(d, &now) || super::doc_diff::same_pixels(d, &now));
+                    if same {
+                        // Compare with the newest next time (and let the old version go).
+                        *doc = Some(now);
+                    }
+                    !same || done
+                }
                 OpenPreview::Done => false,
             };
             if stale {
                 *p = OpenPreview::Done;
-            } else if let OpenPreview::Loading { rx, revision: r, .. } = p {
+            } else if let OpenPreview::Loading { rx, doc, .. } = p {
                 match rx.try_recv() {
                     Ok(Some(c)) => {
                         let image = egui::ColorImage::from_rgba_unmultiplied([c.width as usize, c.height as usize], &c.rgba);
                         let texture = ctx.load_texture(format!("open-preview-{}", id.0), image, egui::TextureOptions::LINEAR);
-                        *p = OpenPreview::Ready { texture, revision: *r };
+                        *p = OpenPreview::Ready { texture, doc: doc.take() };
                     }
                     Ok(None) | Err(TryRecvError::Disconnected) => *p = OpenPreview::Done,
                     Err(TryRecvError::Empty) => {}

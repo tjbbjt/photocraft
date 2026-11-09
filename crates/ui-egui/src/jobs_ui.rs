@@ -459,6 +459,7 @@ fn close_after_saves(app: &mut PhotocraftApp, ctx: &egui::Context) {
 /// Per frame: apply finished jobs and react to them; keep frames coming while jobs run; Esc
 /// cancels the job in view.
 pub fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    crate::canvas::open_preview::prefetch(app, ctx);
     let t0 = crate::gpu_canvas::now_ms();
     let events = app.session.poll_jobs();
     let applied = crate::gpu_canvas::now_ms() - t0;

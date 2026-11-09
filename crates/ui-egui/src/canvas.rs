@@ -442,7 +442,7 @@ fn paint_canvas(
             offset: [0.0, 0.0],
         };
         paint_gpu_view(painter, rect, params, &pattern);
-    } else if gpu_ok && ensure_gpu(app, ctx, idx, redraw_focus(&target_xf, &xf)) {
+    } else if gpu_ok && crate::frame_stages::timed("canvas refresh", || ensure_gpu(app, ctx, idx, redraw_focus(&target_xf, &xf))) {
         on_gpu = true;
         app.perf.gpu = true;
         // Shadow, checkerboard, document and pixel grid in one custom shader (gpu_canvas.rs).
@@ -1312,7 +1312,7 @@ fn paint_primary_overlays(app: &mut PhotocraftApp, ui: &mut egui::Ui, view: &mut
     let edge_rect = input.edge_rect;
     // The transform preview is image content: it goes under the grid and guides, which
     // stay visible across a layer being transformed (#5086); the box is drawn later.
-    crate::transform_tool::draw_content(app, painter, xf);
+    crate::frame_stages::timed("transform preview", || crate::transform_tool::draw_content(app, painter, xf));
     // So are Puppet Warp's, Perspective Warp's and Vanishing Point's warped pixels (#7781).
     crate::distort_ui::draw_content(app, painter, xf);
     // A PSD/PSB's stored composite over what the first draw hasn't reached yet.
@@ -1343,7 +1343,7 @@ fn paint_primary_overlays(app: &mut PhotocraftApp, ui: &mut egui::Ui, view: &mut
     }
     crate::zoom_tool::draw(ctx, painter);
     let resizing = crate::brush_resize::draw(app, painter, xf);
-    draw_transform_controls(app, painter, xf);
+    crate::frame_stages::timed("transform controls", || draw_transform_controls(app, painter, xf));
     crate::move_hover::draw(app, painter, xf, idx, response.hover_pos());
     crate::object_finder::draw(app, painter, xf, idx, response.hover_pos());
     crate::layer_pick_ui::show(app, ctx);
