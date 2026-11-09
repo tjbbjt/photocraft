@@ -240,7 +240,10 @@ pub(crate) fn safety_net(app: &mut PhotocraftApp, doc: &Document, visible: Rect)
     }
 }
 
-/// Add `region` of `doc`'s canvas to its sweep, drawn before what was already pending.
+/// Add `region` of `doc`'s canvas to its sweep. Blocks of `region` still waiting from before
+/// (what is being redrawn was touched again) go first; its other blocks take turns with the rest
+/// of the sweep, a job of each at a time, so a change elsewhere (a storyboard hidden or shown) no
+/// longer holds up the rest of the canvas until it is drawn.
 pub(crate) fn add(app: &mut PhotocraftApp, doc: &Document, region: Rect, visible: Rect) {
     let region = region.intersect(&doc.bounds());
     if region.is_empty() {
@@ -257,9 +260,32 @@ pub(crate) fn add(app: &mut PhotocraftApp, doc: &Document, region: Rect, visible
     // the canvas (6375 MP over a minute) and the blocks of earlier places waited behind the
     // newer ones. Popped from the end: the new blocks first.
     let new = blocks(region, doc.bounds(), visible, block_size(state.gpu_ms_per_mp));
-    let queued: std::collections::HashSet<(i32, i32, i32, i32)> = new.iter().map(|b| (b.x0, b.y0, b.x1, b.y1)).collect();
-    state.pending.retain(|b| !queued.contains(&(b.x0, b.y0, b.x1, b.y1)));
-    state.pending.extend(new);
+    state.pending = queue_after_add(std::mem::take(&mut state.pending), new);
+}
+
+/// The sweep's queue (`pending`, popped from the end) once `new` (popped from the end too) joins
+/// it: see [`add`].
+fn queue_after_add(pending: Vec<Rect>, new: Vec<Rect>) -> Vec<Rect> {
+    use super::redraw_thread::JOB_BLOCKS;
+    let key = |b: &Rect| (b.x0, b.y0, b.x1, b.y1);
+    let waiting: std::collections::HashSet<_> = pending.iter().map(key).collect();
+    let queued: std::collections::HashSet<_> = new.iter().map(key).collect();
+    // In the order they are drawn.
+    let rest: Vec<Rect> = pending.into_iter().rev().filter(|b| !queued.contains(&key(b))).collect();
+    let (again, fresh): (Vec<Rect>, Vec<Rect>) = new.into_iter().rev().partition(|b| waiting.contains(&key(b)));
+    let mut order = again;
+    let (mut a, mut b) = (fresh.chunks(JOB_BLOCKS), rest.chunks(JOB_BLOCKS));
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => break,
+            (x, y) => {
+                order.extend(x.into_iter().flatten());
+                order.extend(y.into_iter().flatten());
+            }
+        }
+    }
+    order.reverse();
+    order
 }
 
 /// Forget a sweep that failed, after a full refresh landed.
@@ -621,6 +647,24 @@ fn blocks(region: Rect, canvas: Rect, visible: Rect, (block_w, block_h): (i32, i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_region_takes_turns_with_the_sweep_and_blocks_waiting_again_go_first() {
+        let r = |x: i32| Rect::new(x, 0, x + 1, 1);
+        // Drawn in the order 0, 1, ... 7 (popped from the end).
+        let pending: Vec<Rect> = (0..8).rev().map(r).collect();
+        // A region of blocks 100..106 and block 5, which was still waiting.
+        let new: Vec<Rect> = [100, 101, 102, 5, 103, 104, 105].into_iter().rev().map(r).collect();
+        let mut q = queue_after_add(pending, new);
+        let mut order = Vec::new();
+        while let Some(b) = q.pop() {
+            order.push(b.x0);
+        }
+        assert_eq!(order, [5, 100, 101, 102, 0, 1, 2, 103, 104, 105, 3, 4, 6, 7]);
+        // Nothing running: the region alone, in its own order.
+        let mut q = queue_after_add(Vec::new(), [1, 2].into_iter().rev().map(r).collect());
+        assert_eq!((q.pop().map(|b| b.x0), q.pop().map(|b| b.x0)), (Some(1), Some(2)));
+    }
 
     #[test]
     fn blocks_cover_the_canvas_once_and_draw_the_view_first() {
