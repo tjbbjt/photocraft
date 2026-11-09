@@ -388,8 +388,7 @@ fn step_threaded(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, 
 
     if !failed {
         // Keep the thread fed: the next blocks (popped from the end) in jobs of a few.
-        loop {
-            let Some(s) = app.canvas_states.get_mut(&doc.id) else { break };
+        while let Some(s) = app.canvas_states.get_mut(&doc.id) {
             if s.in_flight.len() >= IN_FLIGHT || s.pending.is_empty() {
                 break;
             }

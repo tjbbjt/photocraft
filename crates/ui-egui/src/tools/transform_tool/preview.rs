@@ -230,6 +230,7 @@ fn plain(l: &photocraft_doc::Layer) -> bool {
 /// layer (#9387). An adjustment layer over covering layers goes to `applied`: it stays under the
 /// box and is composited with them as well, so they keep its adjustment. A clipping group goes as
 /// a whole, and the layers clipped to `id` (or to the group holding it) stay with it.
+#[cfg(test)]
 pub(super) fn covering(layers: &[photocraft_doc::Layer], id: LayerId, out: &mut Vec<LayerId>, applied: &mut Vec<LayerId>) {
     covering_in(layers, id, None, out, applied);
 }

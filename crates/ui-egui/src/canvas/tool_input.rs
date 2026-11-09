@@ -54,6 +54,10 @@ fn tool_move(app: &mut PhotocraftApp, x: f64, y: f64, pressure: f32, mods: egui:
 }
 
 fn preflight_tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) -> Option<(bool, egui::Modifiers)> {
+    // A released stroke still catching up commits before anything new starts.
+    if matches!(ev, ToolEvent::Down { .. }) {
+        super::strokes::flush_finishing_stroke(app);
+    }
     // A press anywhere but on a guide deselects the selected guide (`guide_select`).
     if let ToolEvent::Down { x, y, .. } = ev
         && app.ui.selected_guide.is_some()
@@ -397,10 +401,6 @@ fn clear_off_on_background(app: &mut PhotocraftApp, tool: Tool) {
 
 /// Tool state machine. Shared by mouse input and automation.
 pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) {
-    // A released stroke still catching up commits before anything new starts.
-    if matches!(ev, ToolEvent::Down { .. }) {
-        super::strokes::flush_finishing_stroke(app);
-    }
     if consumes_cancelled_vector_event(app, ev) {
         return;
     }
