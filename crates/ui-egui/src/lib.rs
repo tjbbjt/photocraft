@@ -637,6 +637,8 @@ pub struct PhotocraftApp {
     pub(crate) open_previews: HashMap<DocId, crate::canvas::open_preview::OpenPreview>,
     /// Stored composites being read while their files open, by path (`open_preview::prefetch`).
     pub(crate) open_preview_reads: HashMap<String, crate::canvas::open_preview::OpenPreview>,
+    /// What the canvas showed over hidden layers, to put back when they are shown again.
+    pub(crate) board_cache: crate::canvas::board_cache::BoardCache,
     /// The session clipboard currently holds an image imported from the OS clipboard: it has no
     /// original position, so Paste centres it (see `menus` "edit.paste").
     pub(crate) clip_external: bool,

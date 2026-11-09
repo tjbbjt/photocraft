@@ -49,6 +49,14 @@ pub struct Stats {
     /// canvas), summed over cells; `pass_bindings` counts every pass a cell considered.
     pub passes_culled: usize,
     pub pass_bindings: usize,
+    /// CPU time of the render's stages (ms): planning the document, checking the lower-stack
+    /// cache against it, effect maps and frame resources, drawing the cells, and the clean-up
+    /// after them. For the sweep's log line: where a block's time goes.
+    pub plan_ms: f64,
+    pub prepare_ms: f64,
+    pub setup_ms: f64,
+    pub cells_ms: f64,
+    pub tail_ms: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -80,6 +80,9 @@ struct Work {
     /// Pass bindings skipped as outside their blocks, of all considered.
     culled: u64,
     bindings: u64,
+    /// Renders (one per block, or per batch of blocks) and their CPU stages, summed (ms).
+    renders: u64,
+    stage_ms: [f64; 5],
     /// The scratch disk's counters when the sweep started.
     scratch: crate::frame_stages::ScratchMark,
 }
@@ -102,6 +105,24 @@ impl Work {
         self.flushes += s.flushes as u64;
         self.culled += s.passes_culled as u64;
         self.bindings += s.pass_bindings as u64;
+        self.renders += 1;
+        for (sum, v) in self.stage_ms.iter_mut().zip([s.plan_ms, s.prepare_ms, s.setup_ms, s.cells_ms, s.tail_ms]) {
+            *sum += v;
+        }
+    }
+
+    /// "; per render (2.1 blocks): plan 3.9, cache check 2.0, setup 0.5, cells 4.1, clean-up 1.2, other 3.0 ms"
+    fn stages(&self, blocks: u32, cpu_ms: f64) -> String {
+        if self.renders == 0 {
+            return String::new();
+        }
+        let n = self.renders as f64;
+        let [plan, prepare, setup, cells, tail] = self.stage_ms.map(|v| v / n);
+        let other = (cpu_ms / n - (plan + prepare + setup + cells + tail)).max(0.0);
+        format!(
+            "; per render ({:.1} blocks): plan {plan:.1}, cache check {prepare:.1}, setup {setup:.1}, cells {cells:.1}, clean-up {tail:.1}, other {other:.1} ms",
+            f64::from(blocks) / n
+        )
     }
 
     /// "; plan 0.4 ms × 378 blocks, 12 passes (1 with effects), 4536 chunks, …"
@@ -346,11 +367,36 @@ fn batch_len(app: &PhotocraftApp, doc: DocId, started: f64, gpu_estimate: f64) -
     let Some(s) = app.canvas_states.get(&doc) else { return 1 };
     let Some(t) = s.totals.as_ref().filter(|t| t.blocks > 0) else { return 1 };
     let Some(next) = s.pending.last() else { return 1 };
-    let cpu = t.cpu_ms / f64::from(t.blocks);
+    // A render plans the document once, however many blocks it draws: that part is paid once.
+    let w = &t.work;
+    let plan = if w.renders > 0 { w.stage_ms[0] / w.renders as f64 } else { 0.0 };
+    let cpu = ((t.cpu_ms - plan * w.renders as f64) / f64::from(t.blocks)).max(0.1);
     let gpu = s.gpu_ms_per_mp.unwrap_or(0.0) * (next.size().area() as f64 / 1_048_576.0);
-    let left = FRAME_BUDGET_MS - (crate::gpu_canvas::now_ms() - started).max(gpu_estimate);
+    let left = FRAME_BUDGET_MS - (crate::gpu_canvas::now_ms() - started).max(gpu_estimate) - plan;
     let each = cpu.max(gpu).max(0.1);
     ((left / each).floor().max(1.0) as usize).min(MAX_BATCH)
+}
+
+/// A thin bar along the bottom of the canvas view with the share of a long sweep drawn so far
+/// (shown once it has run for half a second). Numbers only, so it needs no translation.
+pub(crate) fn draw_progress(app: &PhotocraftApp, painter: &egui::Painter, doc: DocId) {
+    let Some(s) = app.canvas_states.get(&doc) else { return };
+    let Some(t) = s.totals.as_ref() else { return };
+    if s.pending.is_empty() || crate::gpu_canvas::now_ms() - t.started_ms < 500.0 {
+        return;
+    }
+    let done = f64::from(t.blocks) / (f64::from(t.blocks) + s.pending.len() as f64);
+    let view = painter.clip_rect();
+    let bar = egui::Rect::from_min_max(egui::pos2(view.left(), view.bottom() - 4.0), view.right_bottom());
+    let fill = egui::Rect::from_min_max(bar.min, egui::pos2(bar.left() + bar.width() * done as f32, bar.bottom()));
+    painter.rect_filled(bar, 0.0, egui::Color32::from_black_alpha(140));
+    painter.rect_filled(fill, 0.0, egui::Color32::from_rgb(70, 140, 230));
+    let label = format!("{:.0}%", done * 100.0);
+    let at = egui::pos2(view.left() + 8.0, bar.top() - 4.0);
+    let galley = painter.layout_no_wrap(label, egui::FontId::proportional(12.0), egui::Color32::WHITE);
+    let back = egui::Rect::from_min_size(egui::pos2(at.x - 4.0, at.y - galley.size().y - 2.0), galley.size() + egui::vec2(8.0, 4.0));
+    painter.rect_filled(back, 3.0, egui::Color32::from_black_alpha(160));
+    painter.galley(egui::pos2(at.x, at.y - galley.size().y), galley, egui::Color32::WHITE);
 }
 
 /// Most blocks drawn in one render.
@@ -375,7 +421,7 @@ fn finish(app: &mut PhotocraftApp, gpu: &GpuCanvas, doc: DocId, step: Step) -> S
             t.cpu_ms,
             t.uploads,
             mb(resident),
-            t.work.describe(t.blocks),
+            t.work.describe(t.blocks) + &t.work.stages(t.blocks, t.cpu_ms),
             if step == Step::Failed { "; stopped" } else { "" },
         );
     }

@@ -24,10 +24,14 @@ pub(crate) enum OpenPreview {
         cancel: Arc<AtomicBool>,
         /// The document the composite stands for (`None` until the read is attached to one).
         doc: Option<Arc<Document>>,
+        /// Where the document has changed since it opened (a storyboard hidden mid-draw): the
+        /// composite no longer shows those parts, so they wait for the canvas instead.
+        stale: Vec<Rect>,
     },
     Ready {
         texture: egui::TextureHandle,
         doc: Option<Arc<Document>>,
+        stale: Vec<Rect>,
     },
     /// None to show, or no longer needed: never read again for this document.
     Done,
@@ -75,7 +79,7 @@ fn spawn_read(path: String, ctx: &egui::Context) -> OpenPreview {
             let _ = tx.send(read.ok().flatten());
             ctx2.request_repaint();
         });
-        if started.is_ok() { OpenPreview::Loading { rx, cancel, doc: None } } else { OpenPreview::Done }
+        if started.is_ok() { OpenPreview::Loading { rx, cancel, doc: None, stale: Vec::new() } } else { OpenPreview::Done }
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -121,24 +125,38 @@ fn update(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) -> Option<Do
         }
         Some(p) => {
             let stale = match p {
-                OpenPreview::Loading { doc, .. } | OpenPreview::Ready { doc, .. } => {
-                    let same = doc.as_ref().is_some_and(|d| Arc::ptr_eq(d, &now) || super::doc_diff::same_pixels(d, &now));
-                    if same {
+                OpenPreview::Loading { doc, stale, .. } | OpenPreview::Ready { doc, stale, .. } => {
+                    // Still shown where nothing changed: a storyboard hidden or shown mid-draw
+                    // used to drop the whole picture, and every block not drawn yet went blank.
+                    let keep = match doc.as_deref() {
+                        None => false,
+                        Some(d) if std::ptr::eq(d, now.as_ref()) || super::doc_diff::same_pixels(d, &now) => true,
+                        Some(d) => match super::doc_diff::changed_area(d, &now) {
+                            Some(r) => {
+                                if !r.is_empty() {
+                                    stale.push(r);
+                                }
+                                true
+                            }
+                            None => false,
+                        },
+                    };
+                    if keep {
                         // Compare with the newest next time (and let the old version go).
                         *doc = Some(now);
                     }
-                    !same || done
+                    !keep || done
                 }
                 OpenPreview::Done => false,
             };
             if stale {
                 *p = OpenPreview::Done;
-            } else if let OpenPreview::Loading { rx, doc, .. } = p {
+            } else if let OpenPreview::Loading { rx, doc, stale, .. } = p {
                 match rx.try_recv() {
                     Ok(Some(c)) => {
                         let image = egui::ColorImage::from_rgba_unmultiplied([c.width as usize, c.height as usize], &c.rgba);
                         let texture = ctx.load_texture(format!("open-preview-{}", id.0), image, egui::TextureOptions::LINEAR);
-                        *p = OpenPreview::Ready { texture, doc: doc.take() };
+                        *p = OpenPreview::Ready { texture, doc: doc.take(), stale: std::mem::take(stale) };
                     }
                     Ok(None) | Err(TryRecvError::Disconnected) => *p = OpenPreview::Done,
                     Err(TryRecvError::Empty) => {}
@@ -154,14 +172,16 @@ fn update(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) -> Option<Do
 pub(crate) fn draw(app: &mut PhotocraftApp, painter: &egui::Painter, xf: &ViewXform, idx: usize) {
     retain(app);
     let Some(id) = update(app, painter.ctx(), idx) else { return };
-    let Some(OpenPreview::Ready { texture, .. }) = app.open_previews.get(&id) else { return };
+    let Some(OpenPreview::Ready { texture, stale, .. }) = app.open_previews.get(&id) else { return };
     let Some(st) = app.session.documents().get(idx) else { return };
     let canvas = st.doc.bounds();
     if canvas.is_empty() {
         return;
     }
     let pending = crate::canvas::sweep::pending(app, id);
-    let rects: Vec<Rect> = if pending.is_empty() { vec![canvas] } else { pending };
+    // Not over the parts that changed since the file opened: the composite shows them as saved.
+    let rects: Vec<Rect> =
+        if pending.is_empty() { vec![canvas] } else { pending.into_iter().filter(|b| stale.iter().all(|s| s.intersect(b).is_empty())).collect() };
     let mut mesh = egui::Mesh::with_texture(texture.id());
     let (w, h) = (canvas.width() as f32, canvas.height() as f32);
     for r in rects {

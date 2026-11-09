@@ -160,6 +160,7 @@ impl PhotocraftApp {
             canvas_states: Default::default(),
             open_previews: HashMap::new(),
             open_preview_reads: HashMap::new(),
+            board_cache: Default::default(),
             clip_external: false,
             clip_read_for_paste: false,
             smart_svg: Default::default(),

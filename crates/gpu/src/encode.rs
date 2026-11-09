@@ -146,11 +146,12 @@ impl Compositor {
     ) -> Result<Stats, Unsupported> {
         let canvas = doc.bounds();
         let parts: Vec<Rect> = regions.iter().map(|r| r.intersect(&canvas)).filter(|r| !r.is_empty()).collect();
+        let t = clock();
         let plan = plan(doc)?;
         self.check_fx(doc, &plan)?;
         self.pattern_mode = doc.pixel_format().mode;
         self.pattern_doc = doc.id;
-        let mut stats = Stats { passes: plan.passes.len(), slots: plan.slots, ..Default::default() };
+        let mut stats = Stats { passes: plan.passes.len(), slots: plan.slots, plan_ms: ms(t), ..Default::default() };
         if parts.is_empty() {
             return Ok(stats);
         }
@@ -182,6 +183,7 @@ impl Compositor {
         // for every render of this plan, so a layer's bits don't depend on the cache: renders
         // capture and resume only where a run starts.
         let runs = batch_runs(&plan);
+        let t = clock();
         let checkpoint = if flush {
             let starts = run_starts(&runs);
             let resumable: Vec<_> = plan.checkpoints.iter().filter(|c| starts.get(c.pass_end).copied().unwrap_or(false)).copied().collect();
@@ -189,6 +191,8 @@ impl Compositor {
         } else {
             None
         };
+        stats.prepare_ms = ms(t);
+        let t = clock();
 
         // Effect maps of whole regions first (they may render group shapes through sub-plans);
         // regions larger than the limit are built per cell below.
@@ -200,6 +204,8 @@ impl Compositor {
             }
         }
         let fr = self.frame_res(device, queue, canvas, &plan);
+        stats.setup_ms = ms(t);
+        let t = clock();
 
         // Page cells; every other frame in reverse, so a repeated full refresh of a document
         // larger than the budget starts with the pages still resident.
@@ -294,6 +300,8 @@ impl Compositor {
             }
         }
 
+        stats.cells_ms = ms(t);
+        let t = clock();
         // Evict this document's textures whose layers are gone (hidden layers stay resident so
         // toggling visibility costs no upload).
         let frame = self.frame;
@@ -303,6 +311,7 @@ impl Compositor {
         stats.evicted += self.evict().0;
         self.temps.retain(|(_, used)| frame.saturating_sub(*used) < 240);
         self.evict_patterns();
+        stats.tail_ms = ms(t);
         Ok(stats)
     }
 
@@ -436,4 +445,21 @@ impl Compositor {
         let patterns = plan.passes.iter().map(|p| p.pattern.map(|pat| self.pattern_view(device, queue, pat))).collect();
         FrameRes { areas, luts, patterns }
     }
+}
+
+/// A start time for the CPU timings in [`Stats`] (none on the web, where `Instant` isn't there).
+fn clock() -> Option<std::time::Instant> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(std::time::Instant::now())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+}
+
+/// Milliseconds since `start` (0 without one).
+fn ms(start: Option<std::time::Instant>) -> f64 {
+    start.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0)
 }

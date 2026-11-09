@@ -15,6 +15,7 @@ use crate::state::{Tool, View};
 pub(super) mod ants;
 pub mod artboard_ui;
 pub(crate) mod background_redraw;
+pub(crate) mod board_cache;
 pub(crate) mod cam_preview;
 pub mod canvas_autoscroll;
 pub(super) mod canvas_popup;
@@ -1317,6 +1318,10 @@ fn paint_primary_overlays(app: &mut PhotocraftApp, ui: &mut egui::Ui, view: &mut
     crate::distort_ui::draw_content(app, painter, xf);
     // A PSD/PSB's stored composite over what the first draw hasn't reached yet.
     crate::canvas::open_preview::draw(app, painter, xf, idx);
+    // How far a long redraw has got, so it reads as work under way rather than a stuck canvas.
+    if let Some(id) = app.session.documents().get(idx).map(|st| st.doc.id) {
+        crate::canvas::sweep::draw_progress(app, painter, id);
+    }
     // A costly Move drag's picture of the layers, at the pointer.
     if app.session.active_index() == Some(idx) {
         crate::move_ui::draw_snapshot(app, painter, xf);
