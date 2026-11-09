@@ -339,6 +339,17 @@ pub(crate) fn damage_since(app: &PhotocraftApp, idx: usize, seen: (u64, u64), no
     if seen.1 == now.1 ^ display_key && seen.0 + 1 == now.0 {
         return last_damage;
     }
+    // A Move drag's release when the canvas last showed one of its previews (not the final
+    // offset, or a layer that joined another artboard): the move's own damage, where the layers
+    // were and are, covers every pixel between that preview and the result. Without this the
+    // whole canvas recomposited (2.6 GP over 17 s on a storyboard).
+    if seen.0 + 1 == now.0
+        && now.1 == 0
+        && crate::move_ui::is_preview_key(seen.1 ^ display_key)
+        && let Some(r) = last_damage
+    {
+        return Some(r);
+    }
     // Opening, cancelling or committing a Free Transform box: the moving layer and the layers
     // drawn over the box, not the whole document (a gigapixel canvas took over a second).
     if let Some(st) = app.session.documents().get(idx)
