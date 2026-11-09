@@ -8,6 +8,12 @@ impl PhotocraftApp {
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         if self.run_depth == 0 {
             log_command(id);
+            // A released stroke still catching up lands first: Undo right after a release
+            // undoes the stroke, and nothing runs on a document it hasn't reached yet.
+            if self.finishing_stroke.is_some() {
+                log::info!("live stroke: finished at once for {id}");
+                canvas::flush_finishing_stroke(self);
+            }
         }
         let params = if id == "select.findLayers" { crate::layer_filter_ui::find::params_for_run(self, params) } else { params };
         if let Some(result) = delete_layer_prompt::intercept(self, id, &params) {

@@ -239,6 +239,56 @@ pub(crate) struct LiveStroke {
     pub(super) damage: Vec<DRect>,
     /// Drag points rendered so far.
     fed: usize,
+    /// UI-thread time a point has taken to render (ms, moving average): how many points a
+    /// frame's budget holds ([`STROKE_FRAME_MS`]).
+    ms_per_point: Option<f64>,
+}
+
+/// UI-thread time a frame gives the live stroke (ms). Points beyond it wait for the next frame:
+/// a large brush on a storyboard took ~3 ms a point, each slow frame brought more points, and
+/// frames grew past a second until Wayland dropped the window.
+const STROKE_FRAME_MS: f64 = 30.0;
+
+/// Whether the live stroke has points it hasn't rendered yet (it catches up frame by frame).
+pub(super) fn live_stroke_behind(app: &PhotocraftApp) -> bool {
+    app.drag.as_ref().is_some_and(|d| behind(app, d))
+}
+
+fn behind(app: &PhotocraftApp, d: &Drag) -> bool {
+    app.live_stroke.as_ref().is_some_and(|l| !l.preview_failed && l.fed < d.points.len())
+}
+
+/// Estimated UI-thread work (ms) at a release with more than this left to render finishes over
+/// the next frames instead of in one go (`continue_finishing_stroke`).
+const STROKE_RELEASE_MS: f64 = 150.0;
+
+/// One frame of a released stroke catching up; commits it once caught up. Returns whether it is
+/// still catching up (the caller repaints). A document that changed meanwhile commits at once.
+pub(crate) fn continue_finishing_stroke(app: &mut PhotocraftApp) -> bool {
+    let Some(d) = app.finishing_stroke.take() else { return false };
+    let same = app.live_stroke.as_ref().is_some_and(|l| app.session.active().is_some_and(|st| st.doc.id == l.doc && st.revision == l.revision));
+    if same && app.drag.is_none() {
+        app.drag = Some(d);
+        let deferred = std::mem::replace(&mut app.defer_live_stroke, false);
+        feed_live_stroke(app);
+        app.defer_live_stroke = deferred;
+        let Some(d) = app.drag.take() else { return false };
+        if behind(app, &d) {
+            app.finishing_stroke = Some(d);
+            return true;
+        }
+        commit_brush_stroke_now(app, &d);
+        return false;
+    }
+    commit_brush_stroke_now(app, &d);
+    false
+}
+
+/// Commit a released stroke that is still catching up now, before a new press or a command.
+pub(crate) fn flush_finishing_stroke(app: &mut PhotocraftApp) {
+    if let Some(d) = app.finishing_stroke.take() {
+        commit_brush_stroke_now(app, &d);
+    }
 }
 
 impl LiveStroke {
@@ -289,7 +339,7 @@ impl CommittedStroke {
 /// The live stroke on document `idx`, while it is current.
 pub(super) fn live_stroke(app: &PhotocraftApp, idx: usize) -> Option<&LiveStroke> {
     let st = app.session.documents().get(idx)?;
-    app.live_stroke.as_ref().filter(|l| app.drag.is_some() && l.doc == st.doc.id && l.revision == st.revision)
+    app.live_stroke.as_ref().filter(|l| (app.drag.is_some() || app.finishing_stroke.is_some()) && l.doc == st.doc.id && l.revision == st.revision)
 }
 
 /// `paint.stroke` params for a Brush/Eraser drag (shared by the live preview and the commit). The
@@ -403,6 +453,7 @@ pub(super) fn begin_live_stroke(app: &PhotocraftApp) -> Option<LiveStroke> {
         key: (1 << 44) | (n << 20),
         damage,
         fed: if d.tool == Tool::MixerBrush { 1 } else { d.points.len() },
+        ms_per_point: None,
         preview_failed: false,
     })
 }
@@ -437,7 +488,14 @@ pub(super) fn feed_live_stroke(app: &mut PhotocraftApp) {
     let pose = &app.stylus.stroke;
     // The same times `stroke_points` gives the commit (from the drag's first point).
     let t0 = app.stylus.point_ms(0);
-    let pts: Vec<_> = (l.fed..d.points.len())
+    // As many points as this frame's budget holds; the rest wait for the next frames. Not the
+    // Mixer Brush: its release commits what was fed, with no catch-up.
+    let budget = match l.ms_per_point {
+        Some(k) if !matches!(l.stroke, EngineStroke::Mixer(_)) => ((STROKE_FRAME_MS / k.max(0.01)).floor() as usize).max(1),
+        _ => usize::MAX,
+    };
+    let end = d.points.len().min(l.fed.saturating_add(budget));
+    let pts: Vec<_> = (l.fed..end)
         .filter_map(|i| {
             let p = d.points.get(i)?;
             let t = pose.get(i).or(pose.last()).copied().unwrap_or_default();
@@ -450,7 +508,7 @@ pub(super) fn feed_live_stroke(app: &mut PhotocraftApp) {
     if pts.is_empty() {
         return;
     }
-    l.fed = d.points.len();
+    l.fed = end;
     let started = crate::gpu_canvas::now_ms();
     // Held elsewhere too (the canvas keeps the document it shows), the stroke's document is
     // copied whole before the step draws: reported with a slow step.
@@ -472,6 +530,12 @@ pub(super) fn feed_live_stroke(app: &mut PhotocraftApp) {
     }
     let ms = crate::gpu_canvas::now_ms() - started;
     app.perf.stage.stroke_ms += ms;
+    if let Some(l) = app.live_stroke.as_mut()
+        && (!shared || l.ms_per_point.is_none())
+    {
+        let k = ms / n.max(1) as f64;
+        l.ms_per_point = Some(l.ms_per_point.map_or(k, |old| old * 0.7 + k * 0.3));
+    }
     if ms > SLOW_STROKE_STEP_MS {
         let total = app.drag.as_ref().map_or(0, |d| d.points.len());
         log::info!("live stroke: one step of {n} point(s) took {ms:.0} ms ({total} points so far; document copied first: {shared})");
@@ -480,6 +544,14 @@ pub(super) fn feed_live_stroke(app: &mut PhotocraftApp) {
 
 /// A live stroke step slower than this (ms) is logged: what made painting stall.
 const SLOW_STROKE_STEP_MS: f64 = 100.0;
+
+#[cfg(test)]
+impl LiveStroke {
+    /// Pretend each point takes `ms` to render (a large brush on a storyboard).
+    pub(crate) fn pretend_ms_per_point(&mut self, ms: f64) {
+        self.ms_per_point = Some(ms);
+    }
+}
 
 /// The points the live retouching stroke has rendered.
 #[cfg(test)]
@@ -635,6 +707,20 @@ pub(super) fn draw_smoothing_string(painter: &egui::Painter, xf: &ViewXform, (br
 /// offered to the commit (`Session::offer_live_stroke`), so release costs no second render, and
 /// the canvas then refreshes only what it hadn't shown yet (`CommittedStroke`).
 pub(super) fn commit_brush_stroke(app: &mut PhotocraftApp, d: &Drag) {
+    // Rendering what is left in one go would freeze the window (a second or more on a
+    // storyboard): it catches up over the next frames and commits then.
+    if let Some(l) = app.live_stroke.as_ref()
+        && !l.preview_failed
+        && l.ms_per_point.is_some_and(|k| d.points.len().saturating_sub(l.fed) as f64 * k > STROKE_RELEASE_MS)
+    {
+        log::info!("live stroke: {} point(s) left at release; finishing over the next frames", d.points.len() - l.fed);
+        app.finishing_stroke = Some(d.clone());
+        return;
+    }
+    commit_brush_stroke_now(app, d);
+}
+
+fn commit_brush_stroke_now(app: &mut PhotocraftApp, d: &Drag) {
     let live = app.live_stroke.take();
     let mut p = stroke_params(app, d, &app.stylus.stroke_points(&d.points));
     if let Some(seed) = live.as_ref().and_then(|l| l.stroke.seed()) {

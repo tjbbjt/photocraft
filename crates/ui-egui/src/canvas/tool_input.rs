@@ -397,6 +397,10 @@ fn clear_off_on_background(app: &mut PhotocraftApp, tool: Tool) {
 
 /// Tool state machine. Shared by mouse input and automation.
 pub fn tool_event(app: &mut PhotocraftApp, ev: ToolEvent, mods: egui::Modifiers) {
+    // A released stroke still catching up commits before anything new starts.
+    if matches!(ev, ToolEvent::Down { .. }) {
+        super::strokes::flush_finishing_stroke(app);
+    }
     if consumes_cancelled_vector_event(app, ev) {
         return;
     }
