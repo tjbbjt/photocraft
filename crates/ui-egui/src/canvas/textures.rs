@@ -668,6 +668,8 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
             s.shown = None;
         }
     }
+    // A sweep under way goes on while an edit draws itself frame after frame.
+    crate::canvas::sweep::keep_fed(app, ctx, &gpu, &doc, display.as_deref());
     let Some(cache) = app.canvases.get_mut(&(id, GPU_OUTPUT)) else { return true };
     cache.revision = revision;
     cache.preview_key = preview_key;

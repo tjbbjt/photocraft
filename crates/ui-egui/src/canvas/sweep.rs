@@ -372,6 +372,20 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
     }
 }
 
+/// Keep `doc`'s sweep going on the redraw thread on a frame that drew an edit of its own (a brush
+/// step, a drag): [`step`] ran only on frames with nothing new, so the rest of the canvas waited
+/// until the stroke or drag ended. Never draws on this thread; without the redraw thread the sweep
+/// waits as before, rather than take frame time from the edit.
+pub(crate) fn keep_fed(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, doc: &Arc<Document>, display: Option<&CanvasDisplay>) {
+    if !running(app, doc.id) {
+        return;
+    }
+    land_finished(app);
+    if app.canvas_states.get(&doc.id).is_some_and(|s| !s.thread_failed) && super::redraw_thread::thread(app, gpu, ctx).is_some() {
+        let _ = step_threaded(app, ctx, gpu, doc, display);
+    }
+}
+
 /// [`step`] on the redraw thread: take the jobs it finished, keep it fed with [`IN_FLIGHT`] jobs
 /// of the next blocks, and say whether the sweep is over. Never draws on this thread.
 ///
