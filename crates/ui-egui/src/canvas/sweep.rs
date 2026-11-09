@@ -248,7 +248,36 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
         let totals = s.totals.get_or_insert_with(|| Totals { started_ms: started, work: Work::planned(doc), ..Totals::default() });
         totals.frames += 1;
     }
+    let mut batches = true;
     loop {
+        // Once a block's cost is known, the blocks this frame's budget holds go in one render:
+        // one plan of the document for all of them instead of one per block.
+        let n = if batches { batch_len(app, doc.id, started, gpu_estimate) } else { 1 };
+        if n > 1 {
+            let batch: Vec<Rect> = app.canvas_states.get(&doc.id).map(|s| s.pending.iter().rev().take(n).copied().collect()).unwrap_or_default();
+            if batch.len() > 1 {
+                match gpu.refresh_blocks(doc.id.0, doc, &batch, display) {
+                    Some(r) => {
+                        if let Some(s) = app.canvas_states.get_mut(&doc.id) {
+                            let keep = s.pending.len().saturating_sub(batch.len());
+                            s.pending.truncate(keep);
+                            gpu_estimate += s.account(r.px, batch.len() as u32, &r);
+                        }
+                        if !running(app, doc.id) {
+                            return finish(app, gpu, doc.id, Step::Done);
+                        }
+                        let spent = (crate::gpu_canvas::now_ms() - started).max(gpu_estimate);
+                        if spent >= FRAME_BUDGET_MS {
+                            ctx.request_repaint();
+                            return Step::Continuing;
+                        }
+                        continue;
+                    }
+                    // One at a time for the rest of this frame, each with its own fallback.
+                    None => batches = false,
+                }
+            }
+        }
         let Some(block) = app.canvas_states.get_mut(&doc.id).and_then(|s| s.pending.pop()) else { return finish(app, gpu, doc.id, Step::Done) };
         let r = gpu.refresh_with(doc.id.0, doc, Some(block), display, false);
         match (r.kind, &r.fallback) {
@@ -270,7 +299,7 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
             }
         }
         if let Some(s) = app.canvas_states.get_mut(&doc.id) {
-            gpu_estimate += s.account(block, &r);
+            gpu_estimate += s.account(block.size().area(), 1, &r);
         }
         if !running(app, doc.id) {
             return finish(app, gpu, doc.id, Step::Done);
@@ -284,9 +313,9 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
 }
 
 impl CanvasState {
-    /// Count a drawn block in the sweep's totals and learn the GPU's rate from `r`; returns the
-    /// GPU time the block is estimated to take.
-    fn account(&mut self, block: Rect, r: &crate::gpu_canvas::Refresh) -> f64 {
+    /// Count `blocks` drawn blocks of `px` pixels in all in the sweep's totals and learn the GPU's
+    /// rate from `r`; returns the GPU time they are estimated to take.
+    fn account(&mut self, px: u64, blocks: u32, r: &crate::gpu_canvas::Refresh) -> f64 {
         // A GPU measurement comes back a frame or two late, for an earlier refresh: it carries
         // its own pixel count, so it still gives a rate.
         if let Some(t) = r.gpu.filter(|t| t.px > 0) {
@@ -294,8 +323,8 @@ impl CanvasState {
             self.gpu_ms_per_mp = Some(self.gpu_ms_per_mp.map_or(rate, |old| old * 0.7 + rate * 0.3));
         }
         if let Some(totals) = self.totals.as_mut() {
-            totals.blocks += 1;
-            totals.px += block.size().area();
+            totals.blocks += blocks;
+            totals.px += px;
             totals.cpu_ms += r.composite_ms;
             totals.uploads += r.uploads;
             if let Some(stats) = &r.stats {
@@ -306,9 +335,26 @@ impl CanvasState {
                 totals.gpu_px += t.px;
             }
         }
-        self.gpu_ms_per_mp.unwrap_or(0.0) * (block.size().area() as f64 / 1_048_576.0)
+        self.gpu_ms_per_mp.unwrap_or(0.0) * (px as f64 / 1_048_576.0)
     }
 }
+
+/// How many of `doc`'s pending blocks fit what is left of this frame's budget, going by what the
+/// sweep's blocks have cost so far (encoding on this thread, and the GPU's rate): 1 until a block
+/// has been drawn, at most [`MAX_BATCH`].
+fn batch_len(app: &PhotocraftApp, doc: DocId, started: f64, gpu_estimate: f64) -> usize {
+    let Some(s) = app.canvas_states.get(&doc) else { return 1 };
+    let Some(t) = s.totals.as_ref().filter(|t| t.blocks > 0) else { return 1 };
+    let Some(next) = s.pending.last() else { return 1 };
+    let cpu = t.cpu_ms / f64::from(t.blocks);
+    let gpu = s.gpu_ms_per_mp.unwrap_or(0.0) * (next.size().area() as f64 / 1_048_576.0);
+    let left = FRAME_BUDGET_MS - (crate::gpu_canvas::now_ms() - started).max(gpu_estimate);
+    let each = cpu.max(gpu).max(0.1);
+    ((left / each).floor().max(1.0) as usize).min(MAX_BATCH)
+}
+
+/// Most blocks drawn in one render.
+const MAX_BATCH: usize = 8;
 
 /// End of a sweep (or of its last frame): log its totals once it is over.
 fn finish(app: &mut PhotocraftApp, gpu: &GpuCanvas, doc: DocId, step: Step) -> Step {
