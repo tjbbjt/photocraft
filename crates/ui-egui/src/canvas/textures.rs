@@ -610,6 +610,13 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
         // the area it found changed is drawn first: on a canvas of hundreds of layers the whole
         // sweep takes seconds, and what changed showed only when the sweep reached it.
         if everything {
+            // Why the whole canvas: no texture yet, or nothing bounded the change (and why the
+            // comparison couldn't: another display key, or a change it can't bound).
+            let shown = app.canvas_states.get(&id).and_then(|s| s.shown.as_ref()).map(|(_, k)| *k);
+            log::info!(
+                "canvas: redrawing everything: present {present}, seen {seen:?}, now ({revision}, {raw_key}), last damage {last_damage:?}, compared display key {:?} vs {display_key}",
+                shown
+            );
             crate::canvas::sweep::start(app, &doc, visible);
         } else if from_diff {
             crate::canvas::sweep::safety_net(app, &doc, visible);
