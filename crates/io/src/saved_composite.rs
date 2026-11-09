@@ -31,7 +31,7 @@ pub struct SavedComposite {
 /// Reads `path`'s stored composite reduced so its longer side is at most `max_side`. `Ok(None)`
 /// when the file has none to show (see the module notes); `cancelled` is asked between rows.
 #[cfg(any(unix, windows))]
-pub fn saved_composite_at(path: &std::path::Path, max_side: u32, cancelled: &dyn Fn() -> bool) -> Result<Option<SavedComposite>, IoError> {
+pub fn saved_composite_at(path: &std::path::Path, max_side: u32, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<Option<SavedComposite>, IoError> {
     let read_failed = |e: String| IoError::Read(format!("{}: {e}", path.display()));
     let source = photocraft_psd::source::FileSource::open(path).map_err(|e| read_failed(e.to_string()))?;
     let file = PsdFile::from_source(photocraft_psd::source::Source::new(source)).map_err(|e| read_failed(e.to_string()))?;
@@ -39,7 +39,7 @@ pub fn saved_composite_at(path: &std::path::Path, max_side: u32, cancelled: &dyn
 }
 
 /// [`saved_composite_at`] for a parsed file (its composite in memory or still in its source).
-pub fn saved_composite(file: &PsdFile, max_side: u32, cancelled: &dyn Fn() -> bool) -> Result<Option<SavedComposite>, IoError> {
+pub fn saved_composite(file: &PsdFile, max_side: u32, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<Option<SavedComposite>, IoError> {
     let h = &file.header;
     let color = match h.color_mode {
         ColorMode::Rgb => 3usize,
@@ -112,26 +112,44 @@ pub fn saved_composite(file: &PsdFile, max_side: u32, cancelled: &dyn Fn() -> bo
     };
     // The high byte of a 16-bit sample, the sample itself at 8 bits.
     let sample = |row: &[u8], x: usize| row[x * bps];
+    // Output rows `range`, as RGBA8.
+    let band = |range: std::ops::Range<usize>| -> Result<Vec<u8>, IoError> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(range.len() * ow * 4).map_err(|_| IoError::Unsupported("not enough memory for the stored composite's preview".into()))?;
+        for oy in range {
+            if cancelled() {
+                return Err(IoError::Cancelled);
+            }
+            let y = (oy * f + f / 2).min(hgt - 1);
+            let colour: Vec<Vec<u8>> = (0..color).map(|p| row_of(p, y)).collect::<Result<_, _>>()?;
+            let a_row = alpha.map(|p| row_of(p, y)).transpose()?;
+            for ox in 0..ow {
+                let x = (ox * f + f / 2).min(w - 1);
+                let a = a_row.as_deref().map_or(255u8, |r| sample(r, x));
+                let mut px = [0u8; 3];
+                for (c, out) in px.iter_mut().enumerate() {
+                    let v = sample(&colour[c.min(color - 1)], x);
+                    // The stored composite is matted against white where it is translucent.
+                    *out = if a == 255 || a == 0 { v } else { unmatte(v, a) };
+                }
+                out.extend_from_slice(&[px[0], px[1], px[2], a]);
+            }
+        }
+        Ok(out)
+    };
+    // Bands of rows on every core: each row is read and decoded on its own, and a gigapixel
+    // file's thousands of rows took seconds one after another.
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get).clamp(1, 16);
+    let per = oh.div_ceil(threads).max(1);
+    let band = &band;
+    let bands: Vec<Result<Vec<u8>, IoError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..oh).step_by(per).map(|start| scope.spawn(move || band(start..(start + per).min(oh)))).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(IoError::Unsupported("the stored composite's reader stopped".into())))).collect()
+    });
     let mut rgba = Vec::new();
     rgba.try_reserve_exact(ow * oh * 4).map_err(|_| IoError::Unsupported("not enough memory for the stored composite's preview".into()))?;
-    for oy in 0..oh {
-        if cancelled() {
-            return Err(IoError::Cancelled);
-        }
-        let y = (oy * f + f / 2).min(hgt - 1);
-        let colour: Vec<Vec<u8>> = (0..color).map(|p| row_of(p, y)).collect::<Result<_, _>>()?;
-        let a_row = alpha.map(|p| row_of(p, y)).transpose()?;
-        for ox in 0..ow {
-            let x = (ox * f + f / 2).min(w - 1);
-            let a = a_row.as_deref().map_or(255u8, |r| sample(r, x));
-            let mut px = [0u8; 3];
-            for (c, out) in px.iter_mut().enumerate() {
-                let v = sample(&colour[c.min(color - 1)], x);
-                // The stored composite is matted against white where it is translucent.
-                *out = if a == 255 || a == 0 { v } else { unmatte(v, a) };
-            }
-            rgba.extend_from_slice(&[px[0], px[1], px[2], a]);
-        }
+    for b in bands {
+        rgba.extend_from_slice(&b?);
     }
     Ok(Some(SavedComposite { width: ow as u32, height: oh as u32, doc_width: h.width, doc_height: h.height, factor, rgba }))
 }

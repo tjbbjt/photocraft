@@ -31,6 +31,7 @@ pub mod guide_select;
 pub mod layer_pick_ui;
 pub mod move_ui;
 mod navigator;
+pub(crate) mod open_preview;
 pub mod outline;
 mod paint;
 pub mod paint_mouse;
@@ -46,7 +47,6 @@ mod selection;
 pub mod snap_ui;
 mod start_screen;
 mod strokes;
-pub(crate) mod open_preview;
 pub(crate) mod sweep;
 pub(crate) mod tabs;
 mod textures;
@@ -1317,6 +1317,10 @@ fn paint_primary_overlays(app: &mut PhotocraftApp, ui: &mut egui::Ui, view: &mut
     crate::distort_ui::draw_content(app, painter, xf);
     // A PSD/PSB's stored composite over what the first draw hasn't reached yet.
     crate::canvas::open_preview::draw(app, painter, xf, idx);
+    // A costly Move drag's picture of the layers, at the pointer.
+    if app.session.active_index() == Some(idx) {
+        crate::move_ui::draw_snapshot(app, painter, xf);
+    }
     if app.ui.extras.grid && app.ui.view.extras {
         crate::rulers::draw_grid(app, painter, xf, doc);
     }

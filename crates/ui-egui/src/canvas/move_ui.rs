@@ -158,6 +158,94 @@ pub(crate) struct MovePreview {
     /// The moving layers hold more pixels than [`LIVE_LIMIT`]: they aren't copied for every frame
     /// of the drag, which shows its outline and arrow alone (#6114, #6163).
     too_big: bool,
+    /// A drag too costly to show live ([`costly_to_redraw`], [`LIVE_LIMIT`]): a reduced picture
+    /// of the moving layers follows the pointer instead, over the canvas with them hidden.
+    snapshot: Option<Snapshot>,
+}
+
+/// The reduced picture of the moving layers a costly drag shows at the pointer ([`draw_snapshot`]).
+pub(crate) struct Snapshot {
+    /// The document area it shows, at offset (0, 0).
+    rect: Rect,
+    /// The render, until it arrives from its thread.
+    rx: Option<std::sync::mpsc::Receiver<photocraft_compose::Buffer>>,
+    texture: Option<egui::TextureHandle>,
+}
+
+/// Longest side of a drag snapshot: enough for the zooms at which a costly drag happens.
+const SNAPSHOT_SIDE: u32 = 2048;
+
+/// Starts rendering the layers `moving` of `doc` (and nothing else) over `rect`, reduced, on a
+/// thread. `None` when the area is empty or the thread can't start.
+fn start_snapshot(doc: &Document, moving: &[LayerId], rect: Rect) -> Option<Snapshot> {
+    if rect.is_empty() {
+        return None;
+    }
+    // The moving layers and the groups holding them stay visible; every other layer is hidden.
+    let walk = doc.walk();
+    let paths: Vec<_> = walk.iter().filter(|(_, _, l)| moving.contains(&l.id)).map(|(p, _, _)| p.clone()).collect();
+    let keep = |path: &[usize]| paths.iter().any(|m| m.starts_with(path) || path.starts_with(m));
+    let hide: Vec<LayerId> = walk.iter().filter(|(p, _, _)| !keep(p)).map(|(_, _, l)| l.id).collect();
+    let mut only = doc.clone();
+    for id in hide {
+        if let Some(l) = only.layer_mut(id) {
+            l.visible = false;
+        }
+    }
+    let longest = rect.width().max(rect.height()).max(1);
+    let k = longest.div_ceil(SNAPSHOT_SIDE).max(1);
+    let (w, h) = (rect.width().div_ceil(k).max(1), rect.height().div_ceil(k).max(1));
+    let (tx, rx) = std::sync::mpsc::channel();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let started = std::thread::Builder::new().name("photocraft-drag-snapshot".into()).spawn(move || {
+            let _ = tx.send(photocraft_compose::render_reduced_rect(&only, rect, w, h));
+        });
+        started.ok()?;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = tx.send(photocraft_compose::render_reduced_rect(&only, rect, w, h));
+    }
+    Some(Snapshot { rect, rx: Some(rx), texture: None })
+}
+
+/// Draws a costly drag's snapshot at the pointer, once its render has arrived (taking it).
+pub(crate) fn draw_snapshot(app: &mut PhotocraftApp, painter: &egui::Painter, xf: &crate::canvas::ViewXform) {
+    let offset = drag_offset(app);
+    let Some(s) = app.move_preview.as_mut().and_then(|p| p.snapshot.as_mut()) else { return };
+    if let Some(rx) = &s.rx {
+        match rx.try_recv() {
+            Ok(buf) => {
+                let size = [buf.rect.width() as usize, buf.rect.height() as usize];
+                let px: Vec<egui::Color32> = buf
+                    .px
+                    .iter()
+                    .map(|p| {
+                        let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+                        egui::Color32::from_rgba_premultiplied(c(p[0]), c(p[1]), c(p[2]), c(p[3]))
+                    })
+                    .collect();
+                if px.len() == size[0] * size[1] {
+                    let image = egui::ColorImage::new(size, px);
+                    s.texture = Some(painter.ctx().load_texture("move-drag-snapshot", image, egui::TextureOptions::LINEAR));
+                }
+                s.rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => s.rx = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+    let (Some(texture), Some((dx, dy))) = (&s.texture, offset) else { return };
+    let r = s.rect.translate(dx, dy);
+    let corners = [(r.x0, r.y0), (r.x1, r.y0), (r.x1, r.y1), (r.x0, r.y1)];
+    let uvs = [egui::pos2(0.0, 0.0), egui::pos2(1.0, 0.0), egui::pos2(1.0, 1.0), egui::pos2(0.0, 1.0)];
+    let mut mesh = egui::Mesh::with_texture(texture.id());
+    for ((x, y), uv) in corners.into_iter().zip(uvs) {
+        mesh.vertices.push(egui::epaint::Vertex { pos: xf.to_screen(x as f32, y as f32), uv, color: egui::Color32::WHITE });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 impl MovePreview {
@@ -231,11 +319,33 @@ pub(crate) fn display_doc(app: &mut PhotocraftApp, idx: usize) -> Option<(Arc<Do
         if too_big {
             log::info!("move: dragging {} layer(s) as an outline (too costly to redraw live), the release redraws once", ids.len());
         }
-        app.move_preview = Some(MovePreview { doc: doc_id, revision, ids, moving, bounds, canvas, offsets: Vec::new(), shown: None, floating: false, too_big });
+        // The drag's snapshot: the layers' area as they paint it, wherever it reaches.
+        let snapshot = if too_big && !mask_target { bounds.and_then(|b| start_snapshot(&doc, &moving, b)) } else { None };
+        app.move_preview =
+            Some(MovePreview { doc: doc_id, revision, ids, moving, bounds, canvas, offsets: Vec::new(), shown: None, floating: false, too_big, snapshot });
     }
     let p = app.move_preview.as_mut()?;
     if p.too_big {
-        return None;
+        // Once its snapshot is ready (and the pointer has moved), the canvas shows the document
+        // with the moving layers hidden, at one preview key: hiding them redraws where they were,
+        // once; the snapshot follows the pointer; the release redraws where they were and are.
+        let ready = p.snapshot.as_ref().is_some_and(|s| s.texture.is_some());
+        if !ready || offset == (0, 0) && p.offsets.is_empty() {
+            return None;
+        }
+        if p.shown.is_none() {
+            let mut hidden = (*doc).clone();
+            for id in &p.ids {
+                if let Some(l) = hidden.layer_mut(*id) {
+                    l.visible = false;
+                }
+            }
+            let hidden = photocraft_engine::mode_cmds::display_document(&hidden).unwrap_or(hidden);
+            p.shown = Some(Arc::new(hidden));
+            // The key's offset is (0, 0): its damage is where the layers were.
+            p.offsets = vec![(0, 0)];
+        }
+        return Some((p.shown.clone()?, p.key()));
     }
     if offset == (0, 0) && p.offsets.is_empty() {
         return None;
@@ -303,6 +413,10 @@ pub(crate) fn shown_layer_offset(app: &PhotocraftApp, doc: DocId, revision: u64,
     if !p.moving.contains(&id) {
         return None;
     }
+    // A snapshot drag's canvas shows the layers hidden; their outline follows the snapshot.
+    if p.snapshot.is_some() {
+        return drag_offset(app);
+    }
     p.offsets.last().copied()
 }
 
@@ -336,6 +450,7 @@ fn floating_doc(app: &mut PhotocraftApp, idx: usize) -> Option<(Arc<Document>, u
             shown: None,
             floating: true,
             too_big: false,
+            snapshot: None,
         });
     }
     if offset == (0, 0) && app.move_preview.as_ref().is_none_or(|p| p.offsets.is_empty()) {
