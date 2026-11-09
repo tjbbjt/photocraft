@@ -238,6 +238,13 @@ impl PhotocraftApp {
 }
 
 impl eframe::App for PhotocraftApp {
+    /// What the window shows before anything is drawn: the theme's panel colour, not eframe's
+    /// default near-black. A maximized window's first frame comes at its restored size, which on
+    /// Wayland flashed as a black square before PhotoCraft painted (experiment).
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn on_exit(&mut self) {
         if let Err(err) = tool_memory::save_on_exit(self) {
             log::warn!("Preferences: could not save the final tool selection: {err}");

@@ -6,6 +6,9 @@ use super::{
 impl PhotocraftApp {
     /// Run an engine command, reporting errors in the status bar.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        if self.run_depth == 0 {
+            log_command(id);
+        }
         if let Some(result) = delete_layer_prompt::intercept(self, id, &params) {
             return result;
         }
@@ -384,3 +387,16 @@ const ADDS_LAYER_MASK: [&str; 5] = [
     "layer.layerMask.hideSelection",
     "layer.layerMask.fromTransparency",
 ];
+
+/// Logs each command the UI runs, so a log can be matched with what was clicked (a canvas that
+/// redrew after a click in the Layers panel was a visibility change). A command repeated within a
+/// second (a drag, a scrub, scrolling) is logged once.
+fn log_command(id: &str) {
+    static LAST: std::sync::Mutex<Option<(String, f64)>> = std::sync::Mutex::new(None);
+    let now = gpu_canvas::now_ms();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_ref().is_none_or(|(prev, at)| prev != id || now - at > 1000.0) {
+        log::info!("command: {id}");
+    }
+    *last = Some((id.to_owned(), now));
+}

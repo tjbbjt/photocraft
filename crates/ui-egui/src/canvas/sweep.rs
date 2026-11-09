@@ -77,6 +77,9 @@ struct Work {
     fx_px: u64,
     evicted: u64,
     flushes: u64,
+    /// Pass bindings skipped as outside their blocks, of all considered.
+    culled: u64,
+    bindings: u64,
     /// The scratch disk's counters when the sweep started.
     scratch: crate::frame_stages::ScratchMark,
 }
@@ -97,12 +100,14 @@ impl Work {
         self.fx_px += s.fx_pixels;
         self.evicted += s.evicted as u64;
         self.flushes += s.flushes as u64;
+        self.culled += s.passes_culled as u64;
+        self.bindings += s.pass_bindings as u64;
     }
 
     /// "; plan 0.4 ms × 378 blocks, 12 passes (1 with effects), 4536 chunks, …"
     fn describe(&self, blocks: u32) -> String {
         format!(
-            "; plan {:.1} ms x {blocks} blocks, {} passes ({} effect layers), {} chunks, {} layers batched, {} prefix reuses, {} effect maps ({:.0} MP), {} pages evicted, {} flushes",
+            "; plan {:.1} ms x {blocks} blocks, {} passes ({} effect layers), {} chunks, {} layers batched, {} prefix reuses, {} effect maps ({:.0} MP), {} pages evicted, {} flushes, {}% of pass bindings skipped outside their blocks",
             self.plan_ms,
             self.passes,
             self.fx_layers,
@@ -113,6 +118,7 @@ impl Work {
             self.fx_px as f64 / 1_048_576.0,
             self.evicted,
             self.flushes,
+            (self.culled * 100).checked_div(self.bindings).unwrap_or(0),
         ) + &self.scratch.note_until(&crate::frame_stages::ScratchMark::now())
     }
 }
