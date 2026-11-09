@@ -62,6 +62,8 @@ struct Totals {
     /// What the compositor did over the sweep (summed) and planning the document once (timed when
     /// the sweep starts): where a slow sweep's UI-thread time goes.
     work: Work,
+    /// Blocks were composited on the redraw thread ([`super::redraw_thread`]).
+    threaded: bool,
 }
 
 /// Compositor work summed over a sweep's blocks, for its log line.
@@ -156,6 +158,10 @@ pub(crate) struct CanvasState {
     /// moving average); `None` until the GPU has reported one.
     gpu_ms_per_mp: Option<f64>,
     totals: Option<Totals>,
+    /// Jobs on the redraw thread: their tickets and blocks.
+    in_flight: Vec<(u64, Vec<Rect>)>,
+    /// A job failed on the redraw thread: this sweep goes on on the UI thread.
+    thread_failed: bool,
 }
 
 pub(crate) type CanvasStates = HashMap<DocId, CanvasState>;
@@ -178,18 +184,20 @@ pub(crate) fn eligible(app: &PhotocraftApp, doc: &Document) -> bool {
 
 /// The blocks of `doc`'s canvas a sweep hasn't drawn yet (none without a sweep).
 pub(crate) fn pending(app: &PhotocraftApp, doc: DocId) -> Vec<Rect> {
-    app.canvas_states.get(&doc).map(|s| s.pending.clone()).unwrap_or_default()
+    // Blocks out on the redraw thread aren't drawn yet either.
+    app.canvas_states.get(&doc).map(|s| s.pending.iter().chain(s.in_flight.iter().flat_map(|(_, b)| b)).copied().collect()).unwrap_or_default()
 }
 
 /// Whether a sweep of `doc` still has blocks to draw.
 pub(crate) fn running(app: &PhotocraftApp, doc: DocId) -> bool {
-    app.canvas_states.get(&doc).is_some_and(|s| !s.pending.is_empty())
+    app.canvas_states.get(&doc).is_some_and(|s| !s.pending.is_empty() || !s.in_flight.is_empty())
 }
 
 /// (Re)start a sweep of all of `doc`'s canvas, the blocks nearest `visible` first.
 pub(crate) fn start(app: &mut PhotocraftApp, doc: &Document, visible: Rect) {
     let state = app.canvas_states.entry(doc.id).or_default();
     state.pending = blocks(doc.bounds(), doc.bounds(), visible, block_size(state.gpu_ms_per_mp));
+    state.thread_failed = false;
 }
 
 /// The safety net behind a change bounded by comparing documents ([`super::doc_diff`]): redraw
@@ -262,7 +270,11 @@ pub(crate) fn changed_since_shown(app: &PhotocraftApp, doc: &Document, display_k
 
 /// Draw blocks of `doc`'s sweep until this frame's budget is spent, and ask for another frame
 /// while blocks remain. Logs one line per sweep when it ends: its size, blocks, frames and time.
-pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, doc: &Document, display: Option<&CanvasDisplay>) -> Step {
+pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, doc: &Arc<Document>, display: Option<&CanvasDisplay>) -> Step {
+    land_finished(app);
+    if app.canvas_states.get(&doc.id).is_some_and(|s| !s.thread_failed) && super::redraw_thread::thread(app, gpu, ctx).is_some() {
+        return step_threaded(app, ctx, gpu, doc, display);
+    }
     let started = crate::gpu_canvas::now_ms();
     let mut gpu_estimate = 0.0;
     if let Some(s) = app.canvas_states.get_mut(&doc.id) {
@@ -333,10 +345,99 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
     }
 }
 
+/// [`step`] on the redraw thread: take the jobs it finished, keep it fed with [`IN_FLIGHT`] jobs
+/// of the next blocks, and say whether the sweep is over. Never draws on this thread.
+///
+/// [`IN_FLIGHT`]: super::redraw_thread::IN_FLIGHT
+fn step_threaded(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, doc: &Arc<Document>, display: Option<&CanvasDisplay>) -> Step {
+    use super::redraw_thread::{IN_FLIGHT, JOB_BLOCKS};
+    let now = crate::gpu_canvas::now_ms();
+    super::redraw_thread::publish(app, doc, display.is_some_and(|d| d.encode_srgb));
+    if let Some(s) = app.canvas_states.get_mut(&doc.id) {
+        let totals = s.totals.get_or_insert_with(|| Totals { started_ms: now, work: Work::planned(doc), ..Totals::default() });
+        totals.frames += 1;
+        totals.threaded = true;
+    }
+    let failed = app.canvas_states.get(&doc.id).is_some_and(|s| s.thread_failed);
+
+    if !failed {
+        // Keep the thread fed: the next blocks (popped from the end) in jobs of a few.
+        loop {
+            let Some(s) = app.canvas_states.get_mut(&doc.id) else { break };
+            if s.in_flight.len() >= IN_FLIGHT || s.pending.is_empty() {
+                break;
+            }
+            let keep = s.pending.len().saturating_sub(JOB_BLOCKS);
+            let blocks: Vec<Rect> = s.pending.drain(keep..).rev().collect();
+            let Some(ticket) = app.redraw_thread.as_mut().and_then(|t| t.send(doc.id, blocks.clone())) else {
+                if let Some(s) = app.canvas_states.get_mut(&doc.id) {
+                    s.pending.extend(blocks.into_iter().rev());
+                    s.thread_failed = true;
+                }
+                break;
+            };
+            if let Some(s) = app.canvas_states.get_mut(&doc.id) {
+                s.in_flight.push((ticket, blocks));
+            }
+        }
+    }
+    if !running(app, doc.id) {
+        return finish(app, gpu, doc.id, Step::Done);
+    }
+    // The thread asks for a repaint as each job lands; this is a backstop.
+    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    Step::Continuing
+}
+
+/// Take the jobs the redraw thread finished, of any document: count the drawn blocks in their
+/// sweep's totals, and give failed ones back to the UI thread's sweep.
+fn land_finished(app: &mut PhotocraftApp) {
+    let finished = app.redraw_thread.as_ref().map(|t| t.finished()).unwrap_or_default();
+    for done in finished {
+        let Some(s) = app.canvas_states.get_mut(&done.doc) else { continue };
+        s.in_flight.retain(|(ticket, _)| *ticket != done.ticket);
+        match done.result {
+            Ok(stats) => {
+                let px = done.blocks.iter().map(|b| b.size().area()).sum();
+                let r = crate::gpu_canvas::Refresh {
+                    kind: "gpu-rect",
+                    px,
+                    composite_ms: done.cpu_ms,
+                    uploads: stats.tiles_uploaded as u64,
+                    gpu: stats.gpu_time,
+                    stats: Some(stats),
+                    ..Default::default()
+                };
+                s.account(px, done.blocks.len() as u32, &r);
+            }
+            Err(e) => {
+                // Back to the UI thread's sweep, which redraws them (or falls back) as before.
+                log::info!("canvas: the redraw thread couldn't draw {} block(s) ({}); going on on the UI thread", done.blocks.len(), e.0);
+                s.pending.extend(done.blocks);
+                s.thread_failed = true;
+            }
+        }
+    }
+}
+
 impl CanvasState {
     /// Count `blocks` drawn blocks of `px` pixels in all in the sweep's totals and learn the GPU's
     /// rate from `r`; returns the GPU time they are estimated to take.
     fn account(&mut self, px: u64, blocks: u32, r: &crate::gpu_canvas::Refresh) -> f64 {
+        // One render that held its thread for long: what it drew and uploaded, to find what made
+        // a frame slow (painting a canvas-wide layer during a first draw ended with the window
+        // dropped by the compositor).
+        if r.composite_ms > SLOW_RENDER_MS {
+            log::info!(
+                "canvas: one render of {blocks} block(s) ({:.0} MP) took {:.0} ms; {} layer tiles uploaded{}",
+                px as f64 / 1_048_576.0,
+                r.composite_ms,
+                r.uploads,
+                r.stats
+                    .map(|s| format!("; plan {:.1}, cache check {:.1}, setup {:.1}, cells {:.1} ms", s.plan_ms, s.prepare_ms, s.setup_ms, s.cells_ms))
+                    .unwrap_or_default()
+            );
+        }
         // A GPU measurement comes back a frame or two late, for an earlier refresh: it carries
         // its own pixel count, so it still gives a rate.
         if let Some(t) = r.gpu.filter(|t| t.px > 0) {
@@ -382,10 +483,11 @@ fn batch_len(app: &PhotocraftApp, doc: DocId, started: f64, gpu_estimate: f64) -
 pub(crate) fn draw_progress(app: &PhotocraftApp, painter: &egui::Painter, doc: DocId) {
     let Some(s) = app.canvas_states.get(&doc) else { return };
     let Some(t) = s.totals.as_ref() else { return };
-    if s.pending.is_empty() || crate::gpu_canvas::now_ms() - t.started_ms < 500.0 {
+    let left = s.pending.len() + s.in_flight.iter().map(|(_, b)| b.len()).sum::<usize>();
+    if left == 0 || crate::gpu_canvas::now_ms() - t.started_ms < 500.0 {
         return;
     }
-    let done = f64::from(t.blocks) / (f64::from(t.blocks) + s.pending.len() as f64);
+    let done = f64::from(t.blocks) / (f64::from(t.blocks) + left as f64);
     let view = painter.clip_rect();
     let bar = egui::Rect::from_min_max(egui::pos2(view.left(), view.bottom() - 4.0), view.right_bottom());
     let fill = egui::Rect::from_min_max(bar.min, egui::pos2(bar.left() + bar.width() * done as f32, bar.bottom()));
@@ -399,8 +501,11 @@ pub(crate) fn draw_progress(app: &PhotocraftApp, painter: &egui::Painter, doc: D
     painter.galley(egui::pos2(at.x, at.y - galley.size().y), galley, egui::Color32::WHITE);
 }
 
+/// A render slower than this (ms) is logged on its own.
+const SLOW_RENDER_MS: f64 = 150.0;
+
 /// Most blocks drawn in one render.
-const MAX_BATCH: usize = 8;
+const MAX_BATCH: usize = 4;
 
 /// End of a sweep (or of its last frame): log its totals once it is over.
 fn finish(app: &mut PhotocraftApp, gpu: &GpuCanvas, doc: DocId, step: Step) -> Step {
@@ -413,12 +518,13 @@ fn finish(app: &mut PhotocraftApp, gpu: &GpuCanvas, doc: DocId, step: Step) -> S
         let resident = gpu.compositor_bytes().map_or(0, |(pages, _)| pages);
         let budget = gpu.memory_budget().map_or_else(|| "?".into(), |b| mb(b).to_string());
         log::info!(
-            "canvas: redrew {:.0} MP in {} blocks over {} frames, {:.0} ms ({:.0} ms encoding on the UI thread; GPU {gpu_rate}; uploaded {} layer tiles; layer pages {} of {budget} MB{}){}",
+            "canvas: redrew {:.0} MP in {} blocks over {} frames, {:.0} ms ({:.0} ms encoding {}; GPU {gpu_rate}; uploaded {} layer tiles; layer pages {} of {budget} MB{}){}",
             t.px as f64 / 1_048_576.0,
             t.blocks,
             t.frames,
             crate::gpu_canvas::now_ms() - t.started_ms,
             t.cpu_ms,
+            if t.threaded { "on the redraw thread" } else { "on the UI thread" },
             t.uploads,
             mb(resident),
             t.work.describe(t.blocks) + &t.work.stages(t.blocks, t.cpu_ms),

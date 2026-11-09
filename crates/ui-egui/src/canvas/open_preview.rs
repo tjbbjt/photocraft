@@ -135,6 +135,12 @@ fn update(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize) -> Option<Do
                             Some(r) => {
                                 if !r.is_empty() {
                                     stale.push(r);
+                                    // A brush stroke changes the document every frame: keep the
+                                    // list short (one rectangle around them all past a few).
+                                    if stale.len() > 32 {
+                                        let all = stale.iter().fold(Rect::EMPTY, |a, s| if a.is_empty() { *s } else { a.union(s) });
+                                        *stale = vec![all];
+                                    }
                                 }
                                 true
                             }

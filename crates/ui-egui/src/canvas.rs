@@ -40,6 +40,7 @@ pub mod patch_preview;
 pub mod pattern_preview;
 pub mod pixel_grid;
 pub mod quick_pick;
+pub(crate) mod redraw_thread;
 pub mod rotate_view;
 pub mod rulers;
 pub mod scrollbars;
@@ -1317,7 +1318,7 @@ fn paint_primary_overlays(app: &mut PhotocraftApp, ui: &mut egui::Ui, view: &mut
     // So are Puppet Warp's, Perspective Warp's and Vanishing Point's warped pixels (#7781).
     crate::distort_ui::draw_content(app, painter, xf);
     // A PSD/PSB's stored composite over what the first draw hasn't reached yet.
-    crate::canvas::open_preview::draw(app, painter, xf, idx);
+    crate::frame_stages::timed("open preview", || crate::canvas::open_preview::draw(app, painter, xf, idx));
     // How far a long redraw has got, so it reads as work under way rather than a stuck canvas.
     if let Some(id) = app.session.documents().get(idx).map(|st| st.doc.id) {
         crate::canvas::sweep::draw_progress(app, painter, id);

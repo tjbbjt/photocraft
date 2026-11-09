@@ -489,6 +489,15 @@ pub(crate) fn damage(app: &PhotocraftApp, doc: DocId, revision: u64, seen: u64, 
     })
 }
 
+/// A snapshot drag's release: the canvas showed the document with the layers hidden (display key
+/// `key`), and the move at `revision` left them in `rect`: the only area to redraw.
+pub(crate) struct MoveDrop {
+    pub(crate) doc: DocId,
+    pub(crate) revision: u64,
+    pub(crate) key: u64,
+    pub(crate) rect: Rect,
+}
+
 /// Whether a Move drag shows (or is about to show) a snapshot of its layers rather than an arrow.
 pub(crate) fn snapshot_drag(app: &PhotocraftApp) -> bool {
     app.move_preview.as_ref().is_some_and(|p| p.snapshot.is_some())
@@ -519,7 +528,13 @@ pub(crate) fn finish(app: &mut PhotocraftApp, dx: f64, dy: f64) {
     let (dx, dy) = (dx.clamp(-1e7, 1e7), dy.clamp(-1e7, 1e7));
     // Only when the canvas shows this very offset (else it recomposites everything once).
     let at = (dx as i32, dy as i32);
-    let shown = app.move_preview.take().filter(|p| p.shown.is_some() && p.offsets.last() == Some(&at));
+    let preview = app.move_preview.take();
+    // A snapshot drag's canvas shows the layers hidden, drawn where they were: after the move it
+    // differs only where they land, so that is all the drop redraws (not one rectangle around
+    // both places: up to 585 MP for a 108 MP photo moved across a storyboard).
+    let landed =
+        preview.as_ref().filter(|p| p.snapshot.is_some() && p.shown.is_some() && p.offsets == [(0, 0)]).and_then(|p| Some((p.doc, p.key(), p.area(at)?)));
+    let shown = preview.filter(|p| p.shown.is_some() && p.offsets.last() == Some(&at));
     if dx == 0.0 && dy == 0.0 {
         return;
     }
@@ -527,6 +542,12 @@ pub(crate) fn finish(app: &mut PhotocraftApp, dx: f64, dy: f64) {
     let Ok(result) = app.run("layer.translate", json!({"dx": dx, "dy": dy, "selection": carries_selection(app), "nest": true})) else {
         return;
     };
+    if let Some((doc, key, rect)) = landed
+        && let Some(st) = app.session.active().filter(|st| st.doc.id == doc)
+    {
+        log::info!("move: the drop redraws only where the layers landed ({:.0} MP)", rect.size().area() as f64 / 1_048_576.0);
+        app.move_drop = Some(MoveDrop { doc, revision: st.revision, key, rect });
+    }
     // A layer that changed board is clipped by its new board, not the old one the preview showed,
     // so the canvas recomposites instead of keeping the preview.
     let Some(p) = shown.filter(|_| result.get("nested").is_none()) else { return };

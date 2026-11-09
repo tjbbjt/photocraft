@@ -639,6 +639,11 @@ pub struct PhotocraftApp {
     pub(crate) open_preview_reads: HashMap<String, crate::canvas::open_preview::OpenPreview>,
     /// What the canvas showed over hidden layers, to put back when they are shown again.
     pub(crate) board_cache: crate::canvas::board_cache::BoardCache,
+    /// Sweeps composited off the UI thread (started on first use), and whether it couldn't start.
+    pub(crate) redraw_thread: Option<crate::canvas::redraw_thread::RedrawThread>,
+    pub(crate) redraw_thread_failed: bool,
+    /// The last snapshot drag's drop, to redraw only where its layers landed.
+    pub(crate) move_drop: Option<crate::canvas::move_ui::MoveDrop>,
     /// The session clipboard currently holds an image imported from the OS clipboard: it has no
     /// original position, so Paste centres it (see `menus` "edit.paste").
     pub(crate) clip_external: bool,

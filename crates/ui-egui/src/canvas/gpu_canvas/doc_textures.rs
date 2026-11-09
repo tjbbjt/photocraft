@@ -157,9 +157,54 @@ impl DocTextures {
 
     /// Rebuild the mip chain inside document rect `r` (x0, y0, x1, y1) with 2×2 box filtering.
     pub(super) fn regenerate_mips(&self, device: &wgpu::Device, queue: &wgpu::Queue, res: &Resources, r: [u32; 4]) {
-        let Some(mip_pipeline) = res.mip_pipeline(self.format) else { return };
+        let Some(kit) = MipKit::of(res, self.format) else { return };
+        let tiles: Vec<TileTarget> = self.tiles.iter().map(TileTarget::of).collect();
+        regenerate_mips_in(device, queue, &kit, self.format, &tiles, r);
+    }
+}
+
+/// What rebuilding a tile's mip chain draws into: a display tile's rect, texture and levels
+/// (handles, cloned out of the renderer's resources for the redraw thread).
+#[derive(Clone)]
+pub(super) struct TileTarget {
+    pub(super) rect: [u32; 4],
+    pub(super) texture: wgpu::Texture,
+    pub(super) levels: Vec<wgpu::TextureView>,
+}
+
+impl TileTarget {
+    pub(super) fn of(t: &Tile) -> Self {
+        TileTarget { rect: t.rect, texture: t.texture.clone(), levels: t.levels.clone() }
+    }
+}
+
+/// The mip pipeline and its bindings for one tile format.
+#[derive(Clone)]
+pub(super) struct MipKit {
+    pipeline: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    separate: bool,
+}
+
+impl MipKit {
+    pub(super) fn of(res: &Resources, format: wgpu::TextureFormat) -> Option<Self> {
+        Some(MipKit {
+            pipeline: res.mip_pipeline(format)?.clone(),
+            bgl: res.mip_bgl.clone(),
+            sampler: res.mip_sampler.clone(),
+            separate: res.separate_mip_targets,
+        })
+    }
+}
+
+/// Rebuild the mip chains of `tiles` inside document rect `r` (x0, y0, x1, y1) with 2×2 box
+/// filtering ([`DocTextures::regenerate_mips`], usable without the renderer's resources).
+pub(super) fn regenerate_mips_in(device: &wgpu::Device, queue: &wgpu::Queue, kit: &MipKit, format: wgpu::TextureFormat, tiles: &[TileTarget], r: [u32; 4]) {
+    {
+        let mip_pipeline = &kit.pipeline;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pc_mips") });
-        for t in &self.tiles {
+        for t in tiles {
             let [tx, ty, tw, th] = t.rect;
             let (mut x0, mut y0, mut x1, mut y1) = (r[0].max(tx), r[1].max(ty), r[2].min(tx + tw), r[3].min(ty + th));
             if x0 >= x1 || y0 >= y1 {
@@ -171,10 +216,10 @@ impl DocTextures {
                 [x0, y0, x1, y1] = mip_damage([x0, y0, x1, y1], lw, lh);
                 let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("pc_mip"),
-                    layout: &res.mip_bgl,
+                    layout: &kit.bgl,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&t.levels[level - 1]) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&res.mip_sampler) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&kit.sampler) },
                     ],
                 });
                 // Keep the sampled source and render attachment in separate resources on Intel
@@ -182,14 +227,14 @@ impl DocTextures {
                 // previews when both are mip levels of the same texture, even though the
                 // subresources do not overlap. Elsewhere render straight into the level, which
                 // spares a scratch texture and a copy per level on every edit.
-                let scratch = res.separate_mip_targets.then(|| {
+                let scratch = kit.separate.then(|| {
                     let scratch = device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("pc_mip_scratch"),
                         size: wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 },
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
-                        format: self.format,
+                        format,
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                         view_formats: &[],
                     });
