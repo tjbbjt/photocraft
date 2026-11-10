@@ -131,8 +131,11 @@ pub(crate) fn publish(app: &PhotocraftApp, doc: &Arc<Document>, encode_srgb: boo
     let mut latest = t.latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let live: Vec<u64> = app.session.documents().iter().map(|d| d.doc.id.0).collect();
     latest.retain(|k, _| live.contains(k));
+    // Kept only while a sweep of it runs: a version held here shares its tiles with the next, so
+    // a brush stroke copies every tile it touches rather than painting into it.
+    let old = if super::sweep::running(app, doc.id) { latest.insert(doc.id.0, (doc.clone(), encode_srgb)) } else { latest.remove(&doc.id.0) };
     // The version it replaces can be the last holder of a stroke step's tiles: freed elsewhere.
-    if let Some(old) = latest.insert(doc.id.0, (doc.clone(), encode_srgb))
+    if let Some(old) = old
         && !Arc::ptr_eq(&old.0, doc)
     {
         super::strokes::drop_elsewhere(old);
