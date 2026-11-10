@@ -104,7 +104,8 @@ pub(crate) use start_screen::start_screen_drop_hint;
 pub(crate) use strokes::multiple_color_target;
 pub use strokes::paint_target;
 pub(crate) use strokes::{
-    ClonePreviewCache, CommittedStroke, LiveStroke, cancel_mixer_on_context_change, flush_finishing_stroke, freehand_tool, spread_ms, strokes_live,
+    ClonePreviewCache, CommittedStroke, LiveStroke, STILL_FINISHING, cancel_mixer_on_context_change, flush_finishing_stroke, freehand_tool,
+    runs_while_a_stroke_finishes, spread_ms, strokes_live,
 };
 use strokes::{
     HOLD_REPEAT_MS, continue_finishing_stroke, draw_clone_preview, feed_live_stroke, live_stroke_behind, pointer_button_modifiers, pointer_moves,

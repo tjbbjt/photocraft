@@ -309,7 +309,13 @@ fn block_size(gpu_ms_per_mp: Option<f64>) -> (i32, i32) {
 
 /// Remember what the canvas of `doc` shows now (with display key `display_key`).
 pub(crate) fn shown(app: &mut PhotocraftApp, doc: &Arc<Document>, display_key: u64) {
-    app.canvas_states.entry(doc.id).or_default().shown = Some((doc.clone(), display_key));
+    let state = app.canvas_states.entry(doc.id).or_default();
+    // The version it replaces can be the last holder of a stroke step's tiles: freed elsewhere.
+    if let Some(old) = state.shown.replace((doc.clone(), display_key))
+        && !Arc::ptr_eq(&old.0, doc)
+    {
+        super::strokes::drop_elsewhere(old);
+    }
 }
 
 /// The area where `doc` differs from what its canvas last showed, if that can be bounded.
@@ -417,7 +423,7 @@ pub(crate) fn keep_fed(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCa
 ///
 /// [`IN_FLIGHT`]: super::redraw_thread::IN_FLIGHT
 fn step_threaded(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, doc: &Arc<Document>, display: Option<&CanvasDisplay>) -> Step {
-    use super::redraw_thread::{IN_FLIGHT, JOB_BLOCKS};
+    use super::redraw_thread::{IN_FLIGHT, JOB_BLOCKS, JOB_BLOCKS_IDLE};
     let now = crate::gpu_canvas::now_ms();
     super::redraw_thread::publish(app, doc, display.is_some_and(|d| d.encode_srgb));
     if let Some(s) = app.canvas_states.get_mut(&doc.id) {
@@ -426,13 +432,16 @@ fn step_threaded(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, 
     }
     let failed = app.canvas_states.get(&doc.id).is_some_and(|s| s.thread_failed || s.thread_wait_until > now);
 
+    // Larger jobs while nothing is drawn by hand; small ones keep an edit's wait for the
+    // compositor short.
+    let job = if app.drag.is_none() && app.live_stroke.is_none() && app.finishing_stroke.is_none() { JOB_BLOCKS_IDLE } else { JOB_BLOCKS };
     if !failed {
         // Keep the thread fed: the next blocks (popped from the end) in jobs of a few.
         while let Some(s) = app.canvas_states.get_mut(&doc.id) {
             if s.in_flight.len() >= IN_FLIGHT || s.pending.is_empty() {
                 break;
             }
-            let keep = s.pending.len().saturating_sub(JOB_BLOCKS);
+            let keep = s.pending.len().saturating_sub(job);
             let blocks: Vec<Rect> = s.pending.drain(keep..).rev().collect();
             let Some(ticket) = app.redraw_thread.as_mut().and_then(|t| t.send(doc.id, blocks.clone())) else {
                 if let Some(s) = app.canvas_states.get_mut(&doc.id) {

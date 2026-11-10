@@ -10,9 +10,15 @@ impl PhotocraftApp {
             log_command(id);
             // A released stroke still catching up lands first: Undo right after a release
             // undoes the stroke, and nothing runs on a document it hasn't reached yet.
-            if self.finishing_stroke.is_some() {
-                log::info!("live stroke: finished at once for {id}");
-                canvas::flush_finishing_stroke(self);
+            if self.finishing_stroke.is_some() && !canvas::runs_while_a_stroke_finishes(id) {
+                log::info!("live stroke: finishing at once for {id}");
+                // Still on its worker: the command waits for the stroke, the window doesn't.
+                if !canvas::flush_finishing_stroke(self) {
+                    log::info!("live stroke: {id} turned away, the stroke is still finishing");
+                    self.ui.status = canvas::STILL_FINISHING.into();
+                    self.ui.status_error = true;
+                    return Err(canvas::STILL_FINISHING.into());
+                }
             }
         }
         let params = if id == "select.findLayers" { crate::layer_filter_ui::find::params_for_run(self, params) } else { params };

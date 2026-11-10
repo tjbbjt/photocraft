@@ -23,6 +23,11 @@ use crate::gpu_canvas::GpuCanvas;
 /// Blocks per job: small enough that an edit drawn on the UI thread waits little for the
 /// compositor, large enough that the document is planned once for several.
 pub(crate) const JOB_BLOCKS: usize = 3;
+/// Blocks per job while nothing is drawn by hand (no stroke or drag under way): each render
+/// costs about 7.5 ms whatever its size (planning the document, the prefix cache check, setup)
+/// against about 2.6 ms a block, so the first redraw of a storyboard spent half its time on
+/// that; three times the blocks per job cut it to about a third.
+pub(crate) const JOB_BLOCKS_IDLE: usize = 9;
 /// Jobs queued per document at a time, so the thread always has the next one.
 pub(crate) const IN_FLIGHT: usize = 2;
 
@@ -126,5 +131,10 @@ pub(crate) fn publish(app: &PhotocraftApp, doc: &Arc<Document>, encode_srgb: boo
     let mut latest = t.latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let live: Vec<u64> = app.session.documents().iter().map(|d| d.doc.id.0).collect();
     latest.retain(|k, _| live.contains(k));
-    latest.insert(doc.id.0, (doc.clone(), encode_srgb));
+    // The version it replaces can be the last holder of a stroke step's tiles: freed elsewhere.
+    if let Some(old) = latest.insert(doc.id.0, (doc.clone(), encode_srgb))
+        && !Arc::ptr_eq(&old.0, doc)
+    {
+        super::strokes::drop_elsewhere(old);
+    }
 }
