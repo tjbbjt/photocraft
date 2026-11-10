@@ -295,7 +295,9 @@ fn land_worker(l: &mut LiveStroke, wait: Option<std::time::Duration>) -> Landed 
     let Some(w) = l.worker.take() else { return Landed::Failed };
     // The document the canvas showed meanwhile can hold the only copies of gigabytes of tiles
     // the step replaced: freed on another thread, not this one.
-    drop_elsewhere(std::mem::replace(&mut l.stroke, EngineStroke::Brush(stroke)));
+    if let EngineStroke::Busy(busy) = std::mem::replace(&mut l.stroke, EngineStroke::Brush(stroke)) {
+        drop_elsewhere(busy.doc);
+    }
     let ms = crate::gpu_canvas::now_ms() - w.started;
     if ms > SLOW_STROKE_STEP_MS {
         log::info!("live stroke: one step of {} point(s) took {ms:.0} ms on the worker", w.points);
