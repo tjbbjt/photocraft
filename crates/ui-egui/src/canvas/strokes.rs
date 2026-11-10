@@ -252,6 +252,18 @@ fn send_to_worker(l: &mut LiveStroke, pts: Vec<photocraft_engine::paint::StrokeP
     true
 }
 
+/// "; process memory N GB" where the system says (Linux), for slow-step lines: a storyboard
+/// session that vanished without a word looked like the system ending it for memory.
+pub(crate) fn memory_note() -> String {
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/self/statm")
+        && let Some(pages) = s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok())
+    {
+        return format!("; process memory {:.1} GB", (pages * 4096) as f64 / f64::from(1u32 << 30));
+    }
+    String::new()
+}
+
 /// Drop `x` on another thread: freeing a large document's tiles took the UI thread seconds.
 pub(crate) fn drop_elsewhere<T: Send + 'static>(x: T) {
     // A failed spawn drops it here after all, with the closure.
@@ -347,7 +359,7 @@ fn land_worker(l: &mut LiveStroke, wait: Option<std::time::Duration>) -> Landed 
     }
     let ms = crate::gpu_canvas::now_ms() - w.started;
     if ms > SLOW_STROKE_STEP_MS {
-        log::info!("live stroke: one step of {} point(s) took {ms:.0} ms on the worker", w.points);
+        log::info!("live stroke: one step of {} point(s) took {ms:.0} ms on the worker{}", w.points, memory_note());
     }
     match r {
         Ok(dmg) => {

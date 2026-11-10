@@ -330,9 +330,12 @@ pub(crate) fn changed_since_shown(app: &PhotocraftApp, doc: &Document, display_k
 /// Draw blocks of `doc`'s sweep until this frame's budget is spent, and ask for another frame
 /// while blocks remain. Logs one line per sweep when it ends: its size, blocks, frames and time.
 pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, doc: &Arc<Document>, display: Option<&CanvasDisplay>) -> Step {
-    land_finished(app);
+    crate::frame_stages::timed("sweep: landing finished jobs", || land_finished(app));
     if app.canvas_states.get(&doc.id).is_some_and(|s| !s.thread_failed) && super::redraw_thread::thread(app, gpu, ctx).is_some() {
-        return step_threaded(app, ctx, gpu, doc, display);
+        return crate::frame_stages::timed("sweep: feeding the redraw thread", || step_threaded(app, ctx, gpu, doc, display));
+    }
+    if app.canvas_states.get(&doc.id).is_some_and(|s| s.totals.is_none()) {
+        log::info!("canvas: this sweep redraws on the UI thread");
     }
     let started = crate::gpu_canvas::now_ms();
     let mut gpu_estimate = 0.0;
@@ -425,7 +428,7 @@ pub(crate) fn keep_fed(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCa
 fn step_threaded(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, doc: &Arc<Document>, display: Option<&CanvasDisplay>) -> Step {
     use super::redraw_thread::{IN_FLIGHT, JOB_BLOCKS, JOB_BLOCKS_IDLE};
     let now = crate::gpu_canvas::now_ms();
-    super::redraw_thread::publish(app, doc, display.is_some_and(|d| d.encode_srgb));
+    crate::frame_stages::timed("sweep: publishing the document", || super::redraw_thread::publish(app, doc, display.is_some_and(|d| d.encode_srgb)));
     if let Some(s) = app.canvas_states.get_mut(&doc.id) {
         let totals = s.totals.get_or_insert_with(|| Totals { started_ms: now, work: Work::planned(doc), ..Totals::default() });
         totals.frame(crate::gpu_canvas::now_ms());
@@ -456,7 +459,7 @@ fn step_threaded(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, 
         }
     }
     if !running(app, doc.id) {
-        return finish(app, gpu, doc.id, Step::Done);
+        return crate::frame_stages::timed("sweep: finishing", || finish(app, gpu, doc.id, Step::Done));
     }
     // The thread asks for a repaint as each job lands; this is a backstop.
     ctx.request_repaint_after(std::time::Duration::from_millis(100));

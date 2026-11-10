@@ -435,7 +435,7 @@ fn log_command(id: &str) {
     let now = gpu_canvas::now_ms();
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     if last.as_ref().is_none_or(|(prev, at)| prev != id || now - at > 1000.0) {
-        log::info!("command: {id}");
+        log::info!("command: {id}{}", canvas::memory_note());
     }
     *last = Some((id.to_owned(), now));
 }
