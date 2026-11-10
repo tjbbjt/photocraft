@@ -14,10 +14,13 @@ impl PhotocraftApp {
                 log::info!("live stroke: finishing at once for {id}");
                 // Still on its worker: the command waits for the stroke, the window doesn't.
                 if !canvas::flush_finishing_stroke(self) {
-                    log::info!("live stroke: {id} turned away, the stroke is still finishing");
-                    self.ui.status = canvas::STILL_FINISHING.into();
-                    self.ui.status_error = true;
-                    return Err(canvas::STILL_FINISHING.into());
+                    // It runs once the stroke has committed, as if made after it.
+                    log::info!("live stroke: {id} waits for the stroke");
+                    self.queued_commands.push((id.to_string(), params));
+                    let n = self.queued_commands.len();
+                    self.ui.status = format!("Finishing the last brush stroke… {n} action(s) will follow");
+                    self.ui.status_error = false;
+                    return Ok(json!({"pending": true, "queued": true}));
                 }
             }
         }
