@@ -14,11 +14,22 @@ impl PhotocraftApp {
                 log::info!("live stroke: finishing at once for {id}");
                 // Still on its worker: the command waits for the stroke, the window doesn't.
                 if !canvas::flush_finishing_stroke(self) {
-                    // It runs once the stroke has committed, as if made after it.
+                    // Automation gets an error to retry: queued, the command would run after the
+                    // request returned, its result lost and outside the request's authorization.
+                    if self.automation_input || self.session.authorize.is_some() {
+                        log::info!("live stroke: {id} from automation turned away, the stroke is still finishing");
+                        return Err(canvas::still_finishing().into());
+                    }
+                    // Made by hand, it runs once the stroke has committed, as if made after it.
                     log::info!("live stroke: {id} waits for the stroke");
                     self.queued_commands.push((id.to_string(), params));
                     let n = self.queued_commands.len();
-                    self.ui.status = format!("Finishing the last brush stroke… {n} action(s) will follow");
+                    self.ui.status = crate::i18n::trn(
+                        crate::i18n::current(),
+                        n as u64,
+                        "Finishing the last brush stroke… {n} action will follow",
+                        "Finishing the last brush stroke… {n} actions will follow",
+                    );
                     self.ui.status_error = false;
                     return Ok(json!({"pending": true, "queued": true}));
                 }
