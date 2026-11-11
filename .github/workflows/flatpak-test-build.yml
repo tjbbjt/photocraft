@@ -1,0 +1,83 @@
+# Build an unsigned single-file Flatpak from this branch, for testing a fix before a release.
+# Run it from the Actions tab (Flatpak test build > Run workflow); the .flatpak is attached to
+# the run as an artifact. Install it with:
+#
+#   flatpak install --user ./photocraft-<version>-linux-x86_64.flatpak
+#
+# It uses the same scripts as the release (packaging/linux/package.sh and flatpak-bundle.sh)
+# but none of the signing secrets, so it works in a fork.
+name: Flatpak test build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    # Same base as the release binaries: glibc 2.35, so they run on newer distros.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    # Test builds trade a few percent of speed for a much shorter compile: the release profile's
+    # single codegen unit and thin LTO are what make a release build slow.
+    env:
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_LTO: "off"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
+            libgtk-3-dev appstream desktop-file-utils
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build and package the Linux tarball
+        run: packaging/linux/package.sh --formats tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-tarball
+          path: dist/release/*.tar.gz
+          retention-days: 3
+
+  flatpak:
+    needs: binaries
+    # flatpak-bundle.sh needs flatpak-builder >= 1.3 (it composes AppStream data with the host's
+    # appstreamcli); Ubuntu 22.04 ships 1.2, whose appstream-compose the 26.08 SDK no longer has.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder librsvg2-common appstream
+
+      # The freedesktop SDK and runtime (a few GB) are downloaded on every run otherwise.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.local/share/flatpak
+          key: flatpak-runtimes-26.08-${{ hashFiles('packaging/linux/flatpak/*.yml') }}
+          restore-keys: flatpak-runtimes-26.08-
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: photocraft-tarball
+          path: dist/release
+
+      - name: Repackage it as a Flatpak bundle
+        run: packaging/linux/flatpak-bundle.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-flatpak
+          path: dist/release/*.flatpak
+          retention-days: 14
