@@ -63,6 +63,62 @@ pub(crate) struct CanvasState {
     thread_failed: bool,
     /// No jobs before this time ([`crate::gpu_canvas::now_ms`]): the compositor wasn't ready.
     thread_wait_until: f64,
+    /// How the running sweep has gone so far, logged when it ends.
+    timing: Option<SweepTiming>,
+}
+
+/// A sweep's progress, for the log line at its end: how long a whole redraw in blocks takes,
+/// how much of it the UI thread spent drawing, and how much the redraw thread did.
+#[derive(Clone, Copy, Debug)]
+struct SweepTiming {
+    started_ms: f64,
+    frames: usize,
+    blocks: usize,
+    px: u64,
+    /// UI-thread time spent rendering blocks (ms).
+    ui_ms: f64,
+    /// Blocks drawn on the redraw thread, in how many jobs, and its time on them (ms).
+    thread_blocks: usize,
+    thread_jobs: usize,
+    thread_ms: f64,
+}
+
+impl SweepTiming {
+    fn new() -> Self {
+        Self { started_ms: crate::gpu_canvas::now_ms(), frames: 0, blocks: 0, px: 0, ui_ms: 0.0, thread_blocks: 0, thread_jobs: 0, thread_ms: 0.0 }
+    }
+
+    /// `blocks` drawn, on the UI thread in `ui_ms` or on the redraw thread in `thread_ms`.
+    fn drew(&mut self, blocks: &[Rect], ui_ms: f64, thread_ms: Option<f64>) {
+        self.blocks += blocks.len();
+        self.px += blocks.iter().map(|b| b.size().area()).sum::<u64>();
+        self.ui_ms += ui_ms;
+        if let Some(ms) = thread_ms {
+            self.thread_blocks += blocks.len();
+            self.thread_jobs += 1;
+            self.thread_ms += ms;
+        }
+    }
+}
+
+/// The sweep of `doc` has drawn its last block: log how it went.
+fn finished(app: &mut PhotocraftApp, doc: DocId) -> Step {
+    if let Some(t) = app.canvas_states.get_mut(&doc).and_then(|s| s.timing.take()) {
+        log::info!(
+            "canvas: redrew {:.0} MP in {} blocks over {} frames: {:.0} ms; UI thread drew {} blocks in {:.0} ms; redraw thread drew {} blocks in {} jobs, {:.0} ms ({:.1} ms a job)",
+            t.px as f64 / 1_048_576.0,
+            t.blocks,
+            t.frames,
+            crate::gpu_canvas::now_ms() - t.started_ms,
+            t.blocks - t.thread_blocks,
+            t.ui_ms,
+            t.thread_blocks,
+            t.thread_jobs,
+            t.thread_ms,
+            t.thread_ms / t.thread_jobs.max(1) as f64
+        );
+    }
+    Step::Done
 }
 
 /// How long the redraw thread waits for a compositor that isn't ready yet (ms).
@@ -106,6 +162,7 @@ pub(crate) fn running(app: &PhotocraftApp, doc: DocId) -> bool {
 pub(crate) fn start(app: &mut PhotocraftApp, doc: &Document, visible: Rect) {
     let state = app.canvas_states.entry(doc.id).or_default();
     state.pending = blocks(doc.bounds(), doc.bounds(), visible);
+    state.timing = Some(SweepTiming::new());
     state.thread_failed = false;
 }
 
@@ -147,6 +204,7 @@ pub(crate) fn add(app: &mut PhotocraftApp, doc: &Document, region: Rect, visible
     // A new redraw tries the redraw thread again, whatever happened to the last one.
     if state.pending.is_empty() && state.in_flight.is_empty() {
         state.thread_failed = false;
+        state.timing = Some(SweepTiming::new());
     }
     // Blocks sit on one grid over the canvas, so a block already pending is the same rectangle:
     // it is queued once (a Move drag adds the same blocks every frame).
@@ -208,6 +266,9 @@ pub(crate) fn changed_since_shown(app: &PhotocraftApp, doc: &Document, display_k
 /// while blocks remain. With the redraw thread, hand it the next blocks instead ([`step_threaded`]).
 pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas, doc: &Arc<Document>, display: Option<&CanvasDisplay>) -> Step {
     land_finished(app);
+    if let Some(t) = app.canvas_states.get_mut(&doc.id).and_then(|s| s.timing.as_mut()) {
+        t.frames += 1;
+    }
     if app.canvas_states.get(&doc.id).is_some_and(|s| !s.thread_failed) && super::redraw_thread::thread(app, gpu, ctx).is_some() {
         return step_threaded(app, ctx, doc, display);
     }
@@ -222,17 +283,22 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
         let batch: Vec<Rect> =
             if n > 1 { app.canvas_states.get(&doc.id).map(|s| s.pending.iter().rev().take(n).copied().collect()).unwrap_or_default() } else { Vec::new() };
         if batch.len() > 1 {
+            let drawing = crate::gpu_canvas::now_ms();
             match gpu.refresh_blocks(doc.id.0, doc, &batch, display) {
                 Some(r) => {
+                    let ms = crate::gpu_canvas::now_ms() - drawing;
                     app.perf.record_refresh(&r);
                     app.perf.gpu_uploads = r.uploads;
                     if let Some(s) = app.canvas_states.get_mut(&doc.id) {
                         let keep = s.pending.len().saturating_sub(batch.len());
                         s.pending.truncate(keep);
                         s.learn(&r, batch.len());
+                        if let Some(t) = s.timing.as_mut() {
+                            t.drew(&batch, ms, None);
+                        }
                     }
                     if !running(app, doc.id) {
-                        return Step::Done;
+                        return finished(app, doc.id);
                     }
                     if crate::gpu_canvas::now_ms() - started >= FRAME_BUDGET_MS {
                         ctx.request_repaint();
@@ -244,8 +310,12 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
                 None => batches = false,
             }
         }
-        let Some(block) = app.canvas_states.get_mut(&doc.id).and_then(|s| s.pending.pop()) else { return Step::Done };
+        let Some(block) = app.canvas_states.get_mut(&doc.id).and_then(|s| s.pending.pop()) else { return finished(app, doc.id) };
+        let drawing = crate::gpu_canvas::now_ms();
         let r = gpu.refresh_with(doc.id.0, doc, Some(block), display, false);
+        if let Some(t) = app.canvas_states.get_mut(&doc.id).and_then(|s| s.timing.as_mut()) {
+            t.drew(&[block], crate::gpu_canvas::now_ms() - drawing, None);
+        }
         // Counted like any refresh, so `ui.inspect` and slow-frame reports include the blocks.
         if r.fallback.is_none() && matches!(r.kind, "gpu-rect" | "gpu-full" | "rect") {
             app.perf.record_refresh(&r);
@@ -262,7 +332,7 @@ pub(crate) fn step(app: &mut PhotocraftApp, ctx: &egui::Context, gpu: &GpuCanvas
             return end;
         }
         if !running(app, doc.id) {
-            return Step::Done;
+            return finished(app, doc.id);
         }
         if crate::gpu_canvas::now_ms() - started >= FRAME_BUDGET_MS {
             ctx.request_repaint();
@@ -316,7 +386,7 @@ fn step_threaded(app: &mut PhotocraftApp, ctx: &egui::Context, doc: &Arc<Documen
         }
     }
     if !running(app, doc.id) {
-        return Step::Done;
+        return finished(app, doc.id);
     }
     // The thread asks for a repaint as each job lands; this is a backstop (and the retry of a
     // compositor that wasn't ready).
@@ -329,6 +399,11 @@ fn land_finished(app: &mut PhotocraftApp) {
     let Some((finished, alive)) = app.redraw_thread.as_ref().map(super::redraw_thread::RedrawThread::finished) else { return };
     for done in finished {
         if let Some(s) = app.canvas_states.get_mut(&done.doc) {
+            if done.result.is_ok()
+                && let Some(t) = s.timing.as_mut()
+            {
+                t.drew(&done.blocks, 0.0, Some(done.ms));
+            }
             s.landed(done.ticket, done.blocks, done.result);
         }
     }
@@ -399,13 +474,14 @@ fn after_block(app: &mut PhotocraftApp, doc: DocId, kind: &str, fallback: bool) 
             if let Some(s) = app.canvas_states.get_mut(&doc) {
                 s.pending.clear();
             }
-            Some(Step::Done)
+            Some(finished(app, doc))
         }
         _ => {
             log::info!("canvas: redrawing in blocks stopped ({kind}); redrawing in one go");
             if let Some(s) = app.canvas_states.get_mut(&doc) {
                 s.pending.clear();
                 s.failed = true;
+                s.timing = None;
             }
             Some(Step::Failed)
         }

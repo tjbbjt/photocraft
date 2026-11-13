@@ -49,6 +49,8 @@ pub(crate) struct Done {
     pub(crate) ticket: u64,
     pub(crate) blocks: Vec<Rect>,
     pub(crate) result: Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported>,
+    /// How long the thread spent on the job (ms), for the sweep's log line.
+    pub(crate) ms: f64,
 }
 
 /// The running thread: where jobs go, where they come back, and the documents it draws.
@@ -84,8 +86,10 @@ impl RedrawThread {
             // Ends when the app drops its end of the channel.
             while let Ok(job) = jobs.recv() {
                 let pick = || shared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&job.key).cloned();
+                let started = crate::gpu_canvas::now_ms();
                 let result = gpu.composite_lent(pick, &job.blocks);
-                if done.send(Done { doc: DocId(job.key), ticket: job.ticket, blocks: job.blocks, result }).is_err() {
+                let ms = crate::gpu_canvas::now_ms() - started;
+                if done.send(Done { doc: DocId(job.key), ticket: job.ticket, blocks: job.blocks, result, ms }).is_err() {
                     break;
                 }
                 ctx.request_repaint();
