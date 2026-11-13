@@ -174,6 +174,11 @@ pub struct GpuCanvas {
     camera_raw_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     compositor_build: compositor_build::Slot,
     compositor_completion: compositor_build::Completion,
+    /// Held by whoever is compositing, the UI thread ([`GpuCanvas::composite_regions`]) or the
+    /// redraw thread ([`GpuCanvas::composite_lent`]), so the two never use the compositor at
+    /// once. The redraw thread waits while `ui_waiting` is set, so the UI thread goes first.
+    turn: std::sync::Arc<std::sync::Mutex<()>>,
+    ui_waiting: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Whether `regenerate_mips` builds each level in a scratch texture and copies it back: on
@@ -254,6 +259,8 @@ impl GpuCanvas {
             camera_raw_started: Default::default(),
             compositor_build: Default::default(),
             compositor_completion: Default::default(),
+            turn: Default::default(),
+            ui_waiting: Default::default(),
         }
     }
 
@@ -352,6 +359,8 @@ impl GpuCanvas {
         let mut r = self.rs.renderer.write();
         if let Some(res) = r.callback_resources.get_mut::<Resources>() {
             res.compositor = None;
+            // A compositor out on the redraw thread doesn't come back.
+            res.compositor_generation += 1;
             res.compositor_failed = Some(photocraft_gpu::Unsupported(self.fault().map_or_else(|| "GPU canvas released".into(), |f| f.to_string())));
             res.docs.clear();
             res.luts.clear();
@@ -467,6 +476,7 @@ impl GpuCanvas {
         let mut r = self.rs.renderer.write();
         if let Some(res) = r.callback_resources.get_mut::<Resources>() {
             res.compositor = None;
+            res.compositor_generation += 1;
             res.compositor_failed = Some(photocraft_gpu::Unsupported(msg.into()));
         }
     }
@@ -752,6 +762,17 @@ impl GpuCanvas {
         region: photocraft_geom::Rect,
         encode_srgb: bool,
     ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
+        self.composite_regions(doc, &[region], encode_srgb)
+    }
+
+    /// [`Self::composite`] of several regions in one render (a sweep's blocks): one plan of the
+    /// document for all of them.
+    pub fn composite_regions(
+        &self,
+        doc: &photocraft_doc::Document,
+        regions: &[photocraft_geom::Rect],
+        encode_srgb: bool,
+    ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
         let (device, queue) = (&self.rs.device, &self.rs.queue);
         let size = [doc.size.width, doc.size.height];
         if size[0] == 0 || size[1] == 0 {
@@ -763,6 +784,11 @@ impl GpuCanvas {
         if let Some(f) = self.fault() {
             return Err(photocraft_gpu::Unsupported(f.to_string()));
         }
+        // The compositor may be out on the redraw thread: wait for its render to finish (it lets
+        // this go first while `ui_waiting` is set), so the compositor is back in `res`.
+        self.ui_waiting.store(true, Ordering::Relaxed);
+        let _turn = self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ui_waiting.store(false, Ordering::Relaxed);
         let mut renderer = self.rs.renderer.write();
         let Some(res) = renderer.callback_resources.get_mut::<Resources>() else { return Err(photocraft_gpu::Unsupported("no GPU canvas".into())) };
         // A driver that couldn't build the pipelines once won't later: stay on the CPU compositor.
@@ -809,7 +835,8 @@ impl GpuCanvas {
         let key = doc.id.0;
         let format = self.format_for(doc.depth, size);
         let fresh = res.docs.get(&key).is_none_or(|d| d.size != size || d.format != format);
-        let region = if fresh { doc.bounds() } else { region.intersect(&doc.bounds()) };
+        let regions: Vec<photocraft_geom::Rect> =
+            if fresh { vec![doc.bounds()] } else { regions.iter().map(|r| r.intersect(&doc.bounds())).filter(|r| !r.is_empty()).collect() };
         // Checked before allocating a new canvas texture only: `render` plans (and refuses) itself.
         if fresh && let Err(e) = comp.supports(doc) {
             res.compositor = Some(comp);
@@ -819,8 +846,10 @@ impl GpuCanvas {
         // evicted ones every time (no faster than the CPU, and more memory): the banded CPU
         // compositor does it (in the background on desktop). So does a large damage rect, such
         // as hiding a big layer (#4024); small edits in the view stay on the GPU.
-        let large = region.width() as u64 * region.height() as u64 >= DEFER_PX;
-        if region == doc.bounds() || large {
+        // One region only: several are a sweep's small blocks.
+        if let &[region] = regions.as_slice()
+            && (region == doc.bounds() || region.width() as u64 * region.height() as u64 >= DEFER_PX)
+        {
             let needed = comp.working_set(doc, region);
             let fit = LayerFit { doc: doc.id.0, needed, budget: comp.fit_layers(needed, region == doc.bounds()) };
             res.layer_fit = Some(fit);
@@ -847,41 +876,9 @@ impl GpuCanvas {
         // Last-resort guard: a wgpu panic (e.g. polling a device lost mid-refresh) marks the
         // device lost instead of taking the app and its documents down.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            comp.render(device, queue, doc, region, |enc, out| {
-                for t in &d.tiles {
-                    let [tx, ty, tw, th] = t.rect.map(|v| v as i32);
-                    let r = out.rect.intersect(&photocraft_geom::Rect::from_xywh(tx, ty, tw as u32, th as u32));
-                    if r.is_empty() {
-                        continue;
-                    }
-                    let offset = [out.rect.x0 - tx, out.rect.y0 - ty, i32::from(encode_srgb), keep_hdr];
-                    let ubuf = init_buffer(device, "pc_encode", &offset.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), wgpu::BufferUsages::UNIFORM);
-                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("pc_encode"),
-                        layout: bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(out.view) },
-                            wgpu::BindGroupEntry { binding: 1, resource: ubuf.as_entire_binding() },
-                        ],
-                    });
-                    let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("pc_encode"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &t.levels[0],
-                            resolve_target: None,
-                            depth_slice: None,
-                            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    pass.set_pipeline(pipe);
-                    pass.set_bind_group(0, &bg, &[]);
-                    pass.set_scissor_rect((r.x0 - tx) as u32, (r.y0 - ty) as u32, r.width(), r.height());
-                    pass.draw(0..3, 0..1);
-                }
+            comp.render_regions(device, queue, doc, &regions, |enc, out| {
+                let target = EncodeTarget { pipe, bgl, encode_srgb, keep_hdr };
+                target.encode(device, enc, &out, d.tiles.iter().map(|t| (t.rect, &t.levels[0])));
             })
         }));
         let Ok(result) = result else {
@@ -895,7 +892,9 @@ impl GpuCanvas {
             None => result,
         };
         if result.is_ok() {
-            d.regenerate_mips(device, queue, res, [region.x0 as u32, region.y0 as u32, region.x1 as u32, region.y1 as u32]);
+            for region in &regions {
+                d.regenerate_mips(device, queue, res, [region.x0 as u32, region.y0 as u32, region.x1 as u32, region.y1 as u32]);
+            }
             if std::env::var_os("PHOTOCRAFT_GPU_SYNC").is_some() {
                 // Benchmarking: wait for the GPU so callers can time the whole refresh.
                 #[cfg(not(target_arch = "wasm32"))]
@@ -906,6 +905,134 @@ impl GpuCanvas {
         }
         res.compositor = Some(comp);
         result
+    }
+
+    /// [`Self::composite_regions`] for the redraw thread (`canvas::redraw_thread`): the
+    /// compositor and the display texture's handles are taken out of the renderer's resources
+    /// under a brief lock, the render runs without it (the UI keeps painting meanwhile), and the
+    /// compositor goes back after. Only into an existing texture set; `Err` otherwise, and when
+    /// the compositor isn't built yet ([`COMPOSITOR_BUILDING`]), and the caller lets the UI thread
+    /// redraw those blocks as before.
+    ///
+    /// `latest` gives the document to draw (and whether to store the sRGB encoding). It is read
+    /// once the compositor is this thread's: an edit the UI thread drew before that is drawn here
+    /// too, and one drawn after waits for this render, so an older version never lands over a
+    /// newer one.
+    pub fn composite_lent(
+        &self,
+        latest: impl FnOnce() -> Option<(std::sync::Arc<photocraft_doc::Document>, bool)>,
+        regions: &[photocraft_geom::Rect],
+    ) -> Result<photocraft_gpu::Stats, photocraft_gpu::Unsupported> {
+        // A UI composite waiting for its turn goes first.
+        while self.ui_waiting.load(Ordering::Relaxed) {
+            std::thread::yield_now();
+        }
+        let _turn = self.turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((doc, encode_srgb)) = latest() else { return Err(photocraft_gpu::Unsupported("the document closed".into())) };
+        let doc = doc.as_ref();
+        let (device, queue) = (&self.rs.device, &self.rs.queue);
+        if std::env::var_os("PHOTOCRAFT_CPU_COMPOSE").is_some() {
+            return Err(photocraft_gpu::Unsupported("disabled by PHOTOCRAFT_CPU_COMPOSE".into()));
+        }
+        if let Some(f) = self.fault() {
+            return Err(photocraft_gpu::Unsupported(f.to_string()));
+        }
+        let key = doc.id.0;
+        let size = [doc.size.width, doc.size.height];
+        let format = self.format_for(doc.depth, size);
+        let (mut comp, lent) = self.lend(key, size, format)?;
+        let keep_hdr = i32::from(format == FORMAT_HIGH);
+        let regions: Vec<photocraft_geom::Rect> = regions.iter().map(|r| r.intersect(&doc.bounds())).filter(|r| !r.is_empty()).collect();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            comp.render_regions(device, queue, doc, &regions, |enc, out| {
+                let target = EncodeTarget { pipe: &lent.pipe, bgl: &lent.bgl, encode_srgb, keep_hdr };
+                target.encode(device, enc, &out, lent.tiles.iter().map(|t| (t.rect, &t.levels[0])));
+            })
+        }));
+        let Ok(result) = result else {
+            self.health.mark(photocraft_gpu::Fault::Lost("the GPU compositor stopped (internal error)".into()));
+            return Err(photocraft_gpu::Unsupported("GPU device lost".into()));
+        };
+        // Lost during the render: its output can't be trusted.
+        let result = match self.fault() {
+            Some(f) => Err(photocraft_gpu::Unsupported(f.to_string())),
+            None => result,
+        };
+        if result.is_ok() {
+            for r in &regions {
+                doc_textures::regenerate_mips_in(device, queue, &lent.mips, format, &lent.tiles, [r.x0 as u32, r.y0 as u32, r.x1 as u32, r.y1 as u32]);
+            }
+        }
+        self.give_back(comp, lent.generation);
+        result
+    }
+
+    /// The compositor (taken out of the renderer's resources) and the handles of document `key`'s
+    /// display texture set, for [`Self::composite_lent`]: only for a texture set of `size` and
+    /// `format` that exists, and a compositor that is built.
+    fn lend(&self, key: u64, size: [u32; 2], format: wgpu::TextureFormat) -> Result<(photocraft_gpu::Compositor, Lent), photocraft_gpu::Unsupported> {
+        let (device, queue) = (&self.rs.device, &self.rs.queue);
+        let mut renderer = self.rs.renderer.write();
+        let Some(res) = renderer.callback_resources.get_mut::<Resources>() else { return Err(photocraft_gpu::Unsupported("no GPU canvas".into())) };
+        if let Some(e) = &res.compositor_failed {
+            return Err(e.clone());
+        }
+        let Some(d) = res.docs.get(&key).filter(|d| d.size == size && d.format == format && d.tiles.iter().all(|t| t.page.is_none())) else {
+            return Err(photocraft_gpu::Unsupported("no canvas texture to redraw into".into()));
+        };
+        let (Some(pipe), Some(mips)) = (res.encode_pipeline(format).cloned(), doc_textures::MipKit::of(res, format)) else {
+            return Err(photocraft_gpu::Unsupported(format!("no {format:?} pipeline")));
+        };
+        let lent = Lent {
+            tiles: d.tiles.iter().map(doc_textures::TileTarget::of).collect(),
+            pipe,
+            bgl: res.encode_bgl.clone(),
+            mips,
+            generation: res.compositor_generation,
+        };
+        // A compositor built off the UI thread is adopted here too: the first draw of a document
+        // opened at startup can reach the redraw thread first.
+        if res.compositor.is_none() {
+            let mut state = self.compositor_build.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match std::mem::replace(&mut *state, compositor_build::BuildState::Adopted) {
+                // Being built: the caller tries again shortly.
+                compositor_build::BuildState::Building => {
+                    *state = compositor_build::BuildState::Building;
+                    return Err(photocraft_gpu::Unsupported(COMPOSITOR_BUILDING.into()));
+                }
+                compositor_build::BuildState::Ready(comp) => res.compositor = Some(*comp),
+                compositor_build::BuildState::Failed(error) => {
+                    res.compositor_failed = Some(error.clone());
+                    return Err(error);
+                }
+                other => *state = other,
+            }
+        }
+        // No build running and none adopted (nothing started one, as in the snapshot example):
+        // waiting would never end, so the blocks go back to the UI thread, which builds one.
+        let Some(mut comp) = res.compositor.take() else { return Err(photocraft_gpu::Unsupported("no GPU compositor yet; the UI thread builds it".into())) };
+        comp.set_health(self.health.clone());
+        comp.measure_gpu_time(device, queue);
+        if let Some(b) = res.compositor_budget {
+            comp.set_memory_budget(b);
+        }
+        if let Some(b) = res.compositor_cache_budget {
+            comp.set_composite_cache_budget(b);
+        }
+        comp.set_focus(res.compositor_focus);
+        Ok((comp, lent))
+    }
+
+    /// Put back a compositor lent to the redraw thread ([`Self::lend`]), unless it was reset
+    /// meanwhile (released after a fault, `generation` moved on): then this one is dropped.
+    fn give_back(&self, comp: photocraft_gpu::Compositor, generation: u64) {
+        let mut renderer = self.rs.renderer.write();
+        if let Some(res) = renderer.callback_resources.get_mut::<Resources>()
+            && res.compositor_generation == generation
+            && res.compositor.is_none()
+        {
+            res.compositor = Some(comp);
+        }
     }
 
     /// Bring document `key`'s display texture up to date with `doc`: only `damage` when given (a
@@ -969,6 +1096,7 @@ impl GpuCanvas {
                 out.composite_ms = now_ms() - t0;
                 out.uploads = stats.tiles_uploaded as u64;
                 out.gpu = stats.gpu_time;
+                out.stats = Some(stats);
                 return out;
             }
             Err(e) => {
@@ -1003,6 +1131,41 @@ impl GpuCanvas {
         out.px = bounds.width() as u64 * bounds.height() as u64;
         out.composite_ms = now_ms() - t0;
         out
+    }
+
+    /// Several blocks of document `key`'s display texture brought up to date in one GPU render
+    /// (one plan of the document for all of them), for a sweep. `None` when that isn't possible
+    /// (no texture yet, the GPU compositor declined or failed): the caller refreshes them one by
+    /// one, as before, which also gives each its CPU fallback.
+    pub fn refresh_blocks(
+        &self,
+        key: u64,
+        doc: &photocraft_doc::Document,
+        blocks: &[photocraft_geom::Rect],
+        display: Option<&photocraft_engine::display_color::CanvasDisplay>,
+    ) -> Option<Refresh> {
+        let size = [doc.size.width, doc.size.height];
+        if key != doc.id.0
+            || self.fault().is_some()
+            || !self.fits_canvas(doc)
+            || !self.has(key, size)
+            || self.format_of(key) != Some(self.format_for(doc.depth, size))
+        {
+            return None;
+        }
+        let bounds = doc.bounds();
+        let regions: Vec<photocraft_geom::Rect> = blocks.iter().map(|b| b.intersect(&bounds)).filter(|r| !r.is_empty()).collect();
+        let t0 = now_ms();
+        let stats = self.composite_regions(doc, &regions, display.is_some_and(|d| d.encode_srgb)).ok()?;
+        Some(Refresh {
+            kind: "gpu-rect",
+            px: regions.iter().map(|r| r.width() as u64 * r.height() as u64).sum(),
+            composite_ms: now_ms() - t0,
+            uploads: stats.tiles_uploaded as u64,
+            gpu: stats.gpu_time,
+            stats: Some(stats),
+            ..Default::default()
+        })
     }
 
     /// Composite the whole of `doc` with the CPU compositor into document `key`'s texture, band by
@@ -1192,8 +1355,77 @@ impl GpuCanvas {
     }
 }
 
+/// The display texture's handles lent to the redraw thread for one render
+/// ([`GpuCanvas::composite_lent`]).
+struct Lent {
+    tiles: Vec<doc_textures::TileTarget>,
+    pipe: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    mips: doc_textures::MipKit,
+    /// `Resources::compositor_generation` when the compositor was taken.
+    generation: u64,
+}
+
+/// How a compositor chunk is stored into display tiles: the encode pipeline, its bind group
+/// layout, and what the shader is told (store the sRGB encoding, keep values above 1.0).
+struct EncodeTarget<'a> {
+    pipe: &'a wgpu::RenderPipeline,
+    bgl: &'a wgpu::BindGroupLayout,
+    encode_srgb: bool,
+    keep_hdr: i32,
+}
+
+impl EncodeTarget<'_> {
+    /// Store chunk `out` into every tile (document rect x, y, w, h and level-0 view) it meets.
+    fn encode<'t>(
+        &self,
+        device: &wgpu::Device,
+        enc: &mut wgpu::CommandEncoder,
+        out: &photocraft_gpu::ChunkOut<'_>,
+        tiles: impl Iterator<Item = ([u32; 4], &'t wgpu::TextureView)>,
+    ) {
+        for (rect, level0) in tiles {
+            let [tx, ty, tw, th] = rect.map(|v| v as i32);
+            let r = out.rect.intersect(&photocraft_geom::Rect::from_xywh(tx, ty, tw as u32, th as u32));
+            if r.is_empty() {
+                continue;
+            }
+            let offset = [out.rect.x0 - tx, out.rect.y0 - ty, i32::from(self.encode_srgb), self.keep_hdr];
+            let ubuf = init_buffer(device, "pc_encode", &offset.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), wgpu::BufferUsages::UNIFORM);
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("pc_encode"),
+                layout: self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(out.view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: ubuf.as_entire_binding() },
+                ],
+            });
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pc_encode"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: level0,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(self.pipe);
+            pass.set_bind_group(0, &bg, &[0]);
+            pass.set_scissor_rect((r.x0 - tx) as u32, (r.y0 - ty) as u32, r.width(), r.height());
+            pass.draw(0..3, 0..1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod mip_tests;
+
+#[cfg(test)]
+mod sharp_tests;
 
 #[cfg(test)]
 mod tests;

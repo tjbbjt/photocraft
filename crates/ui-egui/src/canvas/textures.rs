@@ -430,7 +430,7 @@ pub(crate) fn damage_since(
     }
     let l = live_stroke(app, idx).filter(|l| seen.0 == now.0 && l.display_key() == now.1)?;
     let r = l.since(seen.1 ^ display_key)?;
-    Some(if r.is_empty() { r } else { r.inflate(effect_reach(&l.stroke.doc().layers)) })
+    Some(if r.is_empty() { r } else { r.inflate(effect_reach(&l.doc().layers)) })
 }
 
 /// Document `doc`'s canvas caches showed a preview that the edit just committed reproduces
@@ -448,7 +448,7 @@ pub(crate) fn shown_as_document(app: &mut PhotocraftApp, doc: photocraft_doc::Do
     let outputs: Vec<u32> = app.canvases.keys().filter(|k| k.0 == doc).map(|k| k.1).collect();
     for out in outputs {
         let (display, key) = canvas_display(app, &d, (out != 0 && out != GPU_OUTPUT).then_some(out));
-        let gpu_key = texture_key(display.as_deref());
+        let gpu_key = texture_key(display.as_deref(), &d);
         let Some(c) = app.canvases.get_mut(&(doc, out)) else { continue };
         if was_preview(c.preview_key ^ gpu_key) {
             c.preview_key = gpu_key;
@@ -492,11 +492,14 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     };
     let (doc, raw_key) = display_doc(app, idx);
     let (display, _) = canvas_display(app, &doc, None);
+    // Before anything draws this frame: blocks the redraw thread renders from now on show this
+    // version, never an older one over what this frame draws.
+    crate::canvas::redraw_thread::publish(app, &doc, display.as_deref().is_some_and(|d| d.encode_srgb));
     // Repeated pattern tiles sample the same texture, including pixels outside the unwrapped
     // viewport. Refresh the affected document region while Pattern Preview is enabled.
     let blend_visible = if app.ui.view.pattern_preview { doc.bounds() } else { visible };
     // The texture is shared by every display: only what it stores counts, not the monitor.
-    let display_key = texture_key(display.as_deref());
+    let display_key = texture_key(display.as_deref(), &doc);
     let seen = app.canvases.get(&(id, GPU_OUTPUT)).map(|c| (c.revision, c.preview_key));
     let damage_start = crate::gpu_canvas::now_ms();
     let mut damage = seen.and_then(|seen| damage_since(app, idx, seen, (revision, raw_key), display_key, last_damage));
@@ -684,6 +687,8 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     // Drawn on the GPU, or nothing to draw ("rect" without a fallback): the texture holds `doc`.
     let drawn = (r.fallback.is_none() && (r.kind.starts_with("gpu") || r.kind == "rect")).then_some(r.kind == "gpu-full");
     after_refresh(app, ctx, id, &doc, display_key, drawn, from_diff.then_some(visible));
+    // A sweep under way goes on (on the redraw thread) while an edit draws itself frame after frame.
+    crate::canvas::sweep::keep_fed(app, ctx, &gpu, &doc, display.as_deref());
     let Some(cache) = app.canvases.get_mut(&(id, GPU_OUTPUT)) else { return true };
     cache.revision = revision;
     cache.preview_key = preview_key;
@@ -699,7 +704,7 @@ fn continue_sweep(
     ctx: &egui::Context,
     gpu: &crate::gpu_canvas::GpuCanvas,
     (idx, id): (usize, photocraft_doc::DocId),
-    doc: &Document,
+    doc: &std::sync::Arc<Document>,
     display: Option<&photocraft_engine::display_color::CanvasDisplay>,
     visible: DRect,
 ) {
