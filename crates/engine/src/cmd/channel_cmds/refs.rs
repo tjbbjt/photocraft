@@ -269,6 +269,8 @@ pub(super) struct ResolvedSource {
     invert: bool,
 }
 
+/// Resolve a channel reference (`p`) to the document, layer and plane it reads, for `cmd`;
+/// `gray`: whether a colour composite reads as its luminosity.
 pub(super) fn resolve_source(s: &Session, p: &Value, cmd: &str, gray: bool) -> Result<ResolvedSource> {
     let di = doc_index(s, p, "document")?;
     let st = &s.documents()[di];
@@ -303,6 +305,13 @@ pub(super) fn resolve_source(s: &Session, p: &Value, cmd: &str, gray: bool) -> R
 }
 
 impl ResolvedSource {
+    /// The layer whose own transparency this loads (⌘-click on its thumbnail), if any, and only
+    /// in the document `doc_id`: what Paste Into Each Selected Layer remembers per click.
+    pub(super) fn transparency_layer(&self, doc_id: photocraft_doc::DocId) -> Option<LayerId> {
+        let own = self.r == ChanRef::Transparency && !self.merged_transparency && !self.invert && self.doc.id == doc_id;
+        own.then(|| self.layer.or(self.active)).flatten()
+    }
+
     /// A layer's transparency over only the part of the canvas it can cover, as `(band, plane)`:
     /// the plane is the layer's alpha inside `band` and the layer is transparent outside it.
     /// `None` when the source is not one layer's own transparency with a transparent default
