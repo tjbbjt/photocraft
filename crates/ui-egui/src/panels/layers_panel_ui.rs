@@ -77,9 +77,18 @@ pub(crate) struct ReorderPreview {
     pub document: std::sync::Arc<Document>,
 }
 
+/// Canvases of this many pixels or more (about 67 MP) show a drop's preview once the pointer rests
+/// on the target for [`SETTLE_MS`].
+const SETTLE_FROM_PX: u64 = 1 << 26;
+/// How long the pointer rests on a drop target before a large canvas shows the layers moved there.
+const SETTLE_MS: f64 = 150.0;
+
 /// Cache the on-canvas preview of the layer drop in `payload` (a `layer.moveTo` request), unless Preview on Canvas is off.
-/// Marks the destination as hovered every frame; the preview itself is rebuilt only when the target changes.
-pub(crate) fn preview_reorder(app: &mut PhotocraftApp, payload: &serde_json::Value) {
+/// Marks the destination as hovered every frame; the preview itself is rebuilt only when the target changes. On a large
+/// canvas a target the pointer only passes over isn't previewed: each preview was composited in a frame of 50–120 ms on
+/// a storyboard, so the drop line lagged behind the pointer. The last preview stays until the pointer rests on the new
+/// target for [`SETTLE_MS`].
+pub(crate) fn preview_reorder(app: &mut PhotocraftApp, ctx: &Context, payload: &serde_json::Value) {
     if !app.ui.layers_panel_options.preview_on_canvas_when_reordering_layers {
         app.reorder_preview = None;
         return;
@@ -96,6 +105,21 @@ pub(crate) fn preview_reorder(app: &mut PhotocraftApp, payload: &serde_json::Val
     if app.reorder_preview.as_ref().is_some_and(|cache| cache.signature == signature) {
         return;
     }
+    if u64::from(st.doc.size.width) * u64::from(st.doc.size.height) >= SETTLE_FROM_PX {
+        let now = crate::gpu_canvas::now_ms();
+        let since = match app.reorder_hover {
+            Some((hovered, since)) if hovered == signature => since,
+            _ => now,
+        };
+        app.reorder_hover = Some((signature, since));
+        let waited = now - since;
+        if waited < SETTLE_MS {
+            // No input arrives while the pointer rests: a frame comes when it has rested long enough.
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64((SETTLE_MS - waited) / 1000.0));
+            return;
+        }
+    }
+    let Some(st) = app.session.active() else { return };
     let (source, revision) = (st.doc.id, st.revision);
     let add_copy = app.ui.layers_panel_options.add_copy_to_copied_layers_and_groups;
     let preview = photocraft_engine::layer_multi_cmds::preview_move(&st.doc, payload, add_copy);
@@ -350,6 +374,34 @@ pub fn show_dialog(app: &mut PhotocraftApp, ctx: &Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A document of `width` × `height` with layers "a" and "b" over the Background, and the
+    /// drop of "a" above "b" as the Layers panel sends it.
+    fn reorder_app(width: u32, height: u32) -> (PhotocraftApp, serde_json::Value) {
+        let mut session = photocraft_engine::Session::new();
+        session.execute("file.new", json!({"width": width, "height": height})).unwrap();
+        let a = session.execute("layer.new.layer", json!({"name": "a"})).unwrap()["layer"].as_u64().unwrap();
+        let b = session.execute("layer.new.layer", json!({"name": "b"})).unwrap()["layer"].as_u64().unwrap();
+        (PhotocraftApp::new(session, crate::Services::default()), json!({"layer": a, "target": b, "position": "above"}))
+    }
+
+    /// On a large canvas the drop's preview waits until the pointer rests on the target, so
+    /// passing over rows doesn't composite a preview for each; a small canvas shows it at once.
+    #[test]
+    fn a_large_canvas_previews_a_drop_once_the_pointer_rests_on_it() {
+        let ctx = egui::Context::default();
+        let (mut small, drop) = reorder_app(64, 64);
+        preview_reorder(&mut small, &ctx, &drop);
+        assert!(small.reorder_preview.is_some(), "a small canvas previews at once");
+
+        let (mut large, drop) = reorder_app(9000, 8000);
+        preview_reorder(&mut large, &ctx, &drop);
+        assert!(large.reorder_preview.is_none(), "not while the pointer passes over the target");
+        assert!(large.reorder_preview_hit, "the target still counts as hovered");
+        std::thread::sleep(std::time::Duration::from_millis((SETTLE_MS as u64) + 50));
+        preview_reorder(&mut large, &ctx, &drop);
+        assert!(large.reorder_preview.is_some(), "the preview once it has rested there");
+    }
 
     /// A fresh install shows Medium thumbnails of the whole document, like Photoshop's Panel Options defaults.
     #[test]

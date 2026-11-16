@@ -73,6 +73,7 @@ impl PhotocraftApp {
             blend_preview: None,
             reorder_preview: None,
             reorder_preview_hit: false,
+            reorder_hover: None,
             patch_preview: None,
             cam_preview: None,
             magnetic: Default::default(),
