@@ -853,23 +853,7 @@ fn build() -> Vec<CommandSpec> {
         ),
         cmd!("layer.mergeDown", "Merge Down", ["Layer"], None, r##"{"layer":id?}"##, has_layer, |s, p| {
             let id = layer_param(s, p)?;
-            s.edit("Merge Down", |doc, active| {
-                let path = doc.path_of(id).ok_or(EngineError::NoLayer(id))?;
-                let Some((&idx, parent)) = path.split_last() else { return Err(EngineError::NoLayer(id)) };
-                if idx == 0 {
-                    return Err(EngineError::Other("no layer below to merge into".into()));
-                }
-                let mut below = parent.to_vec();
-                below.push(idx - 1);
-                let lower = doc.layer_at(&below).ok_or(EngineError::NoLayer(id))?.clone();
-                let upper = doc.layer(id).ok_or(EngineError::NoLayer(id))?.clone();
-                let merged = pixels::merge_down(doc, &lower, &upper);
-                doc.remove(id);
-                *doc.layer_at_mut(&below).ok_or(EngineError::NoLayer(lower.id))? = merged;
-                *active = Some(lower.id);
-                Ok(())
-            })?;
-            Ok(Value::Null)
+            ops::merge_down(s, id)
         }),
         cmd!("layer.mergeGroup", "Merge Group", ["Layer"], None, r##"{"layer":id?}"##, has_layer, |s, p| {
             let id = layer_param(s, p)?;
