@@ -400,6 +400,13 @@ pub(crate) fn damage_since(
     {
         return Some(if r.is_empty() { r } else { r.inflate(effect_reach(&st.doc.layers)) });
     }
+    // Between Layers-panel drop previews (and the document): where the layers changing places differ.
+    if seen.0 == now.0
+        && let Some(st) = app.session.documents().get(idx)
+        && let Some(r) = crate::layers_panel_ui::reorder_damage(app, &st.doc, now.0, seen.1 ^ display_key, now.1)
+    {
+        return Some(if r.is_empty() { r } else { r.inflate(effect_reach(&st.doc.layers)) });
+    }
     // Between hovered blend modes (and the document): where the layer's blending shows.
     if seen.0 == now.0
         && let Some(st) = app.session.documents().get(idx)

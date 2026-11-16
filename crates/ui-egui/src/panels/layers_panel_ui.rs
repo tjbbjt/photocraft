@@ -75,6 +75,10 @@ pub(crate) struct ReorderPreview {
     pub signature: u64,
     pub key: u64,
     pub document: std::sync::Arc<Document>,
+    /// The key of what the canvas showed before this preview (the previous preview, or 0 for the
+    /// document) and the area where the two differ (`step_damage`): moving to this preview redraws
+    /// only that area. `None` when it isn't known.
+    pub from: Option<(u64, photocraft_geom::Rect)>,
 }
 
 /// Canvases of this many pixels or more (about 67 MP) show a drop's preview once the pointer rests
@@ -122,14 +126,50 @@ pub(crate) fn preview_reorder(app: &mut PhotocraftApp, ctx: &Context, payload: &
     let Some(st) = app.session.active() else { return };
     let (source, revision) = (st.doc.id, st.revision);
     let add_copy = app.ui.layers_panel_options.add_copy_to_copied_layers_and_groups;
-    let preview = photocraft_engine::layer_multi_cmds::preview_move(&st.doc, payload, add_copy);
-    app.reorder_preview = preview.map(|document| ReorderPreview {
-        source,
-        revision,
-        signature,
-        key: (1u64 << 60) | (signature & ((1u64 << 60) - 1)),
-        document: std::sync::Arc::new(document),
-    });
+    let Some(document) = photocraft_engine::layer_multi_cmds::preview_move(&st.doc, payload, add_copy) else {
+        app.reorder_preview = None;
+        return;
+    };
+    // What the canvas shows now: the previous preview, or the document. Each preview redrew the
+    // whole storyboard (1.1 GP, about a second) where only the layers changing places differ.
+    let (from_key, before) = match app.reorder_preview.as_ref().filter(|p| p.source == source && p.revision == revision) {
+        Some(p) => (p.key, p.document.clone()),
+        None => (0, st.doc.clone()),
+    };
+    let from = photocraft_engine::layer_multi_cmds::step_damage(&before, &document).map(|area| (from_key, area));
+    let key = (1u64 << 60) | (signature & ((1u64 << 60) - 1));
+    let document = std::sync::Arc::new(document);
+    app.reorder_shown = Some((source, revision, key, document.clone()));
+    app.reorder_preview = Some(ReorderPreview { source, revision, signature, key, document, from });
+}
+
+/// The area of document `doc` (at `revision`) that differs between what its canvas showed
+/// (`seen`: a drop preview's key, or 0 for the document) and what it shows now (`now`): from one
+/// drop preview to the next, from the document to a preview, or from the last preview back to
+/// the document when the drag is cancelled. `None` (the whole canvas) for anything else.
+pub(crate) fn reorder_damage(app: &PhotocraftApp, doc: &Document, revision: u64, seen: u64, now: u64) -> Option<photocraft_geom::Rect> {
+    if seen == now {
+        return None;
+    }
+    if let Some(p) = app.reorder_preview.as_ref().filter(|p| p.source == doc.id && p.revision == revision && p.key == now)
+        && let Some((from, area)) = p.from
+        && from == seen
+    {
+        return Some(area);
+    }
+    let (source, shown_revision, key, shown) = app.reorder_shown.as_ref()?;
+    if *source != doc.id || *shown_revision != revision || *key != seen || now != 0 {
+        return None;
+    }
+    photocraft_engine::layer_multi_cmds::step_damage(shown, doc)
+}
+
+/// The document and key of the drop preview the active canvas shows, if it was built for the
+/// document as it is: a drop that lands redraws only where it differs from that preview.
+pub(crate) fn shown_reorder(app: &PhotocraftApp) -> Option<(photocraft_doc::DocId, u64)> {
+    let st = app.session.active()?;
+    let (source, revision, key, _) = app.reorder_shown.as_ref()?;
+    (*source == st.doc.id && *revision == st.revision).then_some((*source, *key))
 }
 
 /// The cached reorder preview and its compositor cache key for document `index`, if it was built for that document's current revision.
@@ -383,6 +423,27 @@ mod tests {
         let a = session.execute("layer.new.layer", json!({"name": "a"})).unwrap()["layer"].as_u64().unwrap();
         let b = session.execute("layer.new.layer", json!({"name": "b"})).unwrap()["layer"].as_u64().unwrap();
         (PhotocraftApp::new(session, crate::Services::default()), json!({"layer": a, "target": b, "position": "above"}))
+    }
+
+    /// Going from the document to a drop preview, and back to the document when the drag is
+    /// cancelled, redraws only where the two differ, not the whole canvas.
+    #[test]
+    fn a_drop_preview_redraws_only_where_it_differs() {
+        let ctx = egui::Context::default();
+        let (mut app, drop) = reorder_app(64, 64);
+        preview_reorder(&mut app, &ctx, &drop);
+        let st = app.session.active().unwrap();
+        let (doc, revision) = (st.doc.clone(), st.revision);
+        let p = app.reorder_preview.as_ref().expect("a preview");
+        let (key, there) = (p.key, photocraft_engine::layer_multi_cmds::step_damage(&doc, &p.document));
+        assert!(there.is_some(), "a reorder's damage is known");
+        assert_eq!(reorder_damage(&app, &doc, revision, 0, key), there);
+        assert_eq!(shown_reorder(&app).map(|(_, k)| k), Some(key), "the drop would land on what the canvas shows");
+        // The drag is cancelled: the canvas goes back to the document.
+        app.reorder_preview = None;
+        let back = photocraft_engine::layer_multi_cmds::step_damage(&app.reorder_shown.as_ref().unwrap().3, &doc);
+        assert_eq!(reorder_damage(&app, &doc, revision, key, 0), back);
+        assert_eq!(reorder_damage(&app, &doc, revision + 1, key, 0), None, "not once the document has changed");
     }
 
     /// On a large canvas the drop's preview waits until the pointer rests on the target, so
