@@ -228,7 +228,7 @@ pub(super) fn tabs(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> TabStrip {
         .map_or_else(|| app.session.active_index().and_then(|doc| documents.iter().position(|&d| d == doc)).unwrap_or(0), |p| tab_count + p);
     let frame = egui::Frame::NONE.fill(t.canvas).inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 4 }).show(ui, |ui| {
         let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), tab_h), Sense::hover());
-        let f = fit_doc_tabs(&natural, selected, row.width());
+        let f = fit_doc_tabs(&natural, selected, row.width(), &mut app.doc_tab_start);
         let mut x = row.left();
         let mut placed: Vec<(usize, Rect)> = Vec::with_capacity(f.shown.len());
         for &(i, w) in &f.shown {
@@ -534,9 +534,41 @@ const STUDIO_TAB_GAP: f32 = 4.0;
 /// Fit document tabs as Photoshop does (#4487): a tab never shrinks below its whole title, so the
 /// tabs that don't fit move into the » menu instead. Only the active tab, when it alone is wider
 /// than the strip, is cut.
-fn fit_doc_tabs(natural: &[f32], selected: usize, avail: f32) -> crate::tab_strip::TabFit {
+///
+/// The tabs shown are a run of neighbours, as in Photoshop, scrolled just far enough to show the
+/// active one: with ten documents of which five fit, picking the eighth from the » menu shows the
+/// fourth to the eighth (it showed the first four and the eighth). `start`, the run's first tab,
+/// is kept between frames, so the strip stays put while the active tab is on it.
+pub(super) fn fit_doc_tabs(natural: &[f32], selected: usize, avail: f32, start: &mut usize) -> crate::tab_strip::TabFit {
     let widest = natural.iter().copied().filter(|w| w.is_finite()).fold(0.0, f32::max);
-    crate::tab_strip::fit(natural, selected, avail, widest, crate::tab_strip::CHEVRON_W)
+    let fit = crate::tab_strip::fit(natural, selected, avail, widest, crate::tab_strip::CHEVRON_W);
+    if fit.overflow.is_empty() || natural.is_empty() {
+        *start = 0;
+        return fit;
+    }
+    let n = natural.len();
+    let selected = selected.min(n - 1);
+    let budget = f64::from((avail - fit.overflow_width).max(0.0));
+    let width = |i: usize| natural.get(i).copied().filter(|w| w.is_finite()).map_or(0.0, |w| f64::from(w.max(0.0)));
+    // From where the run began, as many tabs as fit; if that stops short of the active tab, the
+    // run ends at the active tab instead and reaches back as far as fits.
+    let (mut first, mut last) = ((*start).min(selected), (*start).min(selected));
+    let mut used = width(first);
+    while last + 1 < n && used + width(last + 1) <= budget {
+        last += 1;
+        used += width(last);
+    }
+    if last < selected {
+        (first, last, used) = (selected, selected, width(selected));
+        while first > 0 && used + width(first - 1) <= budget {
+            first -= 1;
+            used += width(first);
+        }
+    }
+    *start = first;
+    let shown = (first..=last).map(|i| (i, if i == selected { natural[i].min(budget as f32) } else { natural[i] })).collect();
+    let overflow = (0..n).filter(|i| !(first..=last).contains(i)).collect();
+    crate::tab_strip::TabFit { shown, overflow, overflow_width: fit.overflow_width }
 }
 
 /// Photoshop's tab title: "name @ 50% (Layer 1, RGB/8)", "(Layer 1, Layer Mask/8)" when the mask
@@ -610,7 +642,7 @@ fn pro_tabs(app: &mut PhotocraftApp, ui: &mut egui::Ui) -> TabStrip {
     // Every tab's natural width, whether or not it stays on the strip.
     let natural: Vec<f32> = titles.iter().map(|title| ui.painter().layout_no_wrap(title.clone(), font.clone(), t.text).size().x + DOC_TAB_PAD).collect();
     let selected = app.jobs.focus.and_then(|job| opening.iter().position(|(open, _, _)| *open == job)).map_or_else(|| active.unwrap_or(0), |p| tab_count + p);
-    let f = fit_doc_tabs(&natural, selected, strip.width());
+    let f = fit_doc_tabs(&natural, selected, strip.width(), &mut app.doc_tab_start);
     let mut x = strip.left();
     let mut placed: Vec<(usize, Rect)> = Vec::with_capacity(f.shown.len());
     for &(i, w) in &f.shown {
