@@ -408,6 +408,19 @@ fn the_windows_save_dialog_gets_a_bare_name_so_the_type_picks_the_extension() {
     assert_eq!(dialog_file_name("", true), None);
 }
 
+/// The portal's Save dialog gets the whole name of a suggested file that exists, so it asks
+/// about replacing it as it is accepted instead of opening a second time to ask (COSMIC's dialog
+/// returns the stem it was given as it is). A file that doesn't exist yet keeps the bare name, so
+/// the type picked still gives the extension.
+#[test]
+fn the_portal_save_dialog_gets_the_whole_name_of_a_file_that_exists() {
+    let existing = |p: &Path| p == Path::new("/exports/boards.pdf");
+    assert_eq!(portal_file_name("/exports/boards.pdf", existing).as_deref(), Some("boards.pdf"));
+    assert_eq!(portal_file_name("/exports/new.pdf", existing).as_deref(), Some("new"));
+    // A bare name has no folder to look in.
+    assert_eq!(portal_file_name("boards.pdf", |_| true).as_deref(), Some("boards"));
+}
+
 /// A name in another letter case reaches the same file where the file system ignores case
 /// (Windows, and macOS by default), and only there. Two files with the same contents are two.
 #[test]
