@@ -820,6 +820,8 @@ mod patch_shift_constrain_tests;
 #[cfg(test)]
 mod pencil_pressure_toggles_tests;
 #[cfg(test)]
+mod quick_export_artboards_tests;
+#[cfg(test)]
 mod shape_bounds_box_tests;
 
 #[cfg(test)]
