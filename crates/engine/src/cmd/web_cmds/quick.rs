@@ -55,6 +55,9 @@ pub fn quick_export_target_is_own_file(s: &Session) -> bool {
 /// A document with artboards writes one file per artboard instead, `<artboard name>.<format>`,
 /// into the folder `dir` names (else the folder of `path`, else the location), as the reference
 /// application does (#12902): it wrote one image of the whole canvas with every board side by side.
+///
+/// Flattening and encoding run as a job: a storyboard's boards took 13.7 s on the UI thread, and
+/// the compositor closed the window that stopped answering.
 pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.export.quickExport";
     let has_boards = s.active().is_some_and(|d| !d.doc.artboards().is_empty());
@@ -84,11 +87,20 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
         Some(e @ ("png" | "gif" | "webp" | "exr")) => e.into(),
         Some(e) => return Err(bad(cmd, format!("Quick Export writes PNG, JPEG, GIF, WebP or EXR, not .{e}; use Export As"))),
     };
-    let d = s.active().ok_or(EngineError::NoDocument)?;
-    let doc = d.doc.clone();
-    let out = export_quick(&doc, &path, &fmt, &prefs, cmd)?;
-    crate::automate_cmds::fire_event(s, "export");
-    Ok(out)
+    let doc = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
+    crate::jobs::run(
+        s,
+        "Quick Export",
+        false,
+        move |ctx| {
+            ctx.progress(0.0, "Quick Export");
+            export_quick(&doc, &path, &fmt, &prefs, cmd)
+        },
+        |s, out| {
+            crate::automate_cmds::fire_event(s, "export");
+            Ok(out)
+        },
+    )
 }
 
 /// One Quick Export file: `doc` written to `path` as `fmt` with Export Preferences `prefs`.
@@ -170,6 +182,7 @@ fn export_quick(doc: &photocraft_doc::Document, path: &str, fmt: &str, prefs: &c
 /// `<artboard name>.<format>` in one folder, top board of the Layers panel first. Names an earlier
 /// board took (letter case ignored) get `-2`, `-3`…, as Artboards to Files numbers them. Every
 /// board is made before the first file is written, and the document's own file is never replaced.
+/// The boards are made and written in a job, a progress step per board.
 /// `{dir?, path?}` → `{files: [{path, format, …}], format}`.
 fn quick_export_artboards(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.export.quickExport";
@@ -196,26 +209,44 @@ fn quick_export_artboards(s: &mut Session, p: &Value) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let doc = d.doc.clone();
     let own = d.path.clone();
-    // Top board of the Layers panel first, as Artboards to Files writes them.
-    let boards: Vec<photocraft_doc::Document> =
-        doc.artboards().into_iter().rev().filter_map(|(id, _, _)| crate::artboard_cmds::artboard_document(&doc, id).transpose()).collect::<Result<_>>()?;
-    if boards.is_empty() {
-        return Err(bad(cmd, "the artboards are empty"));
-    }
-    let names: Vec<&str> = boards.iter().map(|b| b.name.as_str()).collect();
-    let paths: Vec<String> =
-        crate::artboard_cmds::artboard_file_stems("", &names, false).into_iter().map(|stem| join(&dir, &format!("{stem}.{fmt}"))).collect();
-    if let Some(own) = own.as_deref()
-        && let Some(path) = paths.iter().find(|path| crate::file_cmds::same_file(path, own))
-    {
-        return Err(bad(cmd, format!("the export would replace the document's own file {path}; rename that artboard or choose another folder")));
-    }
-    let mut files = Vec::new();
-    for (board, path) in boards.iter().zip(&paths) {
-        files.push(export_quick(board, path, &fmt, &prefs, cmd)?);
-    }
-    crate::automate_cmds::fire_event(s, "export");
-    Ok(json!({"files": files, "format": fmt}))
+    crate::jobs::run(
+        s,
+        "Quick Export",
+        false,
+        move |ctx| {
+            ctx.progress(0.0, "Quick Export");
+            // Top board of the Layers panel first, as Artboards to Files writes them.
+            let boards: Vec<photocraft_doc::Document> = doc
+                .artboards()
+                .into_iter()
+                .rev()
+                .filter_map(|(id, _, _)| crate::artboard_cmds::artboard_document(&doc, id).transpose())
+                .collect::<Result<_>>()?;
+            if boards.is_empty() {
+                return Err(bad(cmd, "the artboards are empty"));
+            }
+            let names: Vec<&str> = boards.iter().map(|b| b.name.as_str()).collect();
+            let paths: Vec<String> =
+                crate::artboard_cmds::artboard_file_stems("", &names, false).into_iter().map(|stem| join(&dir, &format!("{stem}.{fmt}"))).collect();
+            if let Some(own) = own.as_deref()
+                && let Some(path) = paths.iter().find(|path| crate::file_cmds::same_file(path, own))
+            {
+                return Err(bad(cmd, format!("the export would replace the document's own file {path}; rename that artboard or choose another folder")));
+            }
+            let n = boards.len();
+            let mut files = Vec::new();
+            for (i, (board, path)) in boards.iter().zip(&paths).enumerate() {
+                ctx.check()?;
+                ctx.progress(i as f32 / n as f32, &format!("Artboard {} of {n}", i + 1));
+                files.push(export_quick(board, path, &fmt, &prefs, cmd)?);
+            }
+            Ok(json!({"files": files, "format": fmt}))
+        },
+        |s, out| {
+            crate::automate_cmds::fire_event(s, "export");
+            Ok(out)
+        },
+    )
 }
 
 #[cfg(test)]

@@ -1493,9 +1493,18 @@ pub fn quick_export_png(app: &mut PhotocraftApp) -> Result<Value, String> {
     confirm(app, &f)
 }
 
-/// Runs Quick Export with `p` (an explicit `path`, or none for the document's folder).
+/// Runs Quick Export with `p` (an explicit `path`, or none for the document's folder). As a
+/// background job it says what it wrote when it lands ([`quick_export_done`]).
 fn quick_export(app: &mut PhotocraftApp, p: Value) -> Result<Value, String> {
     let r = app.run("file.export.quickExport", p)?;
+    if r.get("pending").and_then(Value::as_bool) != Some(true) {
+        quick_export_done(app, &r);
+    }
+    Ok(r)
+}
+
+/// The status line for a finished Quick Export's result `r`.
+pub(crate) fn quick_export_done(app: &mut PhotocraftApp, r: &Value) {
     app.ui.status = match r.get("files").and_then(Value::as_array) {
         // One file per artboard (#12902).
         Some(files) => {
@@ -1507,7 +1516,6 @@ fn quick_export(app: &mut PhotocraftApp, p: Value) -> Result<Value, String> {
             crate::i18n::fmt(tl!(template), &[("path", r["path"].as_str().unwrap_or_default())])
         }
     };
-    Ok(r)
 }
 
 #[cfg(test)]

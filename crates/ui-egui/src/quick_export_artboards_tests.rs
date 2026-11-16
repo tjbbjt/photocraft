@@ -24,3 +24,29 @@ fn quick_export_of_artboards_asks_for_a_folder_and_writes_one_file_each() {
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2, "one file per artboard, nothing else");
     assert_eq!(app.ui.status, "Exported 2 files");
 }
+
+/// With background jobs on (the desktop app) the boards are written by a worker, so the window
+/// keeps answering, and the status says what was written once the job lands.
+#[test]
+fn quick_export_of_artboards_runs_as_a_job_and_says_what_it_wrote_when_it_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let (show, _) = crate::file_dialog::fake(vec![Some(FileDialogAnswer::FolderTo(dir.path().to_string_lossy().into_owned()))]);
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services { file_dialog: Some(show), ..Default::default() });
+    app.run("file.new", json!({"width": 200, "height": 100})).unwrap();
+    app.run("layer.new.artboard", json!({"rect": [0, 0, 80, 60], "name": "Red Board"})).unwrap();
+    app.run("layer.new.artboard", json!({"rect": [100, 0, 40, 30], "name": "Blue Board"})).unwrap();
+    app.background_jobs = true;
+    let ctx = egui::Context::default();
+    crate::menus::invoke(&mut app, &ctx, "file.export.quickExportAsPng", json!({})).unwrap();
+    for _ in 0..3 {
+        app.poll_file_dialog(&ctx, None);
+    }
+    assert!(app.jobs.last_started.is_some(), "Quick Export started a background job");
+    let t = std::time::Instant::now();
+    while app.ui.status != "Exported 2 files" && t.elapsed() < std::time::Duration::from_secs(60) {
+        crate::jobs_ui::tick(&mut app, &ctx);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(app.ui.status, "Exported 2 files");
+    assert!(dir.path().join("Red Board.png").exists() && dir.path().join("Blue Board.png").exists());
+}

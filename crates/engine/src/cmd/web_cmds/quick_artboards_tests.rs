@@ -70,3 +70,36 @@ fn a_document_without_artboards_still_writes_one_file() {
     assert_eq!(r["path"], json!(path));
     assert_eq!(png_size(&path), (20, 10));
 }
+
+/// Quick Export runs as a job when started (a storyboard's boards took 13.7 s on the UI thread):
+/// the files are written by the worker and the result arrives when the job lands. A document
+/// without artboards does the same.
+#[test]
+fn a_started_quick_export_runs_as_a_job() {
+    let land = |s: &mut Session, p: Value| -> Value {
+        let id = match s.start("file.export.quickExport", p).unwrap() {
+            crate::jobs::Started::Job(id) => id,
+            crate::jobs::Started::Done(v) => panic!("expected a background job, ran inline: {v}"),
+        };
+        let t = std::time::Instant::now();
+        loop {
+            if let Some(e) = s.poll_jobs().into_iter().find(|e| e.id == id) {
+                let crate::jobs::JobOutcome::Done(v) = e.outcome else { panic!("{:?}", e.outcome) };
+                return v;
+            }
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "the export did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    };
+    let dir = tmp("job");
+    let mut s = session();
+    let r = land(&mut s, json!({"dir": dir}));
+    assert_eq!(r["files"].as_array().unwrap().len(), 2, "{r}");
+    assert_eq!(png_size(&join(&dir, "Red Board.png")), (80, 60));
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 30, "height": 20})).unwrap();
+    let path = join(&dir, "flat.png");
+    let r = land(&mut s, json!({"path": path}));
+    assert_eq!(r["path"], json!(path));
+    assert_eq!(png_size(&path), (30, 20));
+}
