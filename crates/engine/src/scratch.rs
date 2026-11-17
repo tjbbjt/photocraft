@@ -123,12 +123,7 @@ pub(crate) fn configure(prefs: &Preferences) {
     });
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let dir = prefs
-            .scratch_disks
-            .disks
-            .iter()
-            .find(|d| d.enabled && !d.path.trim().is_empty())
-            .map(|d| if d.path.trim() == "(system temp)" { std::env::temp_dir() } else { std::path::PathBuf::from(d.path.trim()) });
+        let candidates = disk_choice::candidates(&prefs.scratch_disks.disks);
         // An unusable or full directory pauses eviction without dropping resident pixels and
         // is retried with backoff; History's byte limit applies meanwhile (sync_scratch_state).
         // The reason is exposed in ui.inspect and the application's status bar.
@@ -139,8 +134,130 @@ pub(crate) fn configure(prefs: &Preferences) {
         };
         let limit = prefs.scratch_disks.size_limit_mb;
         photocraft_raster::spill::set_size_cap((limit > 0).then(|| u64::from(limit).saturating_mul(1 << 20)));
-        let _ = photocraft_raster::spill::configure(dir.as_deref(), tiles);
+        // The first that takes the scratch file wins; when none does, the first listed keeps
+        // the paused state and its reason (or spilling stays off with nothing listed).
+        if !candidates.iter().any(|dir| photocraft_raster::spill::configure(Some(dir), tiles).is_ok()) {
+            let _ = photocraft_raster::spill::configure(candidates.first().map(std::path::PathBuf::as_path), tiles);
+        }
     }
     #[cfg(target_arch = "wasm32")]
     let _ = (prefs, budget);
+}
+
+/// Which folders can hold the scratch file, in the order to try them.
+#[cfg(not(target_arch = "wasm32"))]
+mod disk_choice {
+    use std::path::{Path, PathBuf};
+
+    use crate::prefs::ScratchDisk;
+
+    /// The enabled scratch disks in the order listed, as Photoshop goes down its scratch disks,
+    /// then the app's own cache folder; skipping any that can't help. A folder whose parent is
+    /// missing (a drive that isn't mounted, or that a Flatpak can't see) is skipped rather than
+    /// created on the system disk, and so is a folder held in RAM (tmpfs, as the system temp
+    /// folder is on Fedora and inside a Flatpak): a scratch file there frees no memory, it only
+    /// moves the tiles to another part of RAM. The cache folder is the fallback, so a machine
+    /// whose only listed disk is "(system temp)" still spills to a real disk.
+    pub(super) fn candidates(disks: &[ScratchDisk]) -> Vec<PathBuf> {
+        let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+        let listed = disks.iter().filter(|d| d.enabled && !d.path.trim().is_empty()).map(|d| resolve(d.path.trim()));
+        listed.chain(cache_scratch_dir()).filter(|dir| reachable(dir) && !ram_backed(&mounts, dir)).collect()
+    }
+
+    fn resolve(path: &str) -> PathBuf {
+        if path == "(system temp)" { std::env::temp_dir() } else { PathBuf::from(path) }
+    }
+
+    /// `$XDG_CACHE_HOME/photocraft/scratch` (inside a Flatpak, the app's own cache folder, on the
+    /// home disk), or `~/.cache/photocraft/scratch`.
+    fn cache_scratch_dir() -> Option<PathBuf> {
+        let base = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+        Some(base.join("photocraft").join("scratch"))
+    }
+
+    /// The folder exists, or its parent does (it is created when the scratch file opens).
+    fn reachable(dir: &Path) -> bool {
+        dir.is_dir() || dir.parent().is_some_and(Path::is_dir)
+    }
+
+    /// Whether `dir` lies on a filesystem held in memory, by the longest mount point containing
+    /// it in `mounts` (`/proc/self/mounts`). Unknown (no mount table): not.
+    pub(super) fn ram_backed(mounts: &str, dir: &Path) -> bool {
+        let dir = std::fs::canonicalize(dir)
+            .or_else(|_| dir.parent().map_or(Err(()), |p| std::fs::canonicalize(p).map_err(|_| ())))
+            .unwrap_or_else(|_| dir.to_path_buf());
+        mount_type(mounts, &dir).is_some_and(|t| matches!(t.as_str(), "tmpfs" | "ramfs"))
+    }
+
+    /// The filesystem type of the longest mount point in `mounts` that contains `dir`.
+    pub(super) fn mount_type(mounts: &str, dir: &Path) -> Option<String> {
+        mounts
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (_, point, kind) = (fields.next()?, fields.next()?, fields.next()?);
+                // The table escapes spaces and other separators as octal (`\040`).
+                let point = PathBuf::from(unescape(point));
+                dir.starts_with(&point).then(|| (point.components().count(), kind.to_string()))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, kind)| kind)
+    }
+
+    fn unescape(field: &str) -> String {
+        let mut out = String::with_capacity(field.len());
+        let mut rest = field;
+        while let Some(i) = rest.find('\\') {
+            out.push_str(&rest[..i]);
+            let code = rest.get(i + 1..i + 4).and_then(|o| u8::from_str_radix(o, 8).ok());
+            match code {
+                Some(byte) => {
+                    out.push(char::from(byte));
+                    rest = &rest[i + 4..];
+                }
+                None => {
+                    out.push('\\');
+                    rest = &rest[i + 1..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const MOUNTS: &str = "/dev/nvme0n1p3 / btrfs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n/dev/sda1 /run/media/pce/My\\040Drive ext4 rw 0 0\n";
+
+        #[test]
+        fn the_longest_mount_point_decides() {
+            assert_eq!(mount_type(MOUNTS, Path::new("/tmp/photocraft")).as_deref(), Some("tmpfs"));
+            assert_eq!(mount_type(MOUNTS, Path::new("/home/pce/.cache")).as_deref(), Some("btrfs"));
+            assert_eq!(mount_type(MOUNTS, Path::new("/run/media/pce/My Drive/scratch")).as_deref(), Some("ext4"));
+            // A sibling whose name only starts the same isn't inside it.
+            assert_eq!(mount_type(MOUNTS, Path::new("/tmpx")).as_deref(), Some("btrfs"));
+        }
+
+        #[test]
+        fn ram_backed_folders_and_unmounted_drives_are_skipped() {
+            let real = std::env::temp_dir().join(format!("pc-scratch-choice-{}", std::process::id()));
+            std::fs::create_dir_all(&real).unwrap();
+            let disks = [
+                ScratchDisk { path: "/nonexistent-drive/_SCRATCH".into(), enabled: true },
+                ScratchDisk { path: real.display().to_string(), enabled: false },
+                ScratchDisk { path: real.display().to_string(), enabled: true },
+            ];
+            let got = candidates(&disks);
+            assert!(!got.iter().any(|d| d.starts_with("/nonexistent-drive")), "an unmounted drive is skipped: {got:?}");
+            let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+            assert_eq!(got.first() == Some(&real), !ram_backed(&mounts, &real), "a listed disk comes first unless it's in RAM: {got:?}");
+            assert!(got.iter().all(|d| !ram_backed(&mounts, d)), "nothing held in RAM: {got:?}");
+            let _ = std::fs::remove_dir(&real);
+        }
+    }
 }
