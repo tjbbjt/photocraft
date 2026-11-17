@@ -596,7 +596,7 @@ pub(super) fn ensure_gpu(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usiz
     let started = if partial {
         damage.and_then(|d| super::gpu_slices::start_damage(app, ctx, &gpu, (id, &doc), d, visible))
     } else {
-        super::gpu_slices::start(app, ctx, &gpu, (id, &doc), visible)
+        super::gpu_slices::start(app, ctx, &gpu, (id, &doc), display.as_ref(), visible, scale)
     };
     if started.is_some() {
         if partial {
@@ -744,6 +744,7 @@ pub(crate) fn retain_gpu_documents(app: &mut PhotocraftApp) {
     crate::background_redraw::retain(app);
     let open: Vec<_> = app.session.documents().iter().map(|st| st.doc.id).collect();
     app.gpu_slices.retain(|id, _| open.contains(id));
+    app.gpu_slice_previews.retain(|id, _| open.contains(id));
     // Page work for closed documents (or of a dropped GPU canvas) is cancelled.
     if app.gpu.is_none() {
         app.streams.clear();

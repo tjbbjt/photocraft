@@ -282,13 +282,13 @@ fn blocks(bounds: Rect) -> Vec<Rect> {
 
 /// The mip level a view at `scale` (screen pixels per document pixel) samples, if a reduced
 /// first picture is worth drawing there: at 50% or less, capped at [`MAX_PREVIEW_LEVEL`].
-fn preview_level(scale: f32) -> Option<u32> {
+pub(crate) fn preview_level(scale: f32) -> Option<u32> {
     (scale.is_finite() && scale > 0.0 && scale <= 0.5).then(|| ((-scale.log2()).floor() as u32).clamp(1, MAX_PREVIEW_LEVEL))
 }
 
 /// `r` (document pixels) in the pixels of a level `k` times smaller, covering every pixel `r`
 /// touches.
-fn reduce(r: Rect, k: i32) -> Rect {
+pub(crate) fn reduce(r: Rect, k: i32) -> Rect {
     Rect::new(
         r.x0.div_euclid(k),
         r.y0.div_euclid(k),

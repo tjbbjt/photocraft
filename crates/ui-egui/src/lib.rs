@@ -371,6 +371,8 @@ pub struct PhotocraftApp {
     /// Bands of a very large canvas still to composite after a full refresh begun in slices
     /// (`canvas::gpu_slices`), per document.
     gpu_slices: HashMap<DocId, std::collections::VecDeque<photocraft_geom::Rect>>,
+    /// Reduced first pictures on their way for those refreshes (`canvas::gpu_slices`).
+    gpu_slice_previews: HashMap<DocId, crate::canvas::gpu_slices::SlicePreview>,
     /// Viewport pages of documents too large for their GPU texture set (`canvas::viewport_pages`).
     streams: HashMap<DocId, canvas::viewport_pages::Stream>,
     /// The Info panel's Color Sampler readouts for (document, revision) (`panels::sampler_readouts`).
