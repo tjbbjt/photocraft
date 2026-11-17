@@ -728,3 +728,27 @@ fn keys_wait_while_the_overlay_colour_picker_is_open() {
     press(&mut app, &ctx, Key::Z, Modifiers::COMMAND);
     assert_eq!(ws(&app).describe()["sampledProxyPixels"].as_u64(), Some(all));
 }
+
+/// In the app the fill area is worked out on a worker, so opening the workspace or an Apply
+/// doesn't freeze the window (17 s after each Apply on an 84 MP photo): the base arrives later,
+/// the same as one worked out at once, and the preview is out of date once it has.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_base_worked_out_on_a_worker_matches_one_worked_out_at_once() {
+    let mut app = app_with_selection();
+    open(&mut app).unwrap();
+    let (hole, base) = (ws(&app).base.hole.clone(), ws(&app).base.base.clone());
+    assert!(hole.iter().any(|h| *h), "a fill area to compare");
+    let w = app.distort.caf.as_mut().unwrap();
+    w.base = preview::Base { window: Rect::EMPTY, rect: Rect::EMPTY, hole: Vec::new(), base: Vec::new() };
+    let want = w.preview.want;
+    preview::start_base(&mut app, preview::BaseFor::Change);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while preview::collect_base(&mut app) {
+        assert!(std::time::Instant::now() < deadline, "the base did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(ws(&app).base.hole, hole);
+    assert_eq!(ws(&app).base.base, base);
+    assert!(ws(&app).preview.want > want, "the preview is out of date once it arrives");
+}

@@ -37,7 +37,35 @@ pub(super) struct Preview {
     pub(super) zoom: f32,
     pub(super) center: [f64; 2],
     pub(super) error: Option<String>,
+    /// The base being worked out on a worker ([`start_base`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    base_running: Option<BaseRun>,
 }
+
+/// A base being worked out on a worker: its answer, its job (to cancel it), and what to do with it.
+#[cfg(not(target_arch = "wasm32"))]
+struct BaseRun {
+    rx: std::sync::mpsc::Receiver<Result<Base, String>>,
+    job: photocraft_engine::jobs::JobCtx,
+    then: BaseFor,
+}
+
+/// Why the base is being worked out, which decides what its answer does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BaseFor {
+    /// The workspace just opened: the brush takes its default size from the fill area.
+    Open,
+    /// A lasso edit or Expand / Contract: one that empties the fill area is refused (undone).
+    Edit,
+    /// Anything else (an option, Undo / Redo, an Apply that changed the document).
+    Change,
+}
+
+/// Whether the base is worked out on a worker, so the app keeps running meanwhile: the plan
+/// reads and analyses the whole sampling window at full size (17 s after each Apply on an 84 MP
+/// photo, all of it a frozen window). The web build has no threads, and the tests read the base
+/// at once.
+pub(super) const BASE_ON_A_WORKER: bool = cfg!(not(any(test, target_arch = "wasm32")));
 
 impl Preview {
     /// Takes the result of the preview of state `generation`: an image to upload, or the error,
@@ -89,16 +117,138 @@ pub(super) fn points_limit() -> String {
 /// The plan without strokes: the window, fill area and the option's area. Custom starts empty
 /// (the window and fill area are those of Rectangular).
 pub(super) fn compute_base(app: &PhotocraftApp, w: &CafWorkspace) -> Result<Base, String> {
+    let (doc, layer, p, custom) = base_inputs(app, w)?;
+    base_from(&doc, layer, &p, custom, &photocraft_raster::Interrupt::NONE)
+}
+
+/// What the base is worked out from: the document, the layer, the plan's params and whether the
+/// option is Custom (which starts with an empty area).
+fn base_inputs(app: &PhotocraftApp, w: &CafWorkspace) -> Result<(std::sync::Arc<photocraft_doc::Document>, LayerId, Value, bool), String> {
     let st = app.session.active().ok_or("no document")?;
     let mut p = plan_params(w, false);
     let custom = w.opts.sampling == "custom";
     if custom {
         p["sampling"] = json!("rectangular");
     }
-    let plan = photocraft_engine::edit_menu_cmds::content_aware_plan(&st.doc, w.layer, &p, CMD).map_err(|e| e.to_string())?;
+    Ok((st.doc.clone(), w.layer, p, custom))
+}
+
+/// The base of `doc`'s plan for `p`, asking `ctl` whether to stop ("cancelled").
+fn base_from(doc: &photocraft_doc::Document, layer: LayerId, p: &Value, custom: bool, ctl: &photocraft_raster::Interrupt) -> Result<Base, String> {
+    let plan = photocraft_engine::edit_menu_cmds::content_aware_plan_with(doc, layer, p, CMD, ctl).map_err(|e| match e {
+        photocraft_engine::EngineError::Cancelled => "cancelled".to_string(),
+        e => e.to_string(),
+    })?;
     let base = if custom { vec![false; plan.base.len()] } else { plan.base };
     Ok(Base { window: plan.window, rect: plan.rect, hole: plan.hole, base })
 }
+
+/// The base of the workspace's current state, worked out now.
+fn base_now(app: &PhotocraftApp) -> Result<Base, String> {
+    app.distort.caf.as_ref().map_or_else(|| Err("Content-Aware Fill is not open".to_string()), |w| compute_base(app, w))
+}
+
+/// Takes a worked-out base (or why there is none) into the workspace, as `then` says.
+pub(super) fn take_base(app: &mut PhotocraftApp, r: Result<Base, String>, then: BaseFor) {
+    let Some(w) = app.distort.caf.as_mut() else { return };
+    match r {
+        // A newer one replaced it.
+        Err(e) if e == "cancelled" => return,
+        Ok(b) => {
+            if then == BaseFor::Open {
+                w.brush_size = photocraft_algo::content_aware::default_brush_size(super::lifecycle::bounds(&b));
+            }
+            w.set_base(b);
+            w.error = None;
+        }
+        Err(e) => {
+            w.error = Some(e);
+            w.restate_all();
+        }
+    }
+    w.stale();
+    // An edit that empties the fill area is refused (the plan says so): undo it, if it is still
+    // the last step (a stroke painted while the base was worked out is not undone for it).
+    if then == BaseFor::Edit
+        && app.distort.caf.as_ref().is_some_and(|w| matches!(w.undo.last(), Some(super::Step::Fill(_))))
+        && let Some(msg) = app.distort.caf.as_ref().and_then(|w| w.error.clone())
+    {
+        super::lifecycle::undo(app);
+        if let Some(w) = app.distort.caf.as_mut() {
+            w.redo.clear();
+            w.error = Some(msg);
+        }
+    }
+}
+
+/// Starts working out the base on a worker (cancelling one still running); [`collect_base`]
+/// takes it when it arrives. Where no thread can start, it is worked out now.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn start_base(app: &mut PhotocraftApp, then: BaseFor) {
+    let Some(w) = app.distort.caf.as_ref() else { return };
+    let inputs = base_inputs(app, w);
+    let Some(w) = app.distort.caf.as_mut() else { return };
+    if let Some(old) = w.preview.base_running.take() {
+        old.job.cancel();
+    }
+    let (doc, layer, p, custom) = match inputs {
+        Ok(i) => i,
+        Err(e) => return take_base(app, Err(e), then),
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let job = photocraft_engine::jobs::JobCtx::new();
+    let work = job.clone();
+    let spawned = std::thread::Builder::new().name("caf-base".into()).spawn(move || {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.stage(0.0, 1.0, "", |ctl| base_from(&doc, layer, &p, custom, ctl))))
+            .unwrap_or_else(|_| Err("working out the fill area failed".into()));
+        let _ = tx.send(r);
+    });
+    match spawned {
+        Ok(_) => w.preview.base_running = Some(BaseRun { rx, job, then }),
+        Err(_) => {
+            let r = base_now(app);
+            take_base(app, r, then);
+        }
+    }
+}
+
+/// The web build works the base out now.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn start_base(app: &mut PhotocraftApp, then: BaseFor) {
+    let r = base_now(app);
+    take_base(app, r, then);
+}
+
+/// Takes the worker's base if it has arrived; whether one is still being worked out.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn collect_base(app: &mut PhotocraftApp) -> bool {
+    let Some(w) = app.distort.caf.as_mut() else { return false };
+    let Some(run) = &w.preview.base_running else { return false };
+    match run.rx.try_recv() {
+        Ok(r) => {
+            let then = run.then;
+            w.preview.base_running = None;
+            take_base(app, r, then);
+            false
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => true,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            w.preview.base_running = None;
+            false
+        }
+    }
+}
+
+/// Waits for a base being worked out and takes it (the control channel reads the result).
+#[cfg(not(target_arch = "wasm32"))]
+fn settle_base(app: &mut PhotocraftApp) {
+    let Some(run) = app.distort.caf.as_mut().and_then(|w| w.preview.base_running.take()) else { return };
+    let r = run.rx.recv().unwrap_or_else(|_| Err("cancelled".into()));
+    take_base(app, r, run.then);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn settle_base(_: &mut PhotocraftApp) {}
 
 /// The fill area's edges merged into runs, as the canvas traces a selection, in document px;
 /// `None` past [`MAX_OUTLINE_SEGMENTS`].
@@ -134,26 +284,26 @@ pub(super) fn outline(b: &Base) -> Option<Vec<Segment>> {
 
 /// Recompute the base after a change of the fill area, the sampling option or the document.
 pub(super) fn rebase(app: &mut PhotocraftApp) {
-    let Some(w) = app.distort.caf.as_ref() else { return };
-    let r = compute_base(app, w);
-    let Some(w) = app.distort.caf.as_mut() else { return };
-    match r {
-        Ok(b) => {
-            w.set_base(b);
-            w.error = None;
-        }
-        Err(e) => {
-            w.error = Some(e);
-            w.restate_all();
-        }
+    rebase_for(app, BaseFor::Change);
+}
+
+/// [`rebase`], saying why: on a worker in the app, at once in tests and the web build.
+pub(super) fn rebase_for(app: &mut PhotocraftApp, then: BaseFor) {
+    if BASE_ON_A_WORKER {
+        start_base(app, then);
+    } else {
+        let r = base_now(app);
+        take_base(app, r, then);
     }
-    w.stale();
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn cancel_preview(w: CafWorkspace) {
     if let Some((_, _, job)) = w.preview.running {
         job.cancel();
+    }
+    if let Some(run) = w.preview.base_running {
+        run.job.cancel();
     }
 }
 
@@ -172,6 +322,7 @@ pub(super) fn refresh(app: &mut PhotocraftApp) {
 
 /// Computes the preview now, on this thread (tests and the control channel).
 pub(super) fn wait_preview(app: &mut PhotocraftApp) -> Result<(), String> {
+    settle_base(app);
     let (doc, layer, p, want, limit) = {
         let w = app.distort.caf.as_ref().ok_or("Content-Aware Fill is not open")?;
         let st = app.session.active().ok_or("no document")?;
@@ -257,6 +408,11 @@ fn compute_preview(
 /// collects a finished one.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn drive_preview(app: &mut PhotocraftApp, ctx: &egui::Context, dragging: bool) {
+    // The preview waits for the base: both read the whole window, and the base comes first.
+    if collect_base(app) {
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        return;
+    }
     let doc = app.session.active().map(|s| s.doc.clone());
     let Some(w) = app.distort.caf.as_mut() else { return };
     let pv = &mut w.preview;
