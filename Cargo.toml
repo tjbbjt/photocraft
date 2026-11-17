@@ -230,7 +230,7 @@ egui_system_font_provider = { git = "https://github.com/storytold/egui.git", rev
 eframe = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
 egui_demo_lib = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
 egui_inspection = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
-winit = { git = "https://github.com/tjbbjt/winit.git", rev = "c3fcb9703007f75ae4a9a4e45f36f197e0b1a5ea" }
+winit = { git = "https://github.com/tjbbjt/winit.git", rev = "01c564f7b1e655b31331fe3fda957b70f2b14da0" }
 # craft-pdf's vendored Hayro trees: consumers patch the same craft-libs revision (crates/pdf README).
 hayro = { git = "https://github.com/storytold/craft-libs", rev = "fe6b443acf3eccaf514064812e6e6bf24257652a" }
 hayro-syntax = { git = "https://github.com/storytold/craft-libs", rev = "fe6b443acf3eccaf514064812e6e6bf24257652a" }
