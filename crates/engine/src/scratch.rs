@@ -159,23 +159,36 @@ mod disk_choice {
     /// moves the tiles to another part of RAM. The cache folder is the fallback, so a machine
     /// whose only listed disk is "(system temp)" still spills to a real disk.
     pub(super) fn candidates(disks: &[ScratchDisk]) -> Vec<PathBuf> {
+        candidates_with(disks, cache_base().map(|base| own_folder(&base)))
+    }
+
+    /// [`candidates`] with `cache` as the app's own folder.
+    pub(super) fn candidates_with(disks: &[ScratchDisk], cache: Option<PathBuf>) -> Vec<PathBuf> {
         let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
         let listed = disks.iter().filter(|d| d.enabled && !d.path.trim().is_empty()).map(|d| resolve(d.path.trim()));
-        listed.chain(cache_scratch_dir()).filter(|dir| reachable(dir) && !ram_backed(&mounts, dir)).collect()
+        listed.chain(cache).filter(|dir| reachable(dir) && !ram_backed(&mounts, dir)).collect()
     }
 
     fn resolve(path: &str) -> PathBuf {
         if path == "(system temp)" { std::env::temp_dir() } else { PathBuf::from(path) }
     }
 
-    /// `$XDG_CACHE_HOME/photocraft/scratch` (inside a Flatpak, the app's own cache folder, on the
-    /// home disk), or `~/.cache/photocraft/scratch`.
-    fn cache_scratch_dir() -> Option<PathBuf> {
-        let base = std::env::var_os("XDG_CACHE_HOME")
+    /// `$XDG_CACHE_HOME` (inside a Flatpak, the app's own cache folder, on the home disk), or
+    /// `~/.cache`.
+    fn cache_base() -> Option<PathBuf> {
+        std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-        Some(base.join("photocraft").join("scratch"))
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+    }
+
+    /// `photocraft/scratch` in the cache folder `base`, made if it isn't there. It is the app's own
+    /// folder, so it is created rather than taken for a drive that isn't mounted: in a fresh
+    /// Flatpak only the cache folder itself exists, and without this the scratch disk was off.
+    pub(super) fn own_folder(base: &Path) -> PathBuf {
+        let dir = base.join("photocraft").join("scratch");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
     }
 
     /// The folder exists, or its parent does (it is created when the scratch file opens).
@@ -258,6 +271,21 @@ mod disk_choice {
             assert_eq!(got.first() == Some(&real), !ram_backed(&mounts, &real), "a listed disk comes first unless it's in RAM: {got:?}");
             assert!(got.iter().all(|d| !ram_backed(&mounts, d)), "nothing held in RAM: {got:?}");
             let _ = std::fs::remove_dir(&real);
+        }
+
+        /// The cache folder is used even when its `photocraft` folder doesn't exist yet (a fresh
+        /// Flatpak): it is made, not skipped as an unmounted drive.
+        #[test]
+        fn the_cache_folder_is_made_when_missing() {
+            let base = std::env::temp_dir().join(format!("pc-scratch-cache-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            let own = own_folder(&base);
+            assert!(own.is_dir(), "made: {own:?}");
+            let got = candidates_with(&[], Some(own.clone()));
+            let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+            assert_eq!(got.contains(&own), !ram_backed(&mounts, &own), "the cache folder is a candidate unless it's in RAM: {got:?}");
+            let _ = std::fs::remove_dir_all(&base);
         }
     }
 }
