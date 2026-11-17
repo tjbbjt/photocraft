@@ -156,12 +156,42 @@ pub struct SlowFrames {
     /// When the last log line went out, and the slow frames since that weren't logged.
     logged_at: Option<f64>,
     unlogged: usize,
+    /// The process memory last logged, in whole GiB (see [`note_memory`]).
+    memory_logged: u64,
 }
 
 impl Default for SlowFrames {
     fn default() -> Self {
-        Self { frames: VecDeque::with_capacity(SLOW_FRAMES), threshold_ms: SLOW_FRAME_MS, prev_ui_ms: None, logged_at: None, unlogged: 0 }
+        Self { frames: VecDeque::with_capacity(SLOW_FRAMES), threshold_ms: SLOW_FRAME_MS, prev_ui_ms: None, logged_at: None, unlogged: 0, memory_logged: 0 }
     }
+}
+
+/// Logs the process's memory each time it passes another whole GiB, split into pixel tiles held
+/// in memory, tiles on the scratch disk and everything else, so a log shows which part grew
+/// before the system ran out (the kernel killed a 24 GB session without a word). The numbers are
+/// the engine's own measurement, refreshed every two seconds.
+fn note_memory(logged: &mut u64) {
+    const GIB: u64 = 1 << 30;
+    let (snap, budgets, _) = photocraft_raster::memory::stats();
+    let rss = snap.process_resident_bytes;
+    if rss < logged.saturating_add(GIB) {
+        return;
+    }
+    *logged = rss / GIB * GIB;
+    let spill = photocraft_raster::spill::stats();
+    let tiles = spill.resident_bytes as u64;
+    let g = |b: u64| b as f64 / GIB as f64;
+    log::info!(
+        "memory: process {:.1} GB: pixel tiles {:.1} GB in memory (budget {:.1} GB), {:.1} GB on the scratch disk{}, other {:.1} GB; {:.1} GB of {:.1} GB available",
+        g(rss),
+        g(tiles),
+        g(budgets.tile_bytes),
+        g(spill.scratch_bytes),
+        if spill.dir.is_none() { " (scratch disk off)" } else { "" },
+        g(rss.saturating_sub(tiles)),
+        g(snap.available_bytes),
+        g(snap.total_bytes),
+    );
 }
 
 impl SlowFrames {
@@ -188,6 +218,7 @@ impl SlowFrames {
         if let Some(line) = self.push(&s) {
             log::info!("{line}");
         }
+        note_memory(&mut self.memory_logged);
         s
     }
 
