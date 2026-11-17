@@ -39,6 +39,33 @@ const MAX_FACTOR: u32 = 1 << 16;
 
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// When each document's pages started being worked on, for the log line when they are all done.
+static BUSY_SINCE: std::sync::Mutex<Vec<(u64, f64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Fork diagnostic: with `PHOTOCRAFT_PAGES_FROM_MP=<n>`, documents of `n` megapixels or more are
+/// drawn from viewport pages even when their texture set fits, to compare the two on a very large
+/// canvas (a full refresh of the texture set blocks the UI thread for seconds there).
+fn pages_forced(size: [u32; 2]) -> bool {
+    static FROM: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let from =
+        FROM.get_or_init(|| std::env::var("PHOTOCRAFT_PAGES_FROM_MP").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|mp| mp.saturating_mul(1_000_000)));
+    from.is_some_and(|from| u64::from(size[0]) * u64::from(size[1]) >= from)
+}
+
+/// Logs how long document `id`'s pages took, from the first frame with work to the first without.
+fn note_busy(id: u64, busy: bool, pages: usize) {
+    let Ok(mut since) = BUSY_SINCE.lock() else { return };
+    let now = crate::gpu_canvas::now_ms();
+    match (busy, since.iter().position(|(d, _)| *d == id)) {
+        (true, None) => since.push((id, now)),
+        (false, Some(i)) => {
+            let (_, t0) = since.swap_remove(i);
+            log::info!("viewport pages: the view's {pages} pages done after {:.0} ms", now - t0);
+        }
+        _ => {}
+    }
+}
+
 /// The GPU canvas key of `doc`'s pages, apart from its texture set and the preview keys (bits 58
 /// to 63 tag those: the filter preview, adjustment proxies, gradients and thumbnails).
 pub(crate) fn stream_key(doc: u64) -> u64 {
@@ -622,7 +649,7 @@ pub(super) fn show(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf:
     let size = [size.width, size.height];
     let (doc, raw_key) = display_doc(app, idx);
     // A size-changing preview draws as main does; a document that fits keeps its texture set.
-    if [doc.size.width, doc.size.height] != size || gpu.fits_canvas(&doc) {
+    if [doc.size.width, doc.size.height] != size || (gpu.fits_canvas(&doc) && !pages_forced(size)) {
         if let Some(s) = app.streams.remove(&id) {
             drop(s);
             gpu.retain_pages(stream_key(id.0), &[]);
@@ -719,6 +746,7 @@ pub(super) fn show(app: &mut PhotocraftApp, ctx: &egui::Context, idx: usize, xf:
         gpu.retain_pages(key, &ids);
     }
     stream.stats.limit = limit;
+    note_busy(id.0, stream.busy(), wanted.len());
     if stream.busy() {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
     }
