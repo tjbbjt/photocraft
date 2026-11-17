@@ -138,29 +138,65 @@ pub fn fill(s: &mut Session, p: &Value) -> Result<Value> {
             let mirror = flag(p, "mirror", false)?;
             let rotate = flag(p, "rotationAdaptation", false)?;
             let lid = id.ok_or_else(|| EngineError::Other("no active layer".into()))?;
-            let surf = st.doc.layer(lid).and_then(|l| l.surface()).ok_or_else(|| EngineError::Other("Content-Aware fill needs a pixel layer".into()))?;
+            let surf = st.doc.layer(lid).and_then(|l| l.surface()).ok_or_else(|| EngineError::Other("Content-Aware fill needs a pixel layer".into()))?.clone();
             let seed = p.get("seed").and_then(Value::as_u64).unwrap_or(1);
             // The native Boolean enables quarter-turn candidates, within the existing mosaic cap.
             let rotations = if rotate { photocraft_algo::content_aware::rotation_level("full") } else { Vec::new() };
             let options = FillOptions { rotations, scale, mirror, ..content_aware_options(adapt, seed) };
-            content_aware(surf, sel, doc_bounds, &options)?
+            let (sel, p) = (sel.clone(), p.clone());
+            let how = How { mode, opacity, preserve, restore };
+            // A background job when started with `Session::start`, as Content-Aware Fill's own
+            // workspace is: filling a large selection takes seconds (18 s on an 84 MP photo), and
+            // the dialog stayed on screen with the window frozen meanwhile.
+            return crate::jobs::run(
+                s,
+                "Fill",
+                true,
+                move |ctx| {
+                    ctx.progress(0.0, "Fill");
+                    content_aware(&surf, &sel, doc_bounds, &options)
+                },
+                move |s, source| {
+                    if !area.is_empty() {
+                        apply(s, id, &p, area, &source, how)?;
+                    }
+                    Ok(out)
+                },
+            );
         }
         _ => return Err(bad(format!("unknown contents `{contents}`"))),
     };
     if area.is_empty() {
         return Ok(out);
     }
+    apply(s, id, p, area, &source, How { mode, opacity, preserve, restore })?;
+    Ok(out)
+}
+
+/// How Fill blends its contents: the dialog's mode, opacity and Preserve Transparency, and
+/// whether a History fill restores transparency too.
+#[derive(Clone, Copy)]
+struct How {
+    mode: BlendMode,
+    opacity: f32,
+    preserve: bool,
+    restore: bool,
+}
+
+/// `source` blended into the target over `area` (weighted by the selection), as one history step.
+fn apply(s: &mut Session, id: Option<photocraft_doc::LayerId>, p: &Value, area: Rect, source: &Source, how: How) -> Result<()> {
     // The document's own CMYK profile converts the fill colour, like the compositor and brush.
     let cmyk = crate::brush_cmds::doc_cmyk_space(s);
     photocraft_color::convert::with_cmyk_space(cmyk.as_ref(), || {
         s.edit("Fill", |doc, _| {
             let sel = doc.selection.clone();
             let (surf, lock) = crate::channel_cmds::target_surface(doc, id, p)?;
-            blend_into(surf, area, &source, sel.as_ref(), Blend { mode, opacity, keep_alpha: preserve || lock, restore })?;
+            let blend = Blend { mode: how.mode, opacity: how.opacity, keep_alpha: how.preserve || lock, restore: how.restore };
+            blend_into(surf, area, source, sel.as_ref(), blend)?;
             Ok(())
         })
     })?;
-    Ok(out)
+    Ok(())
 }
 
 /// A fill colour: the inks it was picked as when it was picked as CMYK (#4196), else plain sRGB.
