@@ -187,7 +187,10 @@ fn note_memory(logged: &mut u64) {
         g(tiles),
         g(budgets.tile_bytes),
         g(spill.scratch_bytes),
-        if spill.dir.is_none() { " (scratch disk off)" } else { "" },
+        spill.dir.as_ref().map_or_else(
+            || " (scratch disk off)".to_string(),
+            |d| format!(" ({}{})", d.display(), if photocraft_raster::spill::paused() { ", paused" } else { "" })
+        ),
         g(rss.saturating_sub(tiles)),
         g(snap.available_bytes),
         g(snap.total_bytes),
