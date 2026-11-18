@@ -1,4 +1,6 @@
-use super::preview::{Base, Preview, cancel_preview, compute_base, plan_params, points_limit, rebase, refresh};
+use super::preview::{
+    BASE_ON_A_WORKER, Base, BaseFor, Preview, cancel_preview, compute_base, plan_params, points_limit, rebase, rebase_for, refresh, start_base,
+};
 use super::{CMD, CafOpts, CafTool, CafWorkspace, MAX_CAF_EDITS, MAX_CAF_POINTS, PROXY_SIDE, PhotocraftApp, REMEMBERED, Rect, Step, Value};
 use super::{JobEvent, JobId, JobOutcome, PendingFill, json};
 
@@ -58,6 +60,14 @@ pub fn open(app: &mut PhotocraftApp) -> Result<(), String> {
         error: None,
     };
     w.brush_add = w.opts.sampling == "custom";
+    if BASE_ON_A_WORKER {
+        // Open at once; the fill area, the sampling area and the preview follow (the preview's
+        // spinner shows meanwhile).
+        w.stale();
+        app.distort.caf = Some(w);
+        start_base(app, BaseFor::Open);
+        return Ok(());
+    }
     let base = compute_base(app, &w)?;
     w.brush_size = photocraft_algo::content_aware::default_brush_size(bounds(&base));
     w.set_base(base);
@@ -305,16 +315,8 @@ pub(super) fn fill_edit(app: &mut PhotocraftApp, edit: Value) {
     }
     w.fill_edits.push(edit.clone());
     w.push(Step::Fill(edit));
-    rebase(app);
-    // An edit that empties the fill area is refused (the plan says so): undo it.
-    if app.distort.caf.as_ref().is_some_and(|w| w.error.is_some()) {
-        let msg = app.distort.caf.as_ref().and_then(|w| w.error.clone());
-        undo(app);
-        if let Some(w) = app.distort.caf.as_mut() {
-            w.redo.clear();
-            w.error = msg;
-        }
-    }
+    // An edit that empties the fill area is refused when its base says so (`take_base`).
+    rebase_for(app, BaseFor::Edit);
 }
 
 /// A new sampling option (Auto, Rectangular, Custom): the brush strokes start over and the brush
