@@ -752,3 +752,20 @@ fn a_base_worked_out_on_a_worker_matches_one_worked_out_at_once() {
     assert_eq!(ws(&app).base.base, base);
     assert!(ws(&app).preview.want > want, "the preview is out of date once it arrives");
 }
+
+/// Past the texture limit the preview fills the box-averaged window (one texel per block) rather
+/// than the full-size one, and the red blemish under the selection is gone from it.
+#[test]
+fn a_preview_past_the_texture_limit_fills_the_reduced_window() {
+    let mut app = app_with_selection();
+    open(&mut app).unwrap();
+    let w = ws(&app);
+    let doc = app.session.active().unwrap().doc.clone();
+    let (rect, img) = preview::compute_preview(&doc, w.layer, &preview::plan_params(w, true), &photocraft_raster::Interrupt::NONE, 64).unwrap();
+    let f = crate::filter_preview_ui::texture_factor(rect.width(), rect.height(), 64) as usize;
+    assert!(f > 1, "the window is past the limit: {rect:?}");
+    assert_eq!(img.size, [(rect.width() as usize).div_ceil(f), (rect.height() as usize).div_ceil(f)]);
+    let (tx, ty) = ((100 - rect.x0) as usize / f, (80 - rect.y0) as usize / f);
+    let c = img.pixels[ty * img.size[0] + tx];
+    assert!(!(c.r() > 200 && c.g() < 60 && c.b() < 60), "the blemish is filled: {c:?}");
+}

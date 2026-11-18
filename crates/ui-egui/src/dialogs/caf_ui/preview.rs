@@ -337,8 +337,10 @@ pub(super) fn wait_preview(app: &mut PhotocraftApp) -> Result<(), String> {
 
 /// The filled rectangle as an image (what Apply would write there), as a texture no wider than
 /// `max_side`: past the device's limit it is box-averaged to fit (the rectangle it is drawn over
-/// stays the plan's).
-fn compute_preview(
+/// stays the plan's). Past that limit the fill itself runs on the box-averaged window
+/// ([`reduced_preview`]): the texture could not show more, and a full-size fill of a 156 MP
+/// panorama's borders held many GB for a preview two thousand pixels wide.
+pub(super) fn compute_preview(
     doc: &photocraft_doc::Document,
     layer: LayerId,
     p: &Value,
@@ -357,6 +359,10 @@ fn compute_preview(
     }
     let (w, h) = (plan.rect.width() as usize, plan.rect.height() as usize);
     let n = plan.fmt.channels();
+    let f = crate::filter_preview_ui::texture_factor(w as u32, h as u32, max_side) as usize;
+    if f > 1 {
+        return reduced_preview(plan, f, ctl);
+    }
     let filled =
         photocraft_algo::content_aware::fill_with(w, h, n, &plan.img, &plan.hole, &plan.source, &plan.opts, ctl).map_err(|_| "cancelled".to_string())?;
     let own = plan.layer_pixels();
@@ -404,6 +410,91 @@ fn compute_preview(
     Ok((plan.rect, egui::ColorImage::new([tw, th], px)))
 }
 
+/// [`compute_preview`] past the texture limit: the window box-averaged `f`× (the colours, the
+/// layer's own pixels and the fill coverage), the fill area where any of a block is in it, the
+/// sampling area where most of a block is and none of it is to be filled; then the fill at that
+/// size, one texel per block. The full-size plan is freed before the fill.
+fn reduced_preview(plan: photocraft_engine::edit_menu_cmds::CafPlan, f: usize, ctl: &photocraft_raster::Interrupt) -> Result<(Rect, egui::ColorImage), String> {
+    let (w, h) = (plan.rect.width() as usize, plan.rect.height() as usize);
+    let n = plan.fmt.channels();
+    let (rw, rh) = (w.div_ceil(f), h.div_ceil(f));
+    struct Block {
+        img: Vec<f32>,
+        /// The layer's own pixels, premultiplied RGBA.
+        own: [f32; 4],
+        hole: bool,
+        source: bool,
+        cover: f32,
+    }
+    let own_px = plan.layer_pixels();
+    let block = |j: usize| -> Block {
+        let (bx, by) = (j % rw, j / rw);
+        let mut img = vec![0.0f32; n];
+        let (mut own, mut count, mut sources, mut cover, mut hole) = ([0.0f32; 4], 0.0f32, 0usize, 0.0f32, false);
+        for y in by * f..((by + 1) * f).min(h) {
+            for x in bx * f..((bx + 1) * f).min(w) {
+                let i = y * w + x;
+                for (a, v) in img.iter_mut().zip(&plan.img[i * n..(i + 1) * n]) {
+                    *a += v;
+                }
+                let o = photocraft_raster::to_rgba(&plan.fmt, &own_px[i * n..(i + 1) * n]);
+                for (a, v) in own.iter_mut().zip(&o).take(3) {
+                    *a += v * o[3];
+                }
+                own[3] += o[3];
+                hole |= plan.hole[i];
+                sources += usize::from(plan.source[i]);
+                cover += plan.cover[i];
+                count += 1.0;
+            }
+        }
+        for a in &mut img {
+            *a /= count;
+        }
+        let own = if own[3] > 0.0 { [own[0] / own[3], own[1] / own[3], own[2] / own[3], own[3] / count] } else { [0.0; 4] };
+        Block { img, own, hole, source: !hole && sources as f32 * 2.0 >= count, cover: cover / count }
+    };
+    // The web build has no thread pool.
+    #[cfg(not(target_arch = "wasm32"))]
+    let blocks: Vec<Block> = {
+        use rayon::prelude::*;
+        (0..rw * rh).into_par_iter().map(block).collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let blocks: Vec<Block> = (0..rw * rh).map(block).collect();
+    let (rect, fmt, opts) = (plan.rect, plan.fmt, plan.opts.clone());
+    drop(plan);
+    if ctl.cancelled() {
+        return Err("cancelled".into());
+    }
+    let img: Vec<f32> = blocks.iter().flat_map(|b| b.img.iter().copied()).collect();
+    let hole: Vec<bool> = blocks.iter().map(|b| b.hole).collect();
+    let source: Vec<bool> = blocks.iter().map(|b| b.source).collect();
+    // A sampling area thinner than a block leaves no whole block: the preview says so, as the
+    // full-size one does when there is nothing to copy.
+    if !source.iter().any(|s| *s) {
+        return Err(NOTHING_TO_SAMPLE.into());
+    }
+    let filled = photocraft_algo::content_aware::fill_owned(rw, rh, n, img, &hole, &source, &opts, ctl).map_err(|_| "cancelled".to_string())?;
+    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let px = blocks
+        .iter()
+        .enumerate()
+        .map(|(j, block)| {
+            let under = block.own;
+            let c: [f32; 4] = if block.hole {
+                let fill = photocraft_raster::to_rgba(&fmt, &filled[j * n..(j + 1) * n]);
+                let k = block.cover;
+                std::array::from_fn(|i| under[i] + (fill[i] - under[i]) * k)
+            } else {
+                under
+            };
+            Color32::from_rgba_unmultiplied(b(c[0]), b(c[1]), b(c[2]), b(c[3]))
+        })
+        .collect();
+    Ok((rect, egui::ColorImage::new([rw, rh], px)))
+}
+
 /// Starts a background preview when the shown one is out of date (and the pointer is up), and
 /// collects a finished one.
 #[cfg(not(target_arch = "wasm32"))]
@@ -411,6 +502,17 @@ pub(super) fn drive_preview(app: &mut PhotocraftApp, ctx: &egui::Context, draggi
     // The preview waits for the base: both read the whole window, and the base comes first.
     if collect_base(app) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        return;
+    }
+    // Nor does it run beside an Apply or OK fill: that holds the full-size window itself. A
+    // running preview stops; the next one starts once the fill is done (it changes the document).
+    if let Some(w) = app.distort.caf.as_mut()
+        && w.pending_fill.is_some()
+    {
+        if let Some((_, _, job)) = w.preview.running.take() {
+            job.cancel();
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
         return;
     }
     let doc = app.session.active().map(|s| s.doc.clone());
