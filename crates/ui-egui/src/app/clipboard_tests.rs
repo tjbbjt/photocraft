@@ -683,7 +683,7 @@ fn pixel_paste_reads_the_bitmap_when_the_svg_read_fails() {
 }
 
 /// An app whose OS clipboard setter stores the image in `os`.
-fn app_mirroring_to(os: &OsClip) -> PhotocraftApp {
+fn app_mirroring_to(os: &OsClip) -> Box<PhotocraftApp> {
     let a = os.clone();
     let services = Services {
         clipboard_set_image: Some(Box::new(move |w: u32, h: u32, px: &[u8]| {
