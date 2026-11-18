@@ -378,7 +378,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         painter.rect_filled(right, 0.0, t.dock);
         painter.line_segment([right.left_top(), right.left_bottom()], Stroke::new(1.0, t.separator));
         let mut props =
-            ui.new_child(egui::UiBuilder::new().max_rect(ERect::from_min_max(right.min + vec2(14.0, 12.0), pos2(right.right() - 14.0, right.bottom() - 60.0))));
+            ui.new_child(egui::UiBuilder::new().max_rect(ERect::from_min_max(right.min + vec2(14.0, 12.0), pos2(right.right() - 14.0, right.bottom() - 96.0))));
         egui::ScrollArea::vertical()
             .id_salt("caf-props")
             .show(&mut props, |ui| caf_props_panel(ui, w, &t, &mut reset_what, &mut new_sampling, &mut rebase_needed));
@@ -498,11 +498,10 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             events.push(ToolEvent::Up { x: q[0], y: q[1] });
             dragging = false;
         }
-        // At the bottom left of the view: PhotoCraft's additions, or the workspace as Photoshop
-        // has it.
-        let sw = ERect::from_min_size(pos2(area.left() + 10.0, body.bottom() - 40.0), vec2(220.0, 30.0));
-        painter.rect_filled(sw, 6.0, t.dock);
-        let mut sui = ui.new_child(egui::UiBuilder::new().max_rect(sw.shrink2(vec2(10.0, 5.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        // Above OK and Apply: PhotoCraft's additions, or the workspace as Photoshop has it.
+        let sw = ERect::from_min_size(pos2(full.right() - PANEL_W + 14.0, full.bottom() - 84.0), vec2(PANEL_W - 28.0, 30.0));
+        painter.line_segment([sw.left_top() - vec2(0.0, 4.0), sw.right_top() - vec2(0.0, 4.0)], Stroke::new(1.0, t.separator));
+        let mut sui = ui.new_child(egui::UiBuilder::new().max_rect(sw).layout(egui::Layout::left_to_right(egui::Align::Center)));
         crate::fill_ui::behavior_switch(&mut sui, &mut w.opts.photocraft)
             .on_hover_text(tl!("PhotoCraft: fill methods, the edge band, timers and a resizable preview. Parity: Content-Aware Fill as in Photoshop."));
         // The split between the view and the Preview panel, last so it is above both.

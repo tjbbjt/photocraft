@@ -74,7 +74,7 @@ use synthesis::onion_peel;
 pub use synthesis::{best_offset, synthesize};
 
 /// How strongly a guided fill favours coherent matches ([`Solver::coherence`]).
-const GUIDED_COHERENCE: f32 = 2.0;
+const GUIDED_COHERENCE: f32 = 6.0;
 
 /// Parameters for [`complete`].
 #[derive(Clone, Debug, PartialEq)]

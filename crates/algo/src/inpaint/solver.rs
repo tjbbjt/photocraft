@@ -83,9 +83,11 @@ impl Solver<'_> {
         self.mimg.as_deref().unwrap_or(&self.img[..])
     }
 
-    /// A guided fill's match image: the picture with the guide in the hole, softened by a box of
-    /// half the guide's softness (at least 1 px), so a match agrees with the guide in the large
-    /// and is free in the small. Compared sharp, a soft guide matched smooth sources best (a
+    /// A guided fill's match image: the picture with the guide in the hole, softened by a box
+    /// reaching twice the guide's softness (at least 2 px), so a match agrees with the guide in
+    /// the large and is free in the small. Softened less, a shrub in a source patch still showed
+    /// as a dark spot the guide's flat ground lacks, so sources without shrubs won and the fill
+    /// had half the photo's structure; at twice, the fill is as textured as the photo. Compared sharp, a soft guide matched smooth sources best (a
     /// road, a haze) and the fill came out smeared; softened on both sides, a ground of shrubs
     /// matches the guide's soft ground as well as a road does, and the fill copies shrubs. The
     /// picture outside the hole never changes and the guide is fixed, so it is worked out once
@@ -97,7 +99,7 @@ impl Solver<'_> {
         }
         let (w, h, ch, px) = (self.w, self.h, self.ch, self.px);
         let img = &self.img[..];
-        let r = (soft / 2).max(1);
+        let r = (2 * soft).max(2);
         let row = w * ch;
         let mut m = vec![0.0f32; img.len()];
         par::chunks_mut(&mut m, row.max(1), w * h >= PAR_MIN_PATCHES, |y, out| {
