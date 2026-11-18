@@ -1,0 +1,51 @@
+# Fork-only: build the Windows installer and portable zip from this branch, on demand.
+# Uses the project's own packaging script (packaging/windows/package.ps1). Unsigned.
+name: Windows test build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      # The same pinned fonts the official builds embed (Chinese, Japanese, Korean, Arabic…).
+      CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out craft-fonts
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/craft-fonts
+          ref: b076417b5880bd4154bd22f00695b1d28c6bea83
+          path: craft-fonts
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install WiX v5
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+
+      - name: Build and package
+        shell: pwsh
+        run: pwsh packaging/windows/package.ps1 -Arch x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photocraft-windows-x64
+          path: dist/release/*
+          if-no-files-found: error
