@@ -69,6 +69,11 @@ pub struct DocState {
     /// type layer keeps such a name although it looks like a copy's ("Title copy 2"), while a
     /// name Duplicate Layer made still follows the text (#9023). Kept for the session only.
     pub(crate) typed_names: std::collections::HashMap<LayerId, String>,
+    /// The layers whose transparency built the current selection (⌘-click a thumbnail, then
+    /// ⌘⇧-click more), with the selection they left: Paste Into Each Selected Layer pastes one
+    /// copy above each. Only meaningful while the document's selection still equals the one kept
+    /// here; anything else that changes the selection makes it stale (see `selection_sources`).
+    pub(crate) selection_layers: Option<(photocraft_raster::Surface, Vec<LayerId>)>,
     /// The count of steps whose damage was not empty: pixel thumbnails (the Channels panel's composite and colour
     /// rows) change only when it moves, so a selection-only or view-only step keeps them. Written only by
     /// `Session::dispatch` and the job apply path.
@@ -90,6 +95,7 @@ impl DocState {
         self.history.pixel_bytes(&self.doc).saturating_add(self.history.extra_bytes(&self.doc, &snaps))
     }
 
+    /// A newly opened or created document's state: its top layer targeted, an empty history.
     pub fn new(doc: Document, path: Option<String>) -> Self {
         let active_layer = doc.top_layer();
         let mut history = History::default();
@@ -131,6 +137,7 @@ impl DocState {
             save_snapshot: None,
             source_snapshot: None,
             typed_names: Default::default(),
+            selection_layers: None,
             pixel_revision: 0,
         }
     }
@@ -139,6 +146,23 @@ impl DocState {
     /// layer was changed without updating the set, the selection is just the active layer.
     pub fn selected_layers(&self) -> Vec<LayerId> {
         selected_in(&self.doc, self.active_layer, &self.selected_layers)
+    }
+    /// The layers whose thumbnails built the current selection ([`Self::selection_layers`]),
+    /// if the selection is still exactly the one they built and they are all still here.
+    pub(crate) fn selection_sources(&self) -> Option<Vec<LayerId>> {
+        let (kept, ids) = self.selection_layers.as_ref()?;
+        if self.doc.selection.as_ref() != Some(kept) || ids.iter().any(|id| self.doc.layer(*id).is_none()) {
+            return None;
+        }
+        Some(ids.clone())
+    }
+    /// Forget [`Self::selection_layers`] once the selection is no longer the one it built (after
+    /// Deselect, a marquee, Undo…): its copy of that selection would otherwise keep tiles the
+    /// document let go. While it is current it shares the selection's tiles and costs nothing.
+    pub(crate) fn drop_stale_selection_layers(&mut self) {
+        if self.selection_layers.as_ref().is_some_and(|(kept, _)| self.doc.selection.as_ref() != Some(kept)) {
+            self.selection_layers = None;
+        }
     }
     pub fn is_layer_selected(&self, id: LayerId) -> bool {
         self.active_layer == Some(id) || (self.active_layer.is_some_and(|a| self.selected_layers.contains(&a)) && self.selected_layers.contains(&id))
