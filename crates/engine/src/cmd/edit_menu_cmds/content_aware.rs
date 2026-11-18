@@ -637,9 +637,14 @@ pub fn caf_fill(
 ) -> std::result::Result<Vec<f32>, photocraft_raster::Cancelled> {
     let n = fmt.channels();
     let Some((model, guide)) = model else { return photocraft_algo::content_aware::fill_owned(w, h, n, img, hole, source, opts, ctl) };
-    let g = guide_at(fmt, &img, (w, h), hole, guide);
+    let mut g = guide_at(fmt, &img, (w, h), hole, guide);
+    // The model's fill in the photo's tones around it, region by region (32 of the model's px):
+    // a lighter, flatter fill guided the matching to light, smooth pieces and came out hazy.
+    let scale = w as f32 / guide.w.max(1) as f32;
+    photocraft_algo::inpaint::match_guide_tones(w, h, n, fmt.mode.color_channels(), &mut g, hole, (32.0 * scale).round() as usize);
+    ctl.check()?;
     if model.detail {
-        return photocraft_algo::content_aware::fill_guided_owned(w, h, n, img, hole, source, &g, w as f32 / guide.w.max(1) as f32, opts, ctl);
+        return photocraft_algo::content_aware::fill_guided_owned(w, h, n, img, hole, source, &g, scale, opts, ctl);
     }
     let mut img = img;
     for (i, hh) in hole.iter().enumerate() {

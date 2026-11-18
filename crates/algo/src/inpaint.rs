@@ -177,6 +177,89 @@ pub fn complete_guided_owned(
     Ok(complete_cow(w, h, ch, Cow::Owned(img), px, Some((guide, scale.max(1.0))), p, ctl)?.map_err(Cow::into_owned))
 }
 
+/// A model's fill brought to the tones of the picture around it, before it guides a fill. In
+/// each region of `tile` px (and its eight neighbours), each of the first `colour` channels of
+/// `guide`'s hole pixels gets a gain and an offset so their mean and spread match the known
+/// pixels there; between regions the two are interpolated. A model's fill tends to be lighter
+/// and flatter than the photo deep inside a large hole (it settles on an average); matched
+/// against such a guide, the fill picked light, smooth pieces of the photo and came out hazy.
+/// `guide` holds the picture outside the hole; only its hole pixels change.
+pub fn match_guide_tones(w: usize, h: usize, ch: usize, colour: usize, guide: &mut [f32], hole: &[bool], tile: usize) {
+    let (cc, tile) = (colour.min(ch), tile.max(8));
+    if w == 0 || h == 0 || cc == 0 || guide.len() != w * h * ch || hole.len() != w * h {
+        return;
+    }
+    let (tw, th) = (w.div_ceil(tile), h.div_ceil(tile));
+    // Per region and channel: hole pixels' count, sum and sum of squares, then the known ones'.
+    let rows: Vec<Vec<[f64; 6]>> = par::map(th, w * h >= common::PAR_MIN, |ty| {
+        let mut out = vec![[0.0f64; 6]; tw * cc];
+        for y in ty * tile..((ty + 1) * tile).min(h) {
+            for x in 0..w {
+                let i = y * w + x;
+                let k = if hole[i] { 0 } else { 3 };
+                for c in 0..cc {
+                    let v = f64::from(guide[i * ch + c]);
+                    let s = &mut out[(x / tile) * cc + c];
+                    s[k] += 1.0;
+                    s[k + 1] += v;
+                    s[k + 2] += v * v;
+                }
+            }
+        }
+        out
+    });
+    let at = |tx: usize, ty: usize, c: usize| rows[ty][tx * cc + c];
+    let add = |a: [f64; 6], b: [f64; 6]| std::array::from_fn::<f64, 6, _>(|i| a[i] + b[i]);
+    let least = (tile * tile / 16).max(16) as f64;
+    let fit = |s: [f64; 6]| -> Option<(f32, f32)> {
+        if s[0] < least || s[3] < least {
+            return None;
+        }
+        let (mh, mk) = (s[1] / s[0], s[4] / s[3]);
+        let (sh, sk) = ((s[2] / s[0] - mh * mh).max(0.0).sqrt(), (s[5] / s[3] - mk * mk).max(0.0).sqrt());
+        let gain = ((sk + 1e-3) / (sh + 1e-3)).clamp(0.67, 1.5);
+        Some((gain as f32, (mk - gain * mh) as f32))
+    };
+    let global: Vec<(f32, f32)> = (0..cc)
+        .map(|c| fit((0..th).flat_map(|ty| (0..tw).map(move |tx| (tx, ty))).fold([0.0; 6], |a, (tx, ty)| add(a, at(tx, ty, c)))).unwrap_or((1.0, 0.0)))
+        .collect();
+    let params: Vec<(f32, f32)> = (0..th)
+        .flat_map(|ty| (0..tw).map(move |tx| (tx, ty)))
+        .flat_map(|(tx, ty)| {
+            (0..cc).map(move |c| {
+                let mut s = [0.0f64; 6];
+                for ny in ty.saturating_sub(1)..(ty + 2).min(th) {
+                    for nx in tx.saturating_sub(1)..(tx + 2).min(tw) {
+                        s = add(s, at(nx, ny, c));
+                    }
+                }
+                (s, c)
+            })
+        })
+        .map(|(s, c)| fit(s).unwrap_or(global[c]))
+        .collect();
+    let ps = |tx: usize, ty: usize, c: usize| params[(ty * tw + tx) * cc + c];
+    par::chunks_mut(guide, w * ch, w * h >= common::PAR_MIN, |y, row| {
+        let fy = ((y as f32 + 0.5) / tile as f32 - 0.5).clamp(0.0, (th - 1) as f32);
+        let (y0, ay) = (fy.floor() as usize, fy - fy.floor());
+        let y1 = (y0 + 1).min(th - 1);
+        for x in 0..w {
+            if !hole[y * w + x] {
+                continue;
+            }
+            let fx = ((x as f32 + 0.5) / tile as f32 - 0.5).clamp(0.0, (tw - 1) as f32);
+            let (x0, ax) = (fx.floor() as usize, fx - fx.floor());
+            let x1 = (x0 + 1).min(tw - 1);
+            for c in 0..cc {
+                let lerp = |a: (f32, f32), b: (f32, f32), t: f32| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+                let (g, b) = lerp(lerp(ps(x0, y0, c), ps(x1, y0, c), ax), lerp(ps(x0, y1, c), ps(x1, y1, c), ax), ay);
+                let v = &mut row[x * ch + c];
+                *v = *v * g + b;
+            }
+        }
+    });
+}
+
 /// The completion, on the caller's pixels or a copy of them, guided or not: `Err` gives them
 /// back when there is nothing to copy from.
 #[allow(clippy::too_many_arguments)]

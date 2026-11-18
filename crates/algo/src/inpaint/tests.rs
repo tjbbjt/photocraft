@@ -619,3 +619,24 @@ fn a_soft_guide_gives_the_layout_and_the_picture_the_detail() {
     let (r_fill, r_truth, r_guide) = (roughness(&guided), roughness(&truth), roughness(&soft));
     assert!(r_fill > 0.5 * r_truth && r_fill > 2.0 * r_guide, "fill {r_fill}, picture {r_truth}, guide {r_guide}");
 }
+
+/// A model's fill lighter and flatter than the picture around it takes the picture's tones; the
+/// picture itself is left alone.
+#[test]
+fn a_guide_lighter_than_the_picture_takes_its_tones() {
+    let (w, h, ch) = (96usize, 64usize, 3usize);
+    let hole: Vec<bool> = (0..w * h).map(|i| (32..64).contains(&(i % w))).collect();
+    // Rows alternate dark and light around the hole (mean 0.3); the guide in it is light and flat.
+    let mut g: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            let odd = ((i / w) % 2) as f32;
+            let v = if hole[i] { 0.6 + 0.02 * odd } else { 0.2 + 0.2 * odd };
+            [v, v, v]
+        })
+        .collect();
+    let before = g.clone();
+    match_guide_tones(w, h, ch, 3, &mut g, &hole, 16);
+    let hole_mean = (0..w * h).filter(|&i| hole[i]).map(|i| g[i * ch]).sum::<f32>() / (0..w * h).filter(|&i| hole[i]).count() as f32;
+    assert!((hole_mean - 0.3).abs() < 0.03, "the hole's mean {hole_mean}");
+    assert!(g.iter().zip(&before).enumerate().all(|(k, (a, b))| hole[k / ch] || a == b), "the picture is untouched");
+}
