@@ -1007,3 +1007,38 @@ fn confirmed_damaged_smart_object_opens_are_admitted_as_smart_objects_with_disti
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// "Don't show again" on the high-memory prompt: "Open anyway" with the box ticked opens the file
+/// and keeps the choice, and the next file that would ask opens without the prompt.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn memory_prompt_dont_show_again_opens_the_next_file_without_asking() {
+    if cfg!(target_pointer_width = "32") {
+        return; // the 3 GiB charge would exceed a 32-bit process cap
+    }
+    let gb = 1u64 << 30;
+    let mut app = app();
+    app.background_jobs = false;
+    let psd = recovery_psd::make_psd(false);
+    // Known 5 GiB: S = 2.5 GiB, H = 3.75 GiB. The 3 GiB charge lands in (S, H] on this thread.
+    let snap = photocraft_io::memory::MemorySnapshot { available_ram: Some(5 * gb), swap_free: None, commit_headroom: None };
+    photocraft_io::psd_budget::with_test_estimate_charge(3 * gb, || {
+        photocraft_io::memory::with_mock_memory(snap, || {
+            app.open_bytes_from("first.psd", &psd, Some("/test/first.psd")).unwrap();
+            assert_eq!(app.ui.dialogs.len(), 1, "the first file asks");
+            assert!(crate::open_prompt::owns_memory(&app.ui.dialogs[0].fields));
+            app.ui.dialogs[0].fields.insert("skip".into(), json!(true));
+            let dlg_id = app.ui.dialogs[0].id;
+            let res = call(&mut app, "ui.dialog.confirm", json!({"dialog": dlg_id}));
+            assert_eq!(res["ok"], true, "{res}");
+            assert_eq!(app.session.documents().len(), 1, "Open anyway opened it");
+            assert!(crate::dialogs::dont_show_again::dismissed(&app, crate::open_prompt::MEMORY_PREF), "the choice is kept");
+
+            app.open_bytes_from("second.psd", &psd, Some("/test/second.psd")).unwrap();
+            assert!(app.ui.dialogs.is_empty(), "no prompt the second time");
+            assert_eq!(app.session.documents().len(), 2, "the second file opened as if approved");
+            assert!(app.held_memory_prompts.is_empty());
+            assert!(app.prompt_order.is_empty());
+        });
+    });
+}
