@@ -132,11 +132,14 @@ impl Compositor {
     ) -> Result<Stats, Unsupported> {
         let canvas = doc.bounds();
         let region = region.intersect(&canvas);
+        let planning = timing::cpu_now();
         let plan = plan(doc)?;
         self.check_fx(doc, &plan)?;
+        let plan_ms = timing::cpu_ms(planning);
+        timing::take_wait();
         self.pattern_mode = doc.pixel_format().mode;
         self.pattern_doc = doc.id;
-        let mut stats = Stats { passes: plan.passes.len(), slots: plan.slots, ..Default::default() };
+        let mut stats = Stats { passes: plan.passes.len(), slots: plan.slots, plan_ms, ..Default::default() };
         if region.is_empty() {
             return Ok(stats);
         }
@@ -178,11 +181,13 @@ impl Compositor {
         // regions larger than the limit are built per cell below.
         let paged: Vec<bool> = plan.fx.iter().map(|f| self.fx_paged(f.region)).collect();
         let aprons: Vec<i32> = plan.fx.iter().zip(&paged).map(|(f, &pg)| if pg { Self::fx_apron(doc, f) } else { 0 }).collect();
+        let effects = timing::cpu_now();
         for (f, &pg) in plan.fx.iter().zip(&paged) {
             if !pg {
                 self.sync_fx(device, queue, encoder, doc, f, (f.layer.id, None), f.region, &mut stats)?;
             }
         }
+        stats.fx_ms += timing::cpu_ms(effects);
         let fr = self.frame_res(device, queue, canvas, &plan)?;
 
         // Page cells; every other frame in reverse, so a repeated full refresh of a document
@@ -211,13 +216,21 @@ impl Compositor {
                     continue;
                 }
                 let window = pf.inflate(aprons.get(i).copied().unwrap_or(0)).intersect(&f.region);
+                let effects = timing::cpu_now();
                 self.sync_fx(device, queue, encoder, doc, f, (f.layer.id, Some(cell)), window, &mut stats)?;
+                stats.fx_ms += timing::cpu_ms(effects);
             }
             let chunks = grid_rects(part, self.chunk);
             stats.chunks += chunks.len();
             work += part.width() as u64 * part.height() as u64 * plan.passes.len() as u64;
             let mut batch = flush.then_some(&mut last_submit);
+            stats.wait_ms += timing::take_wait();
+            let recording = timing::cpu_now();
             self.run_cell(device, queue, encoder, doc.id, &plan, &runs, &paged, cell, &fr, &chunks, checkpoint, &mut stats, sink, &mut batch)?;
+            // A cell's own intermediate submits count as waiting, not recording.
+            let waited = timing::take_wait();
+            stats.wait_ms += waited;
+            stats.cells_ms += (timing::cpu_ms(recording) - waited).max(0.0);
             // The device was lost in a submit inside the cell: issue no more work.
             if let Some(f) = self.fault() {
                 return Err(Unsupported(f.to_string()));
@@ -287,6 +300,7 @@ impl Compositor {
         stats.evicted += self.evict().0;
         self.temps.retain(|(_, used)| frame.saturating_sub(*used) < 240);
         self.evict_patterns();
+        stats.wait_ms += timing::take_wait();
         Ok(stats)
     }
 

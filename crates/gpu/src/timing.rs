@@ -313,3 +313,34 @@ impl GpuTimer {
         self.written += 1;
     }
 }
+
+/// Now, for the CPU-side split of a render's time ([`crate::Stats::plan_ms`] and the rest); `None`
+/// in the browser, which has no `Instant`.
+pub(crate) fn cpu_now() -> Option<std::time::Instant> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Some(std::time::Instant::now())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        None
+    }
+}
+
+/// Milliseconds since `start` ([`cpu_now`]); zero without one.
+pub(crate) fn cpu_ms(start: Option<std::time::Instant>) -> f32 {
+    start.map_or(0.0, |t| t.elapsed().as_secs_f32() * 1000.0)
+}
+
+thread_local! {
+    /// Milliseconds spent in `submit_batch` on this thread since the last [`take_wait`].
+    static WAITED: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+}
+
+pub(crate) fn add_wait(start: Option<std::time::Instant>) {
+    WAITED.with(|w| w.set(w.get() + cpu_ms(start)));
+}
+
+pub(crate) fn take_wait() -> f32 {
+    WAITED.with(|w| w.replace(0.0))
+}
