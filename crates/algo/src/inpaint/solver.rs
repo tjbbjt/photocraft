@@ -1,4 +1,5 @@
-use super::common::{Adapt, Bounds, PAR_MIN_PATCHES, Px, Rng};
+use super::cells::{Cells, Span};
+use super::common::{Adapt, PAR_MIN_PATCHES, Px, Rng};
 use super::par;
 
 /// Most channels whose moments the colour adaptation fits (the rest are copied as they are).
@@ -14,18 +15,15 @@ pub(super) struct Solver<'a> {
     pub(super) px: &'a [Px],
     /// Valid source centres: the whole patch is inside the grid and may be copied from.
     pub(super) valid: Vec<bool>,
-    /// The hole's bounds and the targets' (the hole's grown by the patch radius): nothing outside
-    /// them changes or is matched. The match field, its costs and these per-target tables are
-    /// kept over `tbox`, row-major.
-    pub(super) hole_box: Bounds,
-    pub(super) tbox: Bounds,
-    /// Target centres (the patch overlaps the hole).
-    pub(super) targets: Vec<bool>,
-    /// Per cell of `tbox`: the whole patch is inside the grid and not void (so its distances
-    /// need no bounds checks and its own moments can be kept).
+    /// Target centres (the patch overlaps the hole), within the hole's bounds grown by the patch
+    /// radius: nothing outside them changes or is matched. The match field, its costs and these
+    /// per-target tables hold one entry per target, in the cells' order.
+    pub(super) cells: Cells,
+    /// Per target: the whole patch is inside the grid and not void (so its distances need no
+    /// bounds checks and its own moments can be kept).
     pub(super) full: Vec<bool>,
-    /// With colour adaptation, per cell of `tbox` and channel (at most [`MOM_CH`]): `Σt, Σt²` of
-    /// the patch, for full patches, as of the last [`Solver::costs`].
+    /// With colour adaptation, per target and channel (at most [`MOM_CH`]): `Σt, Σt²` of the
+    /// patch, for full patches, as of the last [`Solver::costs`].
     pub(super) tmom: Vec<[f32; 2]>,
     /// With colour adaptation where it pays: per source centre and channel, `Σs, Σs²` of its
     /// patch (source pixels never change within a level). Empty otherwise.
@@ -72,17 +70,16 @@ impl Solver<'_> {
 
     /// Mark the full target patches (`full`), and keep the source moments where they pay off.
     pub(super) fn prepare(&mut self, keep_source_moments: bool) {
-        let (w, h, r, tb) = (self.w, self.h, self.r as usize, self.tbox);
+        let (w, h, r) = (self.w, self.h, self.r as usize);
         let side = 2 * r + 1;
-        let mut full = vec![false; tb.area()];
+        let cells = &self.cells;
+        let mut full = vec![false; cells.len()];
         let px = self.px;
-        par::chunks_mut(&mut full, tb.width(), tb.area() >= PAR_MIN_PATCHES, |ty, out| {
-            let y = tb.y0 + ty;
+        cells.rows_mut(&mut full, 1, cells.len() >= PAR_MIN_PATCHES, |y, runs, out| {
             if y < r || y + r >= h {
                 return;
             }
-            for (tx, f) in out.iter_mut().enumerate() {
-                let x = tb.x0 + tx;
+            for (x, f) in row_cells(runs).zip(out.iter_mut()) {
                 if x < r || x + r >= w {
                     continue;
                 }
@@ -94,7 +91,7 @@ impl Solver<'_> {
             return;
         }
         let c8 = self.ch.min(MOM_CH);
-        self.tmom = vec![[0.0; 2]; tb.area() * c8];
+        self.tmom = vec![[0.0; 2]; self.cells.len() * c8];
         if !keep_source_moments {
             return;
         }
@@ -114,7 +111,7 @@ impl Solver<'_> {
     }
 
     /// Distance between the target patch at `t` (its pixels inside the grid and not void; `k` its
-    /// index in the `tbox` tables) and the source patch at `s`, per sample; with colour adaptation
+    /// number among the targets) and the source patch at `s`, per sample; with colour adaptation
     /// the source is fitted first.
     #[inline]
     fn dist(&self, t: (i32, i32), k: usize, s: (i32, i32), cutoff: f32) -> f32 {
@@ -216,7 +213,7 @@ impl Solver<'_> {
         n
     }
 
-    /// [`Solver::moments`] of a full target patch (`k` in the `tbox` tables): the target's own
+    /// [`Solver::moments`] of a full target patch (`k` its number among the targets): the target's own
     /// sums kept from [`Solver::costs`], the source's from [`Solver::prepare`] when kept, each
     /// summed in the same order as there.
     pub(super) fn moments_full(&self, k: usize, t: (i32, i32), s: (i32, i32), m: &mut [[f32; 5]]) {
@@ -294,7 +291,7 @@ impl Solver<'_> {
         }
     }
 
-    /// One PatchMatch step at target `t` (`k` in the target box) whose match is `cur`: propagation
+    /// One PatchMatch step at target `t` (`k` its number) whose match is `cur`: propagation
     /// from the matches of the neighbours visited just before it (`left` in its row, `up` in its
     /// column, in this pass's direction `step`), then random search in exponentially shrinking
     /// windows around the best (two numbers from `rng` per window).
@@ -346,15 +343,18 @@ impl Solver<'_> {
 
     /// One PatchMatch pass over all target rows, in bands of the grid's rows: each band is
     /// visited in raster order (backwards on odd passes), propagating within itself, its random
-    /// numbers seeded by its index. `nnf` and `cost` are over the target box. The bands run in
-    /// parallel; when there are fewer of them than threads, each is also swept in wavefronts of
-    /// blocks (a cell depends only on its neighbours before it in its row and its column), which
-    /// visits every cell with the same neighbours and random numbers as the raster order.
+    /// numbers seeded by its index. `nnf` and `cost` are per target. The bands run in parallel;
+    /// when there are fewer of them than threads, each is also swept in wavefronts of blocks (a
+    /// cell depends only on its neighbours before it in its row and its column), which visits
+    /// every cell with the same neighbours and random numbers as the raster order.
+    ///
+    /// A neighbour in the target box that is no target offers the match `(0, 0)`, as it did when
+    /// the field was kept over the whole box; one outside the box (or the band) offers none.
     pub(super) fn patchmatch(&self, nnf: &mut [(i32, i32)], cost: &mut [f32], pass: usize, seed: u64, search_radius: i32) {
         const BAND: usize = 16;
-        let tb = self.tbox;
-        let tw = tb.width();
-        if tw == 0 || tb.height() == 0 || nnf.len() < tb.area() || cost.len() < tb.area() {
+        let cells = &self.cells;
+        let tb = cells.tbox;
+        if tb.width() == 0 || tb.height() == 0 || nnf.len() < cells.len() || cost.len() < cells.len() {
             return;
         }
         let reverse = pass % 2 == 1;
@@ -374,11 +374,12 @@ impl Solver<'_> {
             self.patchmatch_wavefront(nnf, cost, &bands, reverse, &band_seed, search_radius);
             return;
         }
-        let band_fn = |bi: usize, ys: usize, nn: &mut [(i32, i32)], co: &mut [f32]| {
+        let band_fn = |bi: usize, ys: usize, rows: usize, nn: &mut [(i32, i32)], co: &mut [f32]| {
             if self.ctl.cancelled() {
                 return;
             }
-            let rows = nn.len() / tw;
+            // The band's targets are `base..` among all of them.
+            let base = cells.before_row(ys);
             let mut rng = Rng::new(band_seed(bi));
             for ry in 0..rows {
                 if self.ctl.cancelled() {
@@ -386,34 +387,47 @@ impl Solver<'_> {
                 }
                 let ly = if reverse { rows - 1 - ry } else { ry };
                 let y = ys + ly;
-                for rx in 0..tw {
-                    let lx = if reverse { tw - 1 - rx } else { rx };
-                    let li = ly * tw + lx;
-                    let k = (y - tb.y0) * tw + lx;
-                    if !self.targets[k] {
-                        continue;
-                    }
-                    // Neighbours outside the target box hold no match: nothing to try.
-                    let nx = lx as i32 - step;
-                    let left = (nx >= 0 && (nx as usize) < tw).then(|| nn[ly * tw + nx as usize]);
-                    let nly = ly as i32 - step;
-                    let up = (nly >= 0 && (nly as usize) < rows).then(|| nn[nly as usize * tw + lx]);
-                    let t = ((tb.x0 + lx) as i32, y as i32);
+                // The row before this one in the pass's direction, when it is in the band.
+                let nly = ly as i32 - step;
+                let up_row = (nly >= 0 && (nly as usize) < rows).then(|| ys + nly as usize);
+                let mut visit = |x: usize, k: usize| {
+                    let left = self.offer(x as i32 - step, y, |j| nn[j - base]);
+                    let up = up_row.and_then(|uy| self.offer(x as i32, uy, |j| nn[j - base]));
+                    let li = k - base;
+                    let t = (x as i32, y as i32);
                     (nn[li], co[li]) = self.pm_step(t, k, (nn[li], co[li]), left, up, step, &mut rng, search_radius);
+                };
+                let runs = cells.row(y);
+                if reverse {
+                    runs.iter().rev().for_each(|s| (s.x0..s.x1).rev().for_each(|x| visit(x, s.at(x))));
+                } else {
+                    runs.iter().for_each(|s| (s.x0..s.x1).for_each(|x| visit(x, s.at(x))));
                 }
             }
         };
-        // The target box's rows, band by band.
+        // The targets, band by band.
         let mut parts = Vec::with_capacity(bands.len());
-        let (mut nn_rest, mut co_rest) = (&mut nnf[..tb.area()], &mut cost[..tb.area()]);
+        let (mut nn_rest, mut co_rest) = (&mut nnf[..cells.len()], &mut cost[..cells.len()]);
         for &(bi, ys, rows) in &bands {
-            let (nn, nr) = std::mem::take(&mut nn_rest).split_at_mut(rows * tw);
-            let (co, cr) = std::mem::take(&mut co_rest).split_at_mut(rows * tw);
-            parts.push((bi, ys, nn, co));
+            let n = cells.before_row(ys + rows) - cells.before_row(ys);
+            let (nn, nr) = std::mem::take(&mut nn_rest).split_at_mut(n);
+            let (co, cr) = std::mem::take(&mut co_rest).split_at_mut(n);
+            parts.push((bi, ys, rows, nn, co));
             (nn_rest, co_rest) = (nr, cr);
         }
         let par = tb.area() >= PAR_MIN_PATCHES && parts.len() > 1;
-        par::each(parts, par, |(bi, ys, nn, co)| band_fn(bi, ys, nn, co));
+        par::each(parts, par, |(bi, ys, rows, nn, co)| band_fn(bi, ys, rows, nn, co));
+    }
+
+    /// The match a neighbour at `(x, y)` offers PatchMatch's propagation, `field(k)` giving the
+    /// match of target `k`: none outside the target box, `(0, 0)` where it is no target.
+    #[inline]
+    fn offer(&self, x: i32, y: usize, field: impl Fn(usize) -> (i32, i32)) -> Option<(i32, i32)> {
+        let tb = self.cells.tbox;
+        if x < tb.x0 as i32 || x >= tb.x1 as i32 {
+            return None;
+        }
+        Some(self.cells.index(x as usize, y).map_or((0, 0), field))
     }
 
     /// [`Solver::patchmatch`] swept in wavefronts: the cells of each band in blocks of a row, a
@@ -431,7 +445,8 @@ impl Solver<'_> {
     ) {
         use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
-        let tb = self.tbox;
+        let cells = &self.cells;
+        let tb = cells.tbox;
         let tw = tb.width();
         let step: i32 = if reverse { -1 } else { 1 };
         let pack = |(x, y): (i32, i32)| (u64::from(x as u32) << 32) | u64::from(y as u32);
@@ -443,13 +458,6 @@ impl Solver<'_> {
             draws += 2;
             rad /= 2;
         }
-        // Targets before each column of each row of the box.
-        let mut before = vec![0u32; tb.height() * (tw + 1)];
-        for (ry, row) in before.chunks_mut(tw + 1).enumerate() {
-            for lx in 0..tw {
-                row[lx + 1] = row[lx] + u32::from(self.targets[ry * tw + lx]);
-            }
-        }
         // Targets visited before each of a band's rows (in the pass's order).
         let row_base: Vec<Vec<u64>> = bands
             .iter()
@@ -458,40 +466,36 @@ impl Solver<'_> {
                 let mut n = 0u64;
                 for pr in 0..rows {
                     base.push(n);
-                    let ly = if reverse { rows - 1 - pr } else { pr };
-                    n += u64::from(before[(ys + ly - tb.y0) * (tw + 1) + tw]);
+                    let y = ys + if reverse { rows - 1 - pr } else { pr };
+                    n += (cells.before_row(y + 1) - cells.before_row(y)) as u64;
                 }
                 base
             })
             .collect();
         let block = (tw / 8).clamp(4, 32);
         let blocks = tw.div_ceil(block);
-        let nn: Vec<AtomicU64> = nnf[..tb.area()].iter().map(|m| AtomicU64::new(pack(*m))).collect();
-        let co: Vec<AtomicU32> = cost[..tb.area()].iter().map(|c| AtomicU32::new(c.to_bits())).collect();
+        let nn: Vec<AtomicU64> = nnf[..cells.len()].iter().map(|m| AtomicU64::new(pack(*m))).collect();
+        let co: Vec<AtomicU32> = cost[..cells.len()].iter().map(|c| AtomicU32::new(c.to_bits())).collect();
+        let field = |k: usize| unpack(nn[k].load(Relaxed));
         let sweep = |(j, pr, b): (usize, usize, usize)| {
             let (bi, ys, rows) = bands[j];
             let ly = if reverse { rows - 1 - pr } else { pr };
             let y = ys + ly;
-            let ry = y - tb.y0;
             let (pc0, pc1) = (b * block, ((b + 1) * block).min(tw));
             // The targets visited before this block, in raster order.
             let first = if reverse { tw - 1 - pc0 } else { pc0 };
-            let row = &before[ry * (tw + 1)..(ry + 1) * (tw + 1)];
-            let in_row = if reverse { row[tw] - row[first + 1] } else { row[first] };
+            let in_row = cells.in_row(y, tb.x0 + first, !reverse);
             let mut rng = Rng::new(band_seed(bi));
-            rng.skip((row_base[j][pr] + u64::from(in_row)) * draws);
+            rng.skip((row_base[j][pr] + in_row as u64) * draws);
+            let nly = ly as i32 - step;
+            let up_row = (nly >= 0 && (nly as usize) < rows).then(|| ys + nly as usize);
             for pc in pc0..pc1 {
-                let lx = if reverse { tw - 1 - pc } else { pc };
-                let k = ry * tw + lx;
-                if !self.targets[k] {
-                    continue;
-                }
-                let nx = lx as i32 - step;
-                let left = (nx >= 0 && (nx as usize) < tw).then(|| unpack(nn[ry * tw + nx as usize].load(Relaxed)));
-                let nly = ly as i32 - step;
-                let up = (nly >= 0 && (nly as usize) < rows).then(|| unpack(nn[(ys + nly as usize - tb.y0) * tw + lx].load(Relaxed)));
+                let x = tb.x0 + if reverse { tw - 1 - pc } else { pc };
+                let Some(k) = cells.index(x, y) else { continue };
+                let left = self.offer(x as i32 - step, y, field);
+                let up = up_row.and_then(|uy| self.offer(x as i32, uy, field));
                 let cur = (unpack(nn[k].load(Relaxed)), f32::from_bits(co[k].load(Relaxed)));
-                let t = ((tb.x0 + lx) as i32, y as i32);
+                let t = (x as i32, y as i32);
                 let (m, c) = self.pm_step(t, k, cur, left, up, step, &mut rng, search_radius);
                 nn[k].store(pack(m), Relaxed);
                 co[k].store(c.to_bits(), Relaxed);
@@ -522,37 +526,35 @@ impl Solver<'_> {
     /// Recompute every target's match cost (hole pixels change between iterations), and with
     /// colour adaptation the full target patches' own moments.
     pub(super) fn costs(&mut self, nnf: &[(i32, i32)], cost: &mut [f32]) -> Result<(), photocraft_raster::Cancelled> {
-        let (w, ch, r, tb) = (self.w, self.ch, self.r as usize, self.tbox);
-        let par = tb.area() >= PAR_MIN_PATCHES;
+        let (w, ch, r) = (self.w, self.ch, self.r as usize);
+        let par = self.cells.len() >= PAR_MIN_PATCHES;
         self.ctl.check()?;
         if !self.adapt.is_none() {
             let c8 = ch.min(MOM_CH);
             let side = 2 * r + 1;
             let mut tmom = std::mem::take(&mut self.tmom);
             let (img, full, ctl) = (&*self.img, &self.full, &self.ctl);
-            par::chunks_mut(&mut tmom, tb.width() * c8, par, |ty, out| {
+            self.cells.rows_mut(&mut tmom, c8, par, |y, runs, out| {
                 if ctl.cancelled() {
                     return;
                 }
-                for tx in 0..tb.width() {
-                    if full[ty * tb.width() + tx] {
-                        patch_moments(img, w, ch, c8, side, tb.x0 + tx - r, tb.y0 + ty - r, &mut out[tx * c8..(tx + 1) * c8]);
+                let base = runs[0].k;
+                for (i, x) in row_cells(runs).enumerate() {
+                    if full[base + i] {
+                        patch_moments(img, w, ch, c8, side, x - r, y - r, &mut out[i * c8..(i + 1) * c8]);
                     }
                 }
             });
             self.tmom = tmom;
         }
         let this = &*self;
-        par::chunks_mut(cost, tb.width(), par, |ty, co| {
+        this.cells.rows_mut(cost, 1, par, |y, runs, co| {
             if this.ctl.cancelled() {
                 return;
             }
-            let y = tb.y0 + ty;
-            for (tx, c) in co.iter_mut().enumerate() {
-                let k = ty * tb.width() + tx;
-                if this.targets[k] {
-                    *c = this.dist(((tb.x0 + tx) as i32, y as i32), k, nnf[k], f32::INFINITY);
-                }
+            let base = runs[0].k;
+            for ((i, x), c) in row_cells(runs).enumerate().zip(co.iter_mut()) {
+                *c = this.dist((x as i32, y as i32), base + i, nnf[base + i], f32::INFINITY);
             }
         });
         self.ctl.check()
@@ -561,16 +563,16 @@ impl Solver<'_> {
     /// Re-estimate hole pixels by a similarity-weighted vote of all overlapping patch matches
     /// (each copy adjusted by its gain and bias).
     pub(super) fn vote(&mut self, nnf: &[(i32, i32)], cost: &[f32]) {
+        const CHUNK: usize = 1 << 12;
         let (w, h, ch, r) = (self.w, self.h, self.ch, self.r);
-        let (tb, hb) = (self.tbox, self.hole_box);
         // A cancelled solve is thrown away.
         if self.ctl.cancelled() {
             return;
         }
-        let used = |k: usize| self.targets[k] && cost[k].is_finite();
+        let n = self.cells.len();
+        let used = |k: usize| cost[k].is_finite();
         // σ² from the 75th percentile of match costs (Wexler et al. use a robust scale like this).
-        let cs: Vec<f32> = (0..tb.area()).filter(|&k| used(k)).map(|k| cost[k]).collect();
-        let mut cs = cs;
+        let mut cs: Vec<f32> = (0..n).filter(|&k| used(k)).map(|k| cost[k]).collect();
         let sigma2 = if cs.is_empty() {
             1.0
         } else {
@@ -582,14 +584,14 @@ impl Solver<'_> {
         // Each target's weight and photometric transform (computed once, used by every pixel it
         // covers).
         let adapted = !self.adapt.is_none();
-        let par = tb.area() >= PAR_MIN_PATCHES;
+        let par = n >= PAR_MIN_PATCHES;
         // A weight (zero for a target that doesn't vote) and its match's centre (as a pixel
         // index) per target.
-        let mut wt = vec![0.0f32; tb.area()];
-        let mut src = vec![0isize; tb.area()];
-        par::chunks2_mut(&mut wt, tb.width(), &mut src, tb.width(), par, |ty, wrow, srow| {
-            for (tx, (o, sc)) in wrow.iter_mut().zip(srow.iter_mut()).enumerate() {
-                let k = ty * tb.width() + tx;
+        let mut wt = vec![0.0f32; n];
+        let mut src = vec![0isize; n];
+        par::chunks2_mut(&mut wt, CHUNK, &mut src, CHUNK, par, |i, wrow, srow| {
+            for (j, (o, sc)) in wrow.iter_mut().zip(srow.iter_mut()).enumerate() {
+                let k = i * CHUNK + j;
                 if used(k) {
                     *o = (-cost[k] / (2.0 * sigma2)).exp().max(1e-8);
                     *sc = nnf[k].1 as isize * w as isize + nnf[k].0 as isize;
@@ -598,69 +600,73 @@ impl Solver<'_> {
         });
         let mut gb: Vec<(f32, f32)> = Vec::new();
         if adapted {
-            gb = vec![(1.0f32, 0.0f32); tb.area() * ch];
+            gb = vec![(1.0f32, 0.0f32); n * ch];
             let this = &*self;
-            par::chunks_mut(&mut gb, tb.width() * ch, par, |ty, out| {
+            this.cells.rows_mut(&mut gb, ch, par, |y, runs, out| {
                 if this.ctl.cancelled() {
                     return;
                 }
-                let y = tb.y0 + ty;
-                for tx in 0..tb.width() {
-                    let k = ty * tb.width() + tx;
-                    if used(k) {
-                        this.transform(((tb.x0 + tx) as i32, y as i32), k, nnf[k], &mut out[tx * ch..(tx + 1) * ch]);
+                let base = runs[0].k;
+                for (i, x) in row_cells(runs).enumerate() {
+                    if used(base + i) {
+                        this.transform((x as i32, y as i32), base + i, nnf[base + i], &mut out[i * ch..(i + 1) * ch]);
                     }
                 }
             });
         }
-        // The vote, into a buffer over the hole's bounds (every pixel reads the old pixels).
-        let votes = Votes { w, h, ch, r: r as usize, tbox: tb, img: &*self.img, wt: &wt, src: &src, gb: &gb };
-        let (px, ctl) = (self.px, &self.ctl);
-        let mut out = vec![0.0f32; hb.area() * ch];
-        let mut got = vec![false; hb.area()];
-        let row = |yy: usize, orow: &mut [f32], grow: &mut [bool]| {
-            if ctl.cancelled() {
-                return;
-            }
-            let y = hb.y0 + yy;
-            for x in hb.x0..hb.x1 {
-                if px[y * w + x] != Px::Hole {
-                    continue;
+        // The vote of each target that is a hole pixel (every pixel reads the old pixels): its
+        // channels, then 1 when any patch voted, else 0.
+        let per = ch + 1;
+        let mut out = vec![0.0f32; n * per];
+        {
+            let votes = Votes { w, h, ch, r: r as usize, cells: &self.cells, img: &*self.img, wt: &wt, src: &src, gb: &gb };
+            let (px, ctl) = (self.px, &self.ctl);
+            self.cells.rows_mut(&mut out, per, par, |y, runs, orow| {
+                if ctl.cancelled() {
+                    return;
                 }
-                let o = (x - hb.x0) * ch;
-                let dst = &mut orow[o..o + ch];
-                grow[x - hb.x0] = match (ch, adapted) {
-                    (1, false) => votes.pixel::<1, false>(x, y, dst),
-                    (3, false) => votes.pixel::<3, false>(x, y, dst),
-                    (4, false) => votes.pixel::<4, false>(x, y, dst),
-                    (1, true) => votes.pixel::<1, true>(x, y, dst),
-                    (3, true) => votes.pixel::<3, true>(x, y, dst),
-                    (4, true) => votes.pixel::<4, true>(x, y, dst),
-                    _ => votes.pixel_any(x, y, adapted, dst),
-                };
-            }
-        };
-        par::chunks2_mut(&mut out, hb.width() * ch, &mut got, hb.width(), hb.area() >= PAR_MIN_PATCHES, row);
-        for yy in 0..hb.height() {
-            for xx in 0..hb.width() {
-                if got[yy * hb.width() + xx] {
-                    let (d, s) = (((hb.y0 + yy) * w + hb.x0 + xx) * ch, (yy * hb.width() + xx) * ch);
-                    self.img[d..d + ch].copy_from_slice(&out[s..s + ch]);
+                for (i, x) in row_cells(runs).enumerate() {
+                    if px[y * w + x] != Px::Hole {
+                        continue;
+                    }
+                    let (dst, got) = orow[i * per..(i + 1) * per].split_at_mut(ch);
+                    let voted = match (ch, adapted) {
+                        (1, false) => votes.pixel::<1, false>(x, y, dst),
+                        (3, false) => votes.pixel::<3, false>(x, y, dst),
+                        (4, false) => votes.pixel::<4, false>(x, y, dst),
+                        (1, true) => votes.pixel::<1, true>(x, y, dst),
+                        (3, true) => votes.pixel::<3, true>(x, y, dst),
+                        (4, true) => votes.pixel::<4, true>(x, y, dst),
+                        _ => votes.pixel_any(x, y, adapted, dst),
+                    };
+                    got[0] = if voted { 1.0 } else { 0.0 };
                 }
+            });
+        }
+        drop((wt, src, gb));
+        for (k, x, y) in self.cells.iter() {
+            let o = &out[k * per..(k + 1) * per];
+            if o[ch] != 0.0 {
+                let d = (y * w + x) * ch;
+                self.img[d..d + ch].copy_from_slice(&o[..ch]);
             }
         }
     }
 }
 
-/// What [`Solver::vote`] votes with: per target (over the target box) its weight (zero when it
-/// doesn't vote), its match's centre as a pixel index, and with colour adaptation its gain and
-/// bias per channel.
+/// The columns of a row's runs, left to right.
+fn row_cells(runs: &[Span]) -> impl Iterator<Item = usize> + '_ {
+    runs.iter().flat_map(|s| s.x0..s.x1)
+}
+
+/// What [`Solver::vote`] votes with: per target its weight (zero when it doesn't vote), its
+/// match's centre as a pixel index, and with colour adaptation its gain and bias per channel.
 struct Votes<'a> {
     w: usize,
     h: usize,
     ch: usize,
     r: usize,
-    tbox: Bounds,
+    cells: &'a Cells,
     img: &'a [f32],
     wt: &'a [f32],
     src: &'a [isize],
@@ -668,22 +674,35 @@ struct Votes<'a> {
 }
 
 impl Votes<'_> {
+    /// `f(target, column)` for the targets of row `ty` in columns `xa..=xb`, left to right.
+    #[inline(always)]
+    fn each_in(&self, ty: usize, xa: usize, xb: usize, mut f: impl FnMut(usize, usize)) {
+        let runs = self.cells.row(ty);
+        let start = runs.partition_point(|s| s.x1 <= xa);
+        for s in &runs[start..] {
+            if s.x0 > xb {
+                break;
+            }
+            for tx in s.x0.max(xa)..s.x1.min(xb + 1) {
+                f(s.at(tx), tx);
+            }
+        }
+    }
+
     /// Hole pixel `(x, y)`'s vote into `out` (`CH` channels): the weighted mean of what the
     /// matches of the patches covering it put there, summed patch by patch in raster order of
     /// their centres. False when no patch votes.
     #[inline(always)]
     fn pixel<const CH: usize, const ADAPT: bool>(&self, x: usize, y: usize, out: &mut [f32]) -> bool {
-        let (w, r, tb) = (self.w, self.r, self.tbox);
+        let (w, r) = (self.w, self.r);
         let mut acc = [0.0f32; CH];
         let mut wsum = 0.0f32;
         for ty in y.saturating_sub(r)..=(y + r).min(self.h - 1) {
             let dy = ty as isize - y as isize;
-            let krow = (ty - tb.y0) * tb.width();
-            for tx in x.saturating_sub(r)..=(x + r).min(w - 1) {
-                let k = krow + tx - tb.x0;
+            self.each_in(ty, x.saturating_sub(r), (x + r).min(w - 1), |k, tx| {
                 let wt = self.wt[k];
                 if wt == 0.0 {
-                    continue;
+                    return;
                 }
                 // The pixel of the match's patch that lands here.
                 let si = (self.src[k] - dy * w as isize - (tx as isize - x as isize)) as usize * CH;
@@ -698,7 +717,7 @@ impl Votes<'_> {
                     acc[c] += v * wt;
                 }
                 wsum += wt;
-            }
+            });
         }
         if wsum > 0.0 {
             for (d, a) in out.iter_mut().zip(&acc) {
@@ -711,17 +730,15 @@ impl Votes<'_> {
 
     /// [`Votes::pixel`] for any number of channels.
     fn pixel_any(&self, x: usize, y: usize, adapted: bool, out: &mut [f32]) -> bool {
-        let (w, r, tb, ch) = (self.w, self.r, self.tbox, self.ch);
+        let (w, r, ch) = (self.w, self.r, self.ch);
         let mut acc = vec![0.0f32; ch];
         let mut wsum = 0.0f32;
         for ty in y.saturating_sub(r)..=(y + r).min(self.h - 1) {
             let dy = ty as isize - y as isize;
-            let krow = (ty - tb.y0) * tb.width();
-            for tx in x.saturating_sub(r)..=(x + r).min(w - 1) {
-                let k = krow + tx - tb.x0;
+            self.each_in(ty, x.saturating_sub(r), (x + r).min(w - 1), |k, tx| {
                 let wt = self.wt[k];
                 if wt == 0.0 {
-                    continue;
+                    return;
                 }
                 let si = (self.src[k] - dy * w as isize - (tx as isize - x as isize)) as usize * ch;
                 for (c, a) in acc.iter_mut().enumerate() {
@@ -734,7 +751,7 @@ impl Votes<'_> {
                     *a += v * wt;
                 }
                 wsum += wt;
-            }
+            });
         }
         if wsum > 0.0 {
             for (d, a) in out.iter_mut().zip(&acc) {

@@ -403,6 +403,7 @@ fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &
         move |ctx| {
             use rayon::prelude::*;
             ctx.progress(0.0, label);
+            let started = web_time::Instant::now();
             let cancel = || ctx.cancelled();
             let plan = content_aware_plan_with(&doc, id, &p, cmd, &photocraft_raster::Interrupt::cancel_only(&cancel))?;
             let CafPlan { layer, rect, fmt, img, layer_px, cover, hole, source, opts, output, .. } = plan;
@@ -415,13 +416,16 @@ fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &
             }
             let (w, h) = (rect.width() as usize, rect.height() as usize);
             let n = fmt.channels();
-            // The fill changes only the fill area: keep the layer's pixels and the coverage over
-            // its bounds for the apply step, and fill the sampled pixels themselves.
+            // The fill changes only the fill area: keep the selected pixels (with their coverage)
+            // and their original values for the apply step, not a copy of their whole bounds (a
+            // fill area along an image's borders has bounds as large as the image), and fill the
+            // sampled pixels themselves.
             let (bx0, by0, bx1, by1) = mask_bounds(w, h, &hole);
+            let selected: Vec<(usize, f32)> =
+                (by0..by1).flat_map(|y| (bx0..bx1).map(move |x| y * w + x)).filter(|&i| cover[i] > 0.0).map(|i| (i, cover[i])).collect();
+            drop(cover);
             let own = layer_px.as_deref().unwrap_or(&img);
-            let original: Vec<f32> = (by0..by1).flat_map(|y| own[(y * w + bx0) * n..(y * w + bx1) * n].iter().copied()).collect();
-            let cover: Vec<f32> = (by0..by1).flat_map(|y| cover[y * w + bx0..y * w + bx1].iter().copied()).collect();
-            let n_hole = cover.iter().filter(|c| **c > 0.0).count();
+            let original: Vec<f32> = selected.iter().flat_map(|&(i, _)| own[i * n..(i + 1) * n].iter().copied()).collect();
             ctx.check()?;
             let mut filled = ctx.stage(0.05, 1.0, label, |ctl| fill_owned(w, h, n, img, &hole, &source, &opts, ctl)).map_err(|_| EngineError::Cancelled)?;
             // Sampled from all layers: outside the fill area the window keeps the layer's pixels.
@@ -432,37 +436,23 @@ fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &
                     }
                 });
             }
-            Ok((layer, rect, fmt, output, FilledWindow { filled, bounds: (bx0, by0, bx1, by1), original, cover, n_hole }))
+            let ms = started.elapsed().as_millis() as u64;
+            Ok((layer, rect, fmt, output, FilledWindow { filled, selected, original, bounds: (bx0, by0, bx1, by1), ms }))
         },
         move |s, (layer, rect, fmt, output, done)| apply_content_aware_fill(s, label, layer, &output, fmt, rect, done),
     )
 }
 
 /// A Content-Aware Fill's result for its apply step: the filled window (the same as the
-/// original outside the selected pixels) and, over the bounds of the selected pixels (in window
-/// coordinates), the original pixels and the selection's coverage.
+/// original outside the selected pixels), the selected pixels (window index and coverage, in
+/// raster order) with their original values, the bounds of the selected pixels (in window
+/// coordinates) and how long the fill took.
 struct FilledWindow {
     filled: Vec<f32>,
-    bounds: (usize, usize, usize, usize),
+    selected: Vec<(usize, f32)>,
     original: Vec<f32>,
-    cover: Vec<f32>,
-    n_hole: usize,
-}
-
-/// `f(window index, index over the bounds, coverage)` for each selected pixel of a
-/// [`FilledWindow`] (`w` wide).
-fn each_selected(w: usize, (bx0, by0, bx1, by1): (usize, usize, usize, usize), cover: &[f32], mut f: impl FnMut(usize, usize, f32)) {
-    let bw = bx1.saturating_sub(bx0);
-    for y in by0..by1 {
-        for x in bx0..bx1 {
-            let k = (y - by0) * bw + (x - bx0);
-            if let Some(&c) = cover.get(k)
-                && c > 0.0
-            {
-                f(y * w + x, k, c);
-            }
-        }
-    }
+    bounds: (usize, usize, usize, usize),
+    ms: u64,
 }
 
 /// Bounds `(x0, y0, x1, y1)` of the set cells of a `w × h` mask (all zero when there are none).
@@ -487,7 +477,8 @@ fn mask_bounds(w: usize, h: usize, m: &[bool]) -> (usize, usize, usize, usize) {
 fn apply_content_aware_fill(s: &mut Session, label: &str, id: LayerId, output: &str, fmt: PixelFormat, window: Rect, done: FilledWindow) -> Result<Value> {
     let n = fmt.channels();
     let (w, h) = (window.width() as usize, window.height() as usize);
-    let FilledWindow { mut filled, bounds, original, cover, n_hole } = done;
+    let FilledWindow { mut filled, selected, original, bounds: (bx0, by0, bx1, by1), ms } = done;
+    let n_hole = selected.len();
     let layer = s.edit(label, |doc, active| {
         let target = match output {
             "new" => {
@@ -497,12 +488,12 @@ fn apply_content_aware_fill(s: &mut Session, label: &str, id: LayerId, output: &
                 let lf = l.surface().map(|s| s.format()).unwrap_or(fmt);
                 let ln = lf.channels();
                 px.resize(w * h * ln, 0.0);
-                each_selected(w, bounds, &cover, |i, _, c| {
+                for &(i, c) in &selected {
                     let rgba = to_rgba(&fmt, &filled[i * n..(i + 1) * n]);
                     let mut enc = [0.0f32; 8];
                     from_rgba_into(&lf, [rgba[0], rgba[1], rgba[2], rgba[3] * c], &mut enc);
                     px[i * ln..(i + 1) * ln].copy_from_slice(&enc[..ln]);
-                });
+                }
                 if let Some(s) = l.surface_mut() {
                     s.write_region(window, &px);
                     s.prune();
@@ -522,14 +513,20 @@ fn apply_content_aware_fill(s: &mut Session, label: &str, id: LayerId, output: &
         };
         let surf = writable_surface(doc, target)?;
         // The fill blended in by the coverage (elsewhere it is the original).
-        each_selected(w, bounds, &cover, |i, k, c| {
+        for (k, &(i, c)) in selected.iter().enumerate() {
             for ch in 0..n {
                 let (j, o) = (i * n + ch, k * n + ch);
                 filled[j] = original[o] + (filled[j] - original[o]) * c;
             }
-        });
+        }
         surf.write_region(window, &filled);
         Ok(target)
     })?;
-    Ok(json!({"layer": layer.0, "filled": n_hole, "window": [window.x0, window.y0, window.width(), window.height()]}))
+    Ok(json!({
+        "layer": layer.0,
+        "filled": n_hole,
+        "window": [window.x0, window.y0, window.width(), window.height()],
+        "fillBounds": [bx0, by0, bx1.saturating_sub(bx0), by1.saturating_sub(by0)],
+        "ms": ms,
+    }))
 }

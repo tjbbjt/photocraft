@@ -936,3 +936,35 @@ fn tool_preset_import_is_validated_before_mutation_and_accepts_old_files() {
     let result = s.execute("edit.presets.exportImportPresets", json!({"action":"import", "data":{"format":PRESET_FORMAT, "version":1}})).unwrap();
     assert_eq!(result["tools"], 0);
 }
+
+/// A fill area along all four borders (a panorama's empty edges) has bounds as large as the
+/// canvas: only the ring changes, the middle keeps its pixels, and the result names the bounds.
+#[test]
+fn content_aware_fill_of_a_border_ring_changes_only_the_ring() {
+    let mut s = blob_session(8);
+    s.execute("select.all", json!({})).unwrap();
+    s.execute("select.rect", json!({"x": 4, "y": 4, "width": 56, "height": 40, "mode": "subtract"})).unwrap();
+    let id = s.active().unwrap().active_layer.unwrap();
+    let read = |s: &Session| s.active().unwrap().doc.layer(id).unwrap().surface().unwrap().read_region(Rect::new(0, 0, 64, 48));
+    let before = read(&s);
+    let result = s.execute("edit.contentAwareFill", json!({"colorAdaptation": "none"})).unwrap();
+    assert_eq!(result["filled"], 64 * 48 - 56 * 40);
+    assert_eq!(result["fillBounds"], json!([0, 0, 64, 48]));
+    assert!(result["ms"].is_u64());
+    let after = read(&s);
+    let n = before.len() / (64 * 48);
+    let (mut kept, mut changed) = (true, 0);
+    for y in 0..48 {
+        for x in 0..64 {
+            let i = (y * 64 + x) * n;
+            let same = before[i..i + n] == after[i..i + n];
+            if (4..60).contains(&x) && (4..44).contains(&y) {
+                kept &= same;
+            } else {
+                changed += usize::from(!same);
+            }
+        }
+    }
+    assert!(kept, "the middle keeps its pixels");
+    assert!(changed > 0, "the ring is filled");
+}

@@ -51,11 +51,13 @@ use crate::poisson::membrane_fill;
 mod proximity_integral;
 use proximity_integral::HoleIntegral;
 
+mod cells;
 mod common;
 mod solver;
 mod sources;
 mod synthesis;
 
+use cells::Cells;
 #[cfg(test)]
 use common::Bounds;
 pub(crate) use common::Rng;
@@ -65,7 +67,7 @@ use solver::Solver;
 pub(crate) use solver::fit;
 #[cfg(test)]
 use solver::least_sum;
-use sources::{Coarser, Sources, THIN_RATIO, downsample, hole_bounds, hole_thickness, peel_affordable, targets_around, valid_sources, window_count};
+use sources::{Coarser, Sources, THIN_RATIO, downsample, hole_bounds, hole_thickness, peel_affordable, valid_sources, window_count};
 #[cfg(test)]
 use sources::{hole_bbox, integral};
 use synthesis::onion_peel;
@@ -193,7 +195,7 @@ fn complete_cow<'a>(
         }
         // The level's own pixels to fill (at level 0 the caller's, or a copy made in parallel).
         let mut limg = into_owned_pixels(limg);
-        let targets = targets_around(lw, r, &lpx, hb, tb);
+        let cells = Cells::around(lw, r, &lpx, hb, tb);
         ctl.check()?;
         // Initialise the hole: at the coarsest level peeled from its edge inwards (or a membrane
         // where nothing can be copied), else the coarser level's pixels, refined below by a vote of
@@ -209,11 +211,11 @@ fn complete_cow<'a>(
             None => fill_hole_with_membrane(&mut limg, &lpx, (lw, lh, ch), r, thin),
         }
         if sources.len() == 0 {
-            prev = Some(Coarser { w: lw, h: lh, img: limg, field: Vec::new(), tbox: tb });
+            prev = Some(Coarser { w: lw, h: lh, img: limg, field: Vec::new(), cells });
             continue;
         }
         let refine_only = li + 1 < nlev && exts[li] > p.refine_extent;
-        let n_targets = targets.iter().filter(|t| **t).count();
+        let n_targets = cells.len();
         // Source moments are worth keeping when there are few sources for the matches tried.
         let keep_source_moments = lw * lh <= SOURCE_MOMENTS_MAX && sources.len() <= n_targets.saturating_mul(if refine_only { 4 } else { 64 });
         let mut solver = Solver {
@@ -224,9 +226,7 @@ fn complete_cow<'a>(
             img: &mut limg,
             px: &lpx,
             valid,
-            targets,
-            hole_box: hb,
-            tbox: tb,
+            cells,
             full: Vec::new(),
             tmom: Vec::new(),
             smom: Vec::new(),
@@ -238,10 +238,10 @@ fn complete_cow<'a>(
         // NNF init: the coarser level's matches scaled up where they land on a valid source,
         // random otherwise.
         let mut rng = Rng::new(p.seed ^ (li as u64) << 20);
-        let (mut nnf, upsampled) = seed_matches(&solver, coarser.as_ref(), &sources, &mut rng, lw, tb, ctl)?;
+        let (mut nnf, upsampled) = seed_matches(&solver, coarser.as_ref(), &sources, &mut rng, lw, ctl)?;
         // The coarser level has given all it had.
         drop(coarser);
-        let mut cost = vec![f32::INFINITY; tb.area()];
+        let mut cost = vec![f32::INFINITY; n_targets];
         // A finer level starts from the coarse matches voted with its own (sharp) pixels.
         if upsampled {
             solver.costs(&nnf, &mut cost)?;
@@ -278,13 +278,14 @@ fn complete_cow<'a>(
         }
         // A vote that saw the cancellation stopped part-way: never hand its pixels on.
         ctl.check()?;
-        // Keep the match field (unmatched cells marked) for the next level (none after the last).
-        let field: Vec<(i32, i32)> =
-            if li == 0 { Vec::new() } else { nnf.iter().zip(&solver.targets).map(|(n, t)| if *t { *n } else { (i32::MIN, i32::MIN) }).collect() };
+        // Keep the match field for the next level (none after the last).
+        let cells = solver.cells;
+        drop(cost);
+        let field = if li == 0 { Vec::new() } else { nnf };
         // Finer levels cost ~4× the previous one: weight progress by pixel count.
         done_px += lw * lh;
         ctl.progress(done_px as f32 / total_px.max(1) as f32);
-        prev = Some(Coarser { w: lw, h: lh, img: limg, field, tbox: tb });
+        prev = Some(Coarser { w: lw, h: lh, img: limg, field, cells });
     }
     Ok(prev.map(|c| c.img).ok_or(Cow::Owned(Vec::new())))
 }
@@ -399,24 +400,21 @@ fn seed_matches(
     sources: &Sources,
     rng: &mut Rng,
     lw: usize,
-    tb: common::Bounds,
     ctl: &photocraft_raster::Interrupt,
 ) -> Result<(Vec<(i32, i32)>, bool), photocraft_raster::Cancelled> {
-    let tw = tb.width();
-    let mut nnf = vec![(0i32, 0i32); tb.area()];
+    let cells = &solver.cells;
+    let mut nnf = vec![(0i32, 0i32); cells.len()];
     let mut upsampled = false;
-    for y in tb.y0..tb.y1 {
+    for y in cells.tbox.y0..cells.tbox.y1 {
         if y % 32 == 0 {
             ctl.check()?;
         }
-        for x in tb.x0..tb.x1 {
-            let k = (y - tb.y0) * tw + (x - tb.x0);
-            if !solver.targets[k] {
-                continue;
+        for s in cells.row(y) {
+            for x in s.x0..s.x1 {
+                let cand = coarser.filter(|c| !c.field.is_empty()).and_then(|c| upscaled_match(solver, c, x, y));
+                upsampled |= cand.is_some();
+                nnf[s.at(x)] = cand.unwrap_or_else(|| sources.nth((rng.next() % sources.len() as u64) as usize, &solver.valid, lw));
             }
-            let cand = coarser.filter(|c| !c.field.is_empty()).and_then(|c| upscaled_match(solver, c, x, y));
-            upsampled |= cand.is_some();
-            nnf[k] = cand.unwrap_or_else(|| sources.nth((rng.next() % sources.len() as u64) as usize, &solver.valid, lw));
         }
     }
     Ok((nnf, upsampled))
