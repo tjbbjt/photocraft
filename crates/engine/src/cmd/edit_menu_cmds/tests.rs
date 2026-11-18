@@ -968,3 +968,55 @@ fn content_aware_fill_of_a_border_ring_changes_only_the_ring() {
     assert!(kept, "the middle keeps its pixels");
     assert!(changed > 0, "the ring is filled");
 }
+
+/// A model's fill guides the fill (`detail`): the hole takes the guide's layout, red where it says
+/// red and blue where it says blue, in pixels copied from the picture; without `detail` it takes
+/// the guide as it is. Nothing outside the hole changes. (No model runs: the guide is given.)
+#[test]
+fn a_model_guide_lays_out_the_fill() {
+    let (w, h) = (96usize, 64usize);
+    let fmt = PixelFormat::RGBA32F;
+    // Top half red, bottom half blue, with a little texture; the hole a band down the middle.
+    let img: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            let n = ((x * 7 + y * 13) % 5) as f32 * 0.02;
+            if y < h / 2 { [0.8 + n, 0.1, 0.1, 1.0] } else { [0.1, 0.1, 0.8 + n, 1.0] }
+        })
+        .collect();
+    let hole: Vec<bool> = (0..w * h).map(|i| (40..56).contains(&(i % w))).collect();
+    let source: Vec<bool> = hole.iter().map(|h| !h).collect();
+    // The guide at a third of the size: red above row 32, blue below.
+    let (gw, gh) = (32usize, 22usize);
+    let rgb: Vec<u8> = (0..gw * gh).flat_map(|j| if j / gw < 11 { [204, 26, 26] } else { [26, 26, 204] }).collect();
+    let guide = ModelGuide { w: gw, h: gh, rgb };
+    let opts = photocraft_algo::content_aware::FillOptions::default();
+    let none = photocraft_raster::Interrupt::NONE;
+    for detail in [true, false] {
+        let model = FillModel { method: "lama".into(), detail };
+        let out = caf_fill(w, h, &fmt, img.clone(), &hole, &source, &opts, Some((&model, &guide)), &none).unwrap();
+        let px = |x: usize, y: usize| &out[(y * w + x) * 4..(y * w + x) * 4 + 4];
+        assert!(px(48, 10)[0] > 0.6 && px(48, 10)[2] < 0.3, "detail {detail}: red above, got {:?}", px(48, 10));
+        assert!(px(48, 54)[2] > 0.6 && px(48, 54)[0] < 0.3, "detail {detail}: blue below, got {:?}", px(48, 54));
+        assert_eq!(px(48, 10)[3], 1.0, "the fill is opaque");
+        for i in (0..w * h).filter(|i| !hole[*i]) {
+            assert_eq!(out[i * 4..i * 4 + 4], img[i * 4..i * 4 + 4]);
+        }
+        // With detail the fill has the picture's texture; without it the guide's flat colour.
+        let rough = (5..25).flat_map(|y| (40..55).map(move |x| (x, y))).map(|(x, y)| (px(x, y)[0] - px(x + 1, y)[0]).abs()).sum::<f32>() / 300.0;
+        if detail {
+            assert!(rough > 0.005, "textured, got {rough}");
+        } else {
+            assert!(rough < 0.001, "flat, got {rough}");
+        }
+    }
+}
+
+/// `method` takes classic, lama, migan or mix; anything else is refused before any work.
+#[test]
+fn content_aware_fill_refuses_an_unknown_method() {
+    let mut s = blob_session(8);
+    let e = s.execute("edit.contentAwareFill", json!({"method": "dall-e"})).unwrap_err().to_string();
+    assert!(e.contains("unknown method"), "{e}");
+    s.execute("edit.contentAwareFill", json!({"method": "classic", "colorAdaptation": "none"})).unwrap();
+}

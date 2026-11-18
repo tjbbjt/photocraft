@@ -366,6 +366,59 @@ fn fill_cow(
     Ok(out)
 }
 
+/// [`fill_owned`] guided by `guide` (the window's size, `ch` channels): a model's fill of the
+/// hole, scaled up `scale` times. The guide decides what goes where; the fill copies pieces of the
+/// sampling area into that layout at full sharpness (see `inpaint::complete_guided_owned`). No
+/// rotated, scaled or mirrored copies. With nothing to sample from, the hole takes the guide.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_guided_owned(
+    w: usize,
+    h: usize,
+    ch: usize,
+    img: Vec<f32>,
+    hole: &[bool],
+    source: &[bool],
+    guide: &[f32],
+    scale: f32,
+    opts: &FillOptions,
+    ctl: &photocraft_raster::Interrupt,
+) -> Result<Vec<f32>, photocraft_raster::Cancelled> {
+    assert_eq!(img.len(), w * h * ch);
+    assert_eq!(guide.len(), img.len());
+    assert_eq!(hole.len(), w * h);
+    assert_eq!(source.len(), w * h);
+    if !hole.iter().any(|h| *h) {
+        return Ok(img);
+    }
+    let params = CompleteParams { seed: opts.seed, adapt: opts.color_adaptation, ..Default::default() };
+    let roles: Vec<Px> = par::map(w * h, true, |i| {
+        if hole[i] {
+            Px::Hole
+        } else if source[i] {
+            Px::Source
+        } else {
+            Px::Known
+        }
+    });
+    let cancel = || ctl.cancelled();
+    let progress = |f: f32| ctl.progress(f * 0.99);
+    let inner = photocraft_raster::Interrupt::new(&cancel, &progress);
+    let out = match crate::inpaint::complete_guided_owned(w, h, ch, img, &roles, guide, scale, &params, &inner)? {
+        Ok(f) => f,
+        Err(mut img) => {
+            for (i, hh) in hole.iter().enumerate() {
+                if *hh {
+                    img[i * ch..(i + 1) * ch].copy_from_slice(&guide[i * ch..(i + 1) * ch]);
+                }
+            }
+            img
+        }
+    };
+    ctl.check()?;
+    ctl.progress(1.0);
+    Ok(out)
+}
+
 /// Box mean of radius `r` over a `w × h` plane (edge-clamped), by summed areas.
 fn box_mean(w: usize, h: usize, v: &[f32], r: usize) -> Vec<f32> {
     let w1 = w + 1;

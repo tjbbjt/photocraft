@@ -171,6 +171,19 @@ fn caf_props_panel(
         });
     });
     ui.horizontal(|ui| {
+        ui.label(tl!("Method"));
+        let o = [
+            ("classic".to_string(), tl!("Classic")),
+            ("lama".to_string(), tl!("LaMa")),
+            ("migan".to_string(), tl!("MI-GAN")),
+            ("mix".to_string(), tl!("Mix (LaMa + MI-GAN)")),
+        ];
+        widgets::dropdown(ui, "caf-method", tl!("Method"), &mut w.opts.method, &o, 150.0);
+    });
+    ui.add_enabled_ui(w.opts.method != "classic", |ui| {
+        widgets::checkbox(ui, &mut w.opts.detail, tl!("Rebuild Detail from the Photo"));
+    });
+    ui.horizontal(|ui| {
         ui.label(tl!("Color Adaptation"));
         let o = [
             ("none".to_string(), tl!("None")),

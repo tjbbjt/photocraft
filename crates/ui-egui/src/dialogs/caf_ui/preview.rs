@@ -101,6 +101,8 @@ pub(super) fn plan_params(w: &CafWorkspace, strokes: bool) -> Value {
         "scale": o.scale,
         "mirror": o.mirror,
         "output": o.output,
+        "method": o.method,
+        "detail": o.detail,
         "layer": w.layer.0,
         "fillEdits": w.fill_edits,
     });
@@ -359,12 +361,19 @@ pub(super) fn compute_preview(
     }
     let (w, h) = (plan.rect.width() as usize, plan.rect.height() as usize);
     let n = plan.fmt.channels();
+    // A fill model works on the whole window first (at its working size), so a preview of any
+    // size and the fill after it get the same model fill.
+    let guide = photocraft_engine::edit_menu_cmds::model_guide(&plan, ctl).map_err(|e| match e {
+        photocraft_engine::EngineError::Cancelled => "cancelled".to_string(),
+        e => e.to_string(),
+    })?;
     let f = crate::filter_preview_ui::texture_factor(w as u32, h as u32, max_side) as usize;
     if f > 1 {
-        return reduced_preview(plan, f, ctl);
+        return reduced_preview(plan, f, guide, ctl);
     }
-    let filled =
-        photocraft_algo::content_aware::fill_with(w, h, n, &plan.img, &plan.hole, &plan.source, &plan.opts, ctl).map_err(|_| "cancelled".to_string())?;
+    let with = plan.model.as_ref().zip(guide.as_ref());
+    let filled = photocraft_engine::edit_menu_cmds::caf_fill(w, h, &plan.fmt, plan.img.clone(), &plan.hole, &plan.source, &plan.opts, with, ctl)
+        .map_err(|_| "cancelled".to_string())?;
     let own = plan.layer_pixels();
     // Pixel `i`: the fill over the fill area (a partly selected pixel by its coverage), the
     // layer's own pixels elsewhere.
@@ -414,7 +423,12 @@ pub(super) fn compute_preview(
 /// layer's own pixels and the fill coverage), the fill area where any of a block is in it, the
 /// sampling area where most of a block is and none of it is to be filled; then the fill at that
 /// size, one texel per block. The full-size plan is freed before the fill.
-fn reduced_preview(plan: photocraft_engine::edit_menu_cmds::CafPlan, f: usize, ctl: &photocraft_raster::Interrupt) -> Result<(Rect, egui::ColorImage), String> {
+fn reduced_preview(
+    plan: photocraft_engine::edit_menu_cmds::CafPlan,
+    f: usize,
+    guide: Option<photocraft_engine::edit_menu_cmds::ModelGuide>,
+    ctl: &photocraft_raster::Interrupt,
+) -> Result<(Rect, egui::ColorImage), String> {
     let (w, h) = (plan.rect.width() as usize, plan.rect.height() as usize);
     let n = plan.fmt.channels();
     let (rw, rh) = (w.div_ceil(f), h.div_ceil(f));
@@ -462,7 +476,7 @@ fn reduced_preview(plan: photocraft_engine::edit_menu_cmds::CafPlan, f: usize, c
     };
     #[cfg(target_arch = "wasm32")]
     let blocks: Vec<Block> = (0..rw * rh).map(block).collect();
-    let (rect, fmt, opts) = (plan.rect, plan.fmt, plan.opts.clone());
+    let (rect, fmt, opts, model) = (plan.rect, plan.fmt, plan.opts.clone(), plan.model.clone());
     drop(plan);
     if ctl.cancelled() {
         return Err("cancelled".into());
@@ -475,7 +489,8 @@ fn reduced_preview(plan: photocraft_engine::edit_menu_cmds::CafPlan, f: usize, c
     if !source.iter().any(|s| *s) {
         return Err(NOTHING_TO_SAMPLE.into());
     }
-    let filled = photocraft_algo::content_aware::fill_owned(rw, rh, n, img, &hole, &source, &opts, ctl).map_err(|_| "cancelled".to_string())?;
+    let with = model.as_ref().zip(guide.as_ref());
+    let filled = photocraft_engine::edit_menu_cmds::caf_fill(rw, rh, &fmt, img, &hole, &source, &opts, with, ctl).map_err(|_| "cancelled".to_string())?;
     let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     let px = blocks
         .iter()

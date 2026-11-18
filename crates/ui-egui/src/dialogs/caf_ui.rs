@@ -117,6 +117,11 @@ pub struct CafOpts {
     pub mirror: bool,
     /// current | new | duplicate (Photoshop opens on New Layer)
     pub output: String,
+    /// What fills: classic (PatchMatch) | lama | migan | mix (LaMa and MI-GAN, block by block).
+    pub method: String,
+    /// With a model: rebuild the detail from the picture (the model's fill guiding PatchMatch)
+    /// rather than keep the model's own fill.
+    pub detail: bool,
 }
 
 impl Default for CafOpts {
@@ -133,6 +138,8 @@ impl Default for CafOpts {
             scale: false,
             mirror: false,
             output: "new".into(),
+            method: "classic".into(),
+            detail: true,
         }
     }
 }
@@ -148,6 +155,7 @@ impl CafOpts {
             ("sampleAllLayers", &mut self.sample_all),
             ("scale", &mut self.scale),
             ("mirror", &mut self.mirror),
+            ("detail", &mut self.detail),
         ] {
             if let Some(b) = flag(k) {
                 *slot = b;
@@ -181,6 +189,9 @@ impl CafOpts {
         if let Some(s) = pick("output", &["current", "new", "duplicate"])? {
             self.output = s;
         }
+        if let Some(s) = pick("method", &["classic", "lama", "migan", "mix"])? {
+            self.method = s;
+        }
         Ok(())
     }
 
@@ -198,6 +209,8 @@ impl CafOpts {
             "scale": self.scale,
             "mirror": self.mirror,
             "output": self.output,
+            "method": self.method,
+            "detail": self.detail,
         })
     }
 }
