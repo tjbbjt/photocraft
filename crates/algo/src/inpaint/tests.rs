@@ -411,6 +411,7 @@ fn full_patches_measure_as_clipped_ones() {
                 guide: None,
                 mimg: None,
                 coherence: 0.0,
+                stamp: false,
                 px: &px,
                 valid: valid.clone(),
                 cells,
@@ -557,7 +558,19 @@ fn a_guide_steers_the_fill_towards_it() {
     let none = photocraft_raster::Interrupt::NONE;
     let plain = complete_masked_owned(w, h, ch, truth.clone(), &px, &p, &none).unwrap().unwrap();
     let guided = complete_guided_owned(w, h, ch, truth.clone(), &px, &truth, 1.0, &p, &none).unwrap().unwrap();
-    let (e_plain, e_guided) = (hole_rmse(&plain, &truth, &hole, ch), hole_rmse(&guided, &truth, &hole, ch));
+    // The layout, not the pixels: the fill stamps pieces of the texture, so compare 7 × 7 means.
+    let soft = |v: &[f32]| -> Vec<f32> {
+        (0..v.len())
+            .map(|i| {
+                let (x, y, c) = ((i / ch) % w, i / ch / w, i % ch);
+                let (x0, x1, y0, y1) = (x.saturating_sub(3), (x + 4).min(w), y.saturating_sub(3), (y + 4).min(h));
+                let n = ((x1 - x0) * (y1 - y0)) as f32;
+                (y0..y1).flat_map(|yy| (x0..x1).map(move |xx| (yy * w + xx) * ch + c)).map(|j| v[j]).sum::<f32>() / n
+            })
+            .collect()
+    };
+    let st = soft(&truth);
+    let (e_plain, e_guided) = (hole_rmse(&soft(&plain), &st, &hole, ch), hole_rmse(&soft(&guided), &st, &hole, ch));
     assert!(e_guided < e_plain, "guided {e_guided} vs unguided {e_plain}");
     // Bright above the line, dark below it, inside the hole too.
     let mean = |y: usize| (40..80).map(|x| guided[(y * w + x) * ch]).sum::<f32>() / 40.0;

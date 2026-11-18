@@ -15,14 +15,17 @@ pub(super) struct Solver<'a> {
     /// A guided fill's guide at this level and how many pixels soft it is here
     /// ([`Solver::refresh_match`]); `None` unguided.
     pub(super) guide: Option<(&'a [f32], usize)>,
-    /// What patches are compared on when guided ([`Solver::m`]): the picture, with the hole as
-    /// the guide plus the current fill's own detail.
+    /// What patches are compared on when guided ([`Solver::m`]): the picture with the guide in
+    /// the hole, softened ([`Solver::refresh_match`]).
     pub(super) mimg: Option<Vec<f32>>,
     /// How much PatchMatch favours coherent matches: a match its left or upper neighbour's
     /// shifted by one is taken over a better one unless that is better by this share (0: the best
     /// wins). A guided fill sets it, so neighbouring pixels copy one piece of the picture and the
     /// vote stamps it rather than averaging many pieces that match a soft guide about equally.
     pub(super) coherence: f32,
+    /// A guided fill's vote stamps: each pixel takes the best match covering it (the highest
+    /// weight) rather than the mean of all of them, so the copies stay sharp. Off unguided.
+    pub(super) stamp: bool,
     pub(super) px: &'a [Px],
     /// Valid source centres: the whole patch is inside the grid and may be copied from.
     pub(super) valid: Vec<bool>,
@@ -80,30 +83,42 @@ impl Solver<'_> {
         self.mimg.as_deref().unwrap_or(&self.img[..])
     }
 
-    /// A guided fill's match image, from the current fill: outside the hole the picture, in it the
-    /// guide plus the fill's detail finer than the guide (the fill less its mean over the guide's
-    /// softness). The guide decides each patch's layout and colour and never drifts; the detail,
-    /// which a soft guide lacks, comes from the copies voted in so far, so neighbouring matches
-    /// agree and the copies stay sharp. Nothing unguided.
+    /// A guided fill's match image: the picture with the guide in the hole, softened by a box of
+    /// half the guide's softness (at least 1 px), so a match agrees with the guide in the large
+    /// and is free in the small. Compared sharp, a soft guide matched smooth sources best (a
+    /// road, a haze) and the fill came out smeared; softened on both sides, a ground of shrubs
+    /// matches the guide's soft ground as well as a road does, and the fill copies shrubs. The
+    /// picture outside the hole never changes and the guide is fixed, so it is worked out once
+    /// per level. Nothing unguided.
     pub(super) fn refresh_match(&mut self) {
         let Some((guide, soft)) = self.guide else { return };
-        let (w, h, ch) = (self.w, self.h, self.ch);
-        let r = soft / 2;
-        let mut m = self.mimg.take().unwrap_or_else(|| self.img.to_vec());
-        let (img, px) = (&self.img[..], self.px);
-        par::chunks_mut(&mut m, w * ch, w * h >= PAR_MIN_PATCHES, |y, row| {
+        if self.mimg.is_some() {
+            return;
+        }
+        let (w, h, ch, px) = (self.w, self.h, self.ch, self.px);
+        let img = &self.img[..];
+        let r = (soft / 2).max(1);
+        let row = w * ch;
+        let mut m = vec![0.0f32; img.len()];
+        par::chunks_mut(&mut m, row.max(1), w * h >= PAR_MIN_PATCHES, |y, out| {
+            // Column sums over the rows in reach, then the mean along the row.
             let (y0, y1) = (y.saturating_sub(r), (y + r + 1).min(h));
-            for x in 0..w {
-                if px[y * w + x] != Px::Hole {
-                    continue;
+            let mut cols = vec![0.0f32; row];
+            for yy in y0..y1 {
+                for x in 0..w {
+                    let i = yy * w + x;
+                    let from = if px[i] == Px::Hole { guide } else { img };
+                    for (c, v) in cols[x * ch..(x + 1) * ch].iter_mut().zip(&from[i * ch..(i + 1) * ch]) {
+                        *c += *v;
+                    }
                 }
+            }
+            let rows = (y1 - y0) as f32;
+            for x in 0..w {
                 let (x0, x1) = (x.saturating_sub(r), (x + r + 1).min(w));
-                let n = ((y1 - y0) * (x1 - x0)) as f32;
+                let k = 1.0 / ((x1 - x0) as f32 * rows);
                 for c in 0..ch {
-                    let i = (y * w + x) * ch + c;
-                    let mean =
-                        if r == 0 { img[i] } else { (y0..y1).flat_map(|yy| (x0..x1).map(move |xx| (yy * w + xx) * ch + c)).map(|j| img[j]).sum::<f32>() / n };
-                    row[x * ch + c] = guide[i] + img[i] - mean;
+                    out[x * ch + c] = (x0..x1).map(|xx| cols[xx * ch + c]).sum::<f32>() * k;
                 }
             }
         });
@@ -677,7 +692,7 @@ impl Solver<'_> {
         let per = ch + 1;
         let mut out = vec![0.0f32; n * per];
         {
-            let votes = Votes { w, h, ch, r: r as usize, cells: &self.cells, img: &*self.img, wt: &wt, src: &src, gb: &gb };
+            let votes = Votes { w, h, ch, r: r as usize, cells: &self.cells, img: &*self.img, wt: &wt, src: &src, gb: &gb, stamp: self.stamp };
             let (px, ctl) = (self.px, &self.ctl);
             self.cells.rows_mut(&mut out, per, par, |y, runs, orow| {
                 if ctl.cancelled() {
@@ -729,6 +744,8 @@ struct Votes<'a> {
     wt: &'a [f32],
     src: &'a [isize],
     gb: &'a [(f32, f32)],
+    /// Each pixel from the best match covering it ([`Solver::stamp`]), not the mean.
+    stamp: bool,
 }
 
 impl Votes<'_> {
@@ -755,6 +772,7 @@ impl Votes<'_> {
         let (w, r) = (self.w, self.r);
         let mut acc = [0.0f32; CH];
         let mut wsum = 0.0f32;
+        let mut best = (0.0f32, [0.0f32; CH]);
         for ty in y.saturating_sub(r)..=(y + r).min(self.h - 1) {
             let dy = ty as isize - y as isize;
             self.each_in(ty, x.saturating_sub(r), (x + r).min(w - 1), |k, tx| {
@@ -765,17 +783,25 @@ impl Votes<'_> {
                 // The pixel of the match's patch that lands here.
                 let si = (self.src[k] - dy * w as isize - (tx as isize - x as isize)) as usize * CH;
                 let s = &self.img[si..si + CH];
+                let mut v = [0.0f32; CH];
                 for c in 0..CH {
-                    let v = if ADAPT {
+                    v[c] = if ADAPT {
                         let (g, b) = self.gb[k * CH + c];
                         g * s[c] + b
                     } else {
                         s[c]
                     };
-                    acc[c] += v * wt;
+                    acc[c] += v[c] * wt;
+                }
+                if self.stamp && wt > best.0 {
+                    best = (wt, v);
                 }
                 wsum += wt;
             });
+        }
+        if self.stamp && wsum > 0.0 {
+            out[..CH].copy_from_slice(&best.1);
+            return true;
         }
         if wsum > 0.0 {
             for (d, a) in out.iter_mut().zip(&acc) {
@@ -791,6 +817,7 @@ impl Votes<'_> {
         let (w, r, ch) = (self.w, self.r, self.ch);
         let mut acc = vec![0.0f32; ch];
         let mut wsum = 0.0f32;
+        let (mut best_wt, mut best) = (0.0f32, vec![0.0f32; ch]);
         for ty in y.saturating_sub(r)..=(y + r).min(self.h - 1) {
             let dy = ty as isize - y as isize;
             self.each_in(ty, x.saturating_sub(r), (x + r).min(w - 1), |k, tx| {
@@ -799,6 +826,10 @@ impl Votes<'_> {
                     return;
                 }
                 let si = (self.src[k] - dy * w as isize - (tx as isize - x as isize)) as usize * ch;
+                let stamp = self.stamp && wt > best_wt;
+                if stamp {
+                    best_wt = wt;
+                }
                 for (c, a) in acc.iter_mut().enumerate() {
                     let v = if adapted {
                         let (g, b) = self.gb[k * ch + c];
@@ -807,9 +838,16 @@ impl Votes<'_> {
                         self.img[si + c]
                     };
                     *a += v * wt;
+                    if stamp {
+                        best[c] = v;
+                    }
                 }
                 wsum += wt;
             });
+        }
+        if self.stamp && wsum > 0.0 {
+            out.copy_from_slice(&best);
+            return true;
         }
         if wsum > 0.0 {
             for (d, a) in out.iter_mut().zip(&acc) {

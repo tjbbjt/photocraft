@@ -124,10 +124,6 @@ fn caf_props_panel(
     rebase_needed: &mut bool,
 ) {
     ui.spacing_mut().item_spacing.y = 6.0;
-    // Off: the panel as Photoshop has it (parity). On: PhotoCraft's additions.
-    widgets::toggle(ui, &mut w.opts.photocraft, tl!("PhotoCraft features"))
-        .on_hover_text(tl!("Off: Content-Aware Fill as in Photoshop. On: fill methods, the edge band, timers and a resizable preview."));
-    widgets::hairline(ui);
     egui::CollapsingHeader::new(tl!("Sampling Area Overlay")).id_salt("caf-overlay").default_open(false).show(ui, |ui| {
         widgets::checkbox(ui, &mut w.opts.show_overlay, tl!("Show Sampling Area"));
         widgets::slider_row(ui, tl!("Opacity"), &mut w.opts.opacity, 0.0..=100.0, "%", None);
@@ -502,6 +498,13 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             events.push(ToolEvent::Up { x: q[0], y: q[1] });
             dragging = false;
         }
+        // At the bottom left of the view: PhotoCraft's additions, or the workspace as Photoshop
+        // has it.
+        let sw = ERect::from_min_size(pos2(area.left() + 10.0, body.bottom() - 40.0), vec2(220.0, 30.0));
+        painter.rect_filled(sw, 6.0, t.dock);
+        let mut sui = ui.new_child(egui::UiBuilder::new().max_rect(sw.shrink2(vec2(10.0, 5.0))).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        crate::fill_ui::behavior_switch(&mut sui, &mut w.opts.photocraft)
+            .on_hover_text(tl!("PhotoCraft: fill methods, the edge band, timers and a resizable preview. Parity: Content-Aware Fill as in Photoshop."));
         // The split between the view and the Preview panel, last so it is above both.
         if w.opts.photocraft {
             let grip = ui.interact(split, egui::Id::unique("caf-preview-split"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);

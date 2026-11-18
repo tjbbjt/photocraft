@@ -43,6 +43,27 @@ fn tiles_fill_the_whole_hole_and_nothing_else() {
     assert!(ran.get() < spans(w).len() * spans(h).len(), "tiles without any of the hole ran");
 }
 
+/// A tile run once is kept, per model: the same tile again (a fill after a preview that stopped
+/// part-way) does not run the model.
+#[test]
+fn a_tile_run_once_is_kept() {
+    let rgb: Vec<u8> = (0..TILE * TILE * 3).map(|i| (i % 241) as u8).collect();
+    let hole = vec![true; TILE * TILE];
+    let calls = std::cell::Cell::new(0);
+    let first = run_tile(Model::Lama, &rgb, &hole, || {
+        calls.set(calls.get() + 1);
+        Ok(vec![9u8; 3])
+    })
+    .unwrap();
+    let again = run_tile(Model::Lama, &rgb, &hole, || {
+        calls.set(calls.get() + 1);
+        Ok(vec![1u8; 3])
+    })
+    .unwrap();
+    assert_eq!((first, again, calls.get()), (vec![9u8; 3], vec![9u8; 3], 1));
+    assert_eq!(run_tile(Model::Migan, &rgb, &hole, || Ok(vec![2u8; 3])).unwrap(), vec![2u8; 3], "another model runs");
+}
+
 /// A cancelled fill stops before its next tile.
 #[test]
 fn a_cancelled_fill_stops() {

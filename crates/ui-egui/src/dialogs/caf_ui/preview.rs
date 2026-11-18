@@ -441,7 +441,9 @@ fn reduced_preview(
     let (rw, rh) = (w.div_ceil(f), h.div_ceil(f));
     struct Block {
         img: Vec<f32>,
-        /// The layer's own pixels, premultiplied RGBA.
+        /// The layer's own pixels the fill leaves (each weighted by how little of it is filled),
+        /// straight RGBA: a block on the fill area's edge blends the fill with the pixels beside
+        /// the area, not with the ones under it (black in a hole, which left a dark line).
         own: [f32; 4],
         hole: bool,
         source: bool,
@@ -451,7 +453,7 @@ fn reduced_preview(
     let block = |j: usize| -> Block {
         let (bx, by) = (j % rw, j / rw);
         let mut img = vec![0.0f32; n];
-        let (mut own, mut count, mut sources, mut cover, mut hole) = ([0.0f32; 4], 0.0f32, 0usize, 0.0f32, false);
+        let (mut own, mut count, mut sources, mut cover, mut hole, mut kept) = ([0.0f32; 4], 0.0f32, 0usize, 0.0f32, false, 0.0f32);
         for y in by * f..((by + 1) * f).min(h) {
             for x in bx * f..((bx + 1) * f).min(w) {
                 let i = y * w + x;
@@ -459,10 +461,12 @@ fn reduced_preview(
                     *a += v;
                 }
                 let o = photocraft_raster::to_rgba(&plan.fmt, &own_px[i * n..(i + 1) * n]);
+                let keep = 1.0 - plan.cover[i];
                 for (a, v) in own.iter_mut().zip(&o).take(3) {
-                    *a += v * o[3];
+                    *a += v * o[3] * keep;
                 }
-                own[3] += o[3];
+                own[3] += o[3] * keep;
+                kept += keep;
                 hole |= plan.hole[i];
                 sources += usize::from(plan.source[i]);
                 cover += plan.cover[i];
@@ -472,7 +476,7 @@ fn reduced_preview(
         for a in &mut img {
             *a /= count;
         }
-        let own = if own[3] > 0.0 { [own[0] / own[3], own[1] / own[3], own[2] / own[3], own[3] / count] } else { [0.0; 4] };
+        let own = if own[3] > 0.0 { [own[0] / own[3], own[1] / own[3], own[2] / own[3], own[3] / kept] } else { [0.0; 4] };
         Block { img, own, hole, source: !hole && sources as f32 * 2.0 >= count, cover: cover / count }
     };
     // The web build has no thread pool.

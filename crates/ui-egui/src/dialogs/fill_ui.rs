@@ -226,14 +226,7 @@ pub fn body(app: &PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Value>) 
     let label = |ui: &mut egui::Ui, text: &str| {
         crate::widgets::column_label(ui, text, label_w);
     };
-    // Off: the dialog as Photoshop has it (parity). On: PhotoCraft's additions.
-    let mut photocraft = get_str(f, "fillMode", "photocraft") == "photocraft";
-    if crate::widgets::toggle(ui, &mut photocraft, tl!("PhotoCraft features"))
-        .on_hover_text(tl!("Off: Fill as in Photoshop. On: Content-Aware gets fill methods and the edge band, and runs in the background."))
-        .changed()
-    {
-        f.insert("fillMode".into(), json!(if photocraft { "photocraft" } else { "parity" }));
-    }
+    let photocraft = get_str(f, "fillMode", "photocraft") == "photocraft";
     let mut contents = get_str(f, "contents", "foreground");
     ui.horizontal(|ui| {
         label(ui, tl!("Contents:"));
@@ -293,6 +286,50 @@ pub fn body(app: &PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Value>) 
     if !blending {
         ui.label(egui::RichText::new(tl!("Blending applies to Parity fills.")).color(Tokens::get(ui.ctx()).text_faint).size(11.0));
     }
+    // At the bottom left: PhotoCraft's additions, or the dialog as Photoshop has it.
+    ui.add_space(6.0);
+    let mut on = photocraft;
+    if behavior_switch(ui, &mut on)
+        .on_hover_text(tl!("PhotoCraft: Content-Aware gets fill methods and the edge band, and runs in the background. Parity: Fill as in Photoshop."))
+        .changed()
+    {
+        f.insert("fillMode".into(), json!(if on { "photocraft" } else { "parity" }));
+    }
+}
+
+/// PhotoCraft's switch between its own behaviour (left) and Photoshop's (Parity, right); a click
+/// on the switch flips it, a click on a side picks that side. Edit › Fill and the Content-Aware
+/// Fill workspace share it.
+pub fn behavior_switch(ui: &mut egui::Ui, photocraft: &mut bool) -> egui::Response {
+    let t = Tokens::get(ui.ctx());
+    ui.horizontal(|ui| {
+        let side = |ui: &mut egui::Ui, text: &str, on: bool| {
+            ui.add(egui::Label::new(egui::RichText::new(text).color(if on { t.text } else { t.text_dim })).sense(egui::Sense::click()))
+        };
+        let left = side(ui, tl!("PhotoCraft"), *photocraft);
+        let (rect, switch) = ui.allocate_exact_size(egui::vec2(34.0, 18.0), egui::Sense::click());
+        let how = ui.ctx().animate_bool(switch.id, !*photocraft);
+        ui.painter().rect_filled(rect, 9.0, if *photocraft { t.accent } else { t.field_border });
+        let x = egui::lerp((rect.left() + 9.0)..=(rect.right() - 9.0), how);
+        ui.painter().circle_filled(egui::pos2(x, rect.center().y), 7.0, egui::Color32::WHITE);
+        let right = side(ui, tl!("Parity"), !*photocraft);
+        let was = *photocraft;
+        if left.clicked() {
+            *photocraft = true;
+        }
+        if right.clicked() {
+            *photocraft = false;
+        }
+        if switch.clicked() {
+            *photocraft = !was;
+        }
+        let mut r = left.union(switch).union(right);
+        if *photocraft != was {
+            r.mark_changed();
+        }
+        r
+    })
+    .inner
 }
 
 /// PhotoCraft's Content-Aware options: the method and the edge band.

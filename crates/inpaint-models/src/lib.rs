@@ -2,13 +2,14 @@
 //! Rust engine that reads the publishers' ONNX files as they are, on the processor.
 //!
 //! A model fills a picture's hole at a working size (the caller shrinks the picture first): in
-//! 512-pixel tiles that overlap by half, each keeping only what it filled in its middle (or out to
-//! the picture's edge), so every tile sees the fills before it. [`Model::Mix`] runs both and keeps,
+//! 512-pixel tiles that overlap by a quarter, each keeping only what it filled in its middle (or
+//! out to the picture's edge), so every tile sees the fills before it. [`Model::Mix`] runs both and keeps,
 //! block by block, whichever fill matches the picture around it better.
 //!
 //! The model files are not part of PhotoCraft: they are read from [`models_dir`]. Loaded models
-//! stay in memory, and the last fill of each model is kept, so a preview and the fill that follows
-//! it on the same picture run the model once.
+//! stay in memory, and the last few fills of each model are kept, and the tiles of the last
+//! fills, so a preview and the fill that follows it on the same picture run the model once, and
+//! a fill that follows a preview stopped part-way reuses the tiles it got through.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -21,6 +22,12 @@ use rten_tensor::{AsView, NdTensor};
 
 /// The models' side.
 pub const TILE: usize = 512;
+/// How far apart tiles start: they overlap by a quarter. Half (256) ran half as many tiles
+/// again for a guide whose detail comes from the photo anyway.
+const STEP: usize = TILE * 3 / 4;
+/// Fills kept per model, and tiles kept in all.
+const FILLS_KEPT: usize = 4;
+const TILES_KEPT: usize = 96;
 /// The longest side a picture is shrunk to before a model fills it.
 pub const WORKING_SIDE: usize = 2048;
 /// LaMa's file (Carve/LaMa-ONNX, `lama_fp32.onnx`, 208 044 816 bytes).
@@ -119,7 +126,7 @@ pub fn fill(model: Model, pic: &Picture, ctl: &Interrupt) -> Result<Vec<u8>, Err
     }
 }
 
-/// The last fill of each model, by what it filled.
+/// The last fills of each model ([`FILLS_KEPT`]), by what they filled.
 static FILLS: Mutex<Vec<Fill>> = Mutex::new(Vec::new());
 
 /// A model's fill and the key of what it filled ([`key`]).
@@ -142,13 +149,42 @@ fn fill_one(model: Model, pic: &Picture, ctl: &Interrupt, span: (f32, f32)) -> R
         return Ok(done.to_vec());
     }
     let graph = load(model)?;
-    let out = tiles(pic, ctl, span, |rgb, hole| match model {
-        Model::Migan => run_migan(&graph, rgb, hole),
-        _ => run_lama(&graph, rgb, hole),
+    let out = tiles(pic, ctl, span, |rgb, hole| {
+        run_tile(model, rgb, hole, || match model {
+            Model::Migan => run_migan(&graph, rgb, hole),
+            _ => run_lama(&graph, rgb, hole),
+        })
     })?;
     if let Ok(mut f) = FILLS.lock() {
-        f.retain(|(m, _, _)| *m != model);
+        if f.iter().filter(|(m, _, _)| *m == model).count() >= FILLS_KEPT
+            && let Some(oldest) = f.iter().position(|(m, _, _)| *m == model)
+        {
+            f.remove(oldest);
+        }
         f.push((model, k, Arc::new(out.clone())));
+    }
+    Ok(out)
+}
+
+/// The tiles run lately ([`TILES_KEPT`]), by model and what the tile held.
+static TILE_FILLS: Mutex<Vec<Fill>> = Mutex::new(Vec::new());
+
+/// One tile's fill by `model`: kept from an earlier run that gave it the same pixels and hole,
+/// else `run`, and kept.
+fn run_tile(model: Model, rgb: &[u8], hole: &[bool], run: impl FnOnce() -> Result<Vec<u8>, Error>) -> Result<Vec<u8>, Error> {
+    let mut h = DefaultHasher::new();
+    rgb.hash(&mut h);
+    hole.hash(&mut h);
+    let k = h.finish();
+    if let Some(done) = TILE_FILLS.lock().ok().and_then(|t| t.iter().find(|(m, kk, _)| *m == model && *kk == k).map(|(_, _, v)| v.clone())) {
+        return Ok(done.to_vec());
+    }
+    let out = run()?;
+    if let Ok(mut t) = TILE_FILLS.lock() {
+        if t.len() >= TILES_KEPT {
+            t.remove(0);
+        }
+        t.push((model, k, Arc::new(out.clone())));
     }
     Ok(out)
 }
@@ -173,14 +209,14 @@ fn load(model: Model) -> Result<Arc<Graph>, Error> {
     Ok(graph)
 }
 
-/// The tiles along a side of `n`: each tile's start (every half tile, the last one flush with the
+/// The tiles along a side of `n`: each tile's start (every [`STEP`], the last one flush with the
 /// end) and its middle `lo..hi`, the part it keeps. The middles split the side between them: two
 /// neighbours meet halfway through their overlap, the first and last reach the ends.
 fn spans(n: usize) -> Vec<(usize, usize, usize)> {
     if n <= TILE {
         return vec![(0, 0, n)];
     }
-    let mut starts: Vec<usize> = (0..n - TILE).step_by(TILE / 2).collect();
+    let mut starts: Vec<usize> = (0..n - TILE).step_by(STEP).collect();
     starts.push(n - TILE);
     starts.dedup();
     let meet = |a: usize, b: usize| (a + TILE + b) / 2;

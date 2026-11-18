@@ -74,7 +74,7 @@ use synthesis::onion_peel;
 pub use synthesis::{best_offset, synthesize};
 
 /// How strongly a guided fill favours coherent matches ([`Solver::coherence`]).
-const GUIDED_COHERENCE: f32 = 1.0;
+const GUIDED_COHERENCE: f32 = 2.0;
 
 /// Parameters for [`complete`].
 #[derive(Clone, Debug, PartialEq)]
@@ -157,9 +157,10 @@ pub fn complete_masked_owned(
 /// should look like: a model's fill at a reduced size, scaled up `scale` times (1 for a guide at
 /// full sharpness). The guide decides the layout (where the sky ends, which way a ridge runs) and
 /// the picture the detail: at every level the hole's patches are matched as the guide shows them,
-/// against the picture softened to the guide's sharpness, and the fill copies the matched pieces
-/// of the picture at their full sharpness. The guide is never overwritten, so the matching
-/// cannot drift away from it the way a fill that only starts from it does.
+/// against the picture softened the same way, and the fill stamps the matched pieces of the
+/// picture at their full sharpness, neighbours favouring one piece. The guide is never
+/// overwritten, so the matching cannot drift away from it the way a fill that only starts from
+/// it does.
 #[allow(clippy::too_many_arguments)]
 pub fn complete_guided_owned(
     w: usize,
@@ -271,6 +272,7 @@ fn complete_cow<'a>(
             guide: guide_here,
             mimg: None,
             coherence: if guides.is_some() { GUIDED_COHERENCE } else { 0.0 },
+            stamp: guides.is_some(),
             px: &lpx,
             valid,
             cells,
@@ -305,10 +307,6 @@ fn complete_cow<'a>(
         let pm_iters = if refine_only { 1 } else { p.pm_iters };
         let full_search = (lw.max(lh)) as i32;
         for it in 0..em {
-            // Costs change as hole pixels are re-estimated: refresh before each PatchMatch.
-            if it > 0 || upsampled {
-                solver.refresh_match();
-            }
             solver.costs(&nnf, &mut cost)?;
             // Wide random search on the coarsest level and on each level's first iteration,
             // local refinement afterwards.
