@@ -408,6 +408,8 @@ fn full_patches_measure_as_clipped_ones() {
                 ch,
                 r: r as i32,
                 img: &mut img,
+                guide: None,
+                mimg: None,
                 px: &px,
                 valid: valid.clone(),
                 cells,
@@ -538,4 +540,68 @@ fn a_border_ring_has_targets_only_along_the_borders() {
     let b = complete(w, h, 3, &img, &hole, &p).expect("filled");
     assert_eq!(bits(&a), bits(&b));
     assert!(a.iter().all(|v| v.is_finite()));
+}
+
+/// A guide decides the fill's layout: a hole across the line between a bright upper half and a
+/// dark lower one, guided by the picture as it was, comes out with the line where it was, and
+/// closer to the picture than the unguided fill. The pixels outside the hole stay as they are.
+#[test]
+fn a_guide_steers_the_fill_towards_it() {
+    let (w, h, ch) = (120, 96, 3);
+    let base = busy(w, h, ch, 6);
+    let truth: Vec<f32> = base.iter().enumerate().map(|(i, v)| if i / ch / w < 40 { (v + 0.4).min(1.0) } else { v * 0.5 }).collect();
+    let hole = disc(w, h, 60.0, 40.0, 22.0);
+    let px = roles(w, h, &hole);
+    let p = CompleteParams::default();
+    let none = photocraft_raster::Interrupt::NONE;
+    let plain = complete_masked_owned(w, h, ch, truth.clone(), &px, &p, &none).unwrap().unwrap();
+    let guided = complete_guided_owned(w, h, ch, truth.clone(), &px, &truth, 1.0, &p, &none).unwrap().unwrap();
+    let (e_plain, e_guided) = (hole_rmse(&plain, &truth, &hole, ch), hole_rmse(&guided, &truth, &hole, ch));
+    assert!(e_guided < e_plain, "guided {e_guided} vs unguided {e_plain}");
+    // Bright above the line, dark below it, inside the hole too.
+    let mean = |y: usize| (40..80).map(|x| guided[(y * w + x) * ch]).sum::<f32>() / 40.0;
+    assert!(mean(30) > mean(50) + 0.2, "{} above vs {} below", mean(30), mean(50));
+    for (i, hh) in hole.iter().enumerate() {
+        if !*hh {
+            assert_eq!(bits(&guided[i * ch..(i + 1) * ch]), bits(&truth[i * ch..(i + 1) * ch]));
+        }
+    }
+}
+
+/// A soft guide (a model's fill scaled up) still decides the layout: guided by the picture
+/// blurred over 6 pixels and told so, the fill keeps the line between the bright and dark halves
+/// and comes out sharp, as textured as the picture rather than as soft as the guide.
+#[test]
+fn a_soft_guide_gives_the_layout_and_the_picture_the_detail() {
+    let (w, h, ch) = (120, 96, 3);
+    let base = busy(w, h, ch, 6);
+    let truth: Vec<f32> = base.iter().enumerate().map(|(i, v)| if i / ch / w < 40 { (v + 0.4).min(1.0) } else { v * 0.5 }).collect();
+    // The guide: 6 × 6 block means, scaled back up.
+    let mut soft = truth.clone();
+    for by in (0..h).step_by(6) {
+        for bx in (0..w).step_by(6) {
+            for c in 0..ch {
+                let cells: Vec<usize> = (by..(by + 6).min(h)).flat_map(|y| (bx..(bx + 6).min(w)).map(move |x| y * w + x)).collect();
+                let mean = cells.iter().map(|i| truth[i * ch + c]).sum::<f32>() / cells.len() as f32;
+                for i in cells {
+                    soft[i * ch + c] = mean;
+                }
+            }
+        }
+    }
+    let hole = disc(w, h, 60.0, 40.0, 22.0);
+    let px = roles(w, h, &hole);
+    let p = CompleteParams::default();
+    let none = photocraft_raster::Interrupt::NONE;
+    let guided = complete_guided_owned(w, h, ch, truth.clone(), &px, &soft, 6.0, &p, &none).unwrap().unwrap();
+    let mean = |y: usize| (40..80).map(|x| guided[(y * w + x) * ch]).sum::<f32>() / 40.0;
+    assert!(mean(30) > mean(50) + 0.2, "{} above vs {} below", mean(30), mean(50));
+    // Detail: neighbouring pixels in the hole differ about as much as in the picture, far more
+    // than in the guide.
+    let roughness = |v: &[f32]| {
+        let d: Vec<f32> = (0..w * h).filter(|&i| hole[i] && i % w + 1 < w && hole[i + 1]).map(|i| (v[i * ch] - v[(i + 1) * ch]).abs()).collect();
+        d.iter().sum::<f32>() / d.len() as f32
+    };
+    let (r_fill, r_truth, r_guide) = (roughness(&guided), roughness(&truth), roughness(&soft));
+    assert!(r_fill > 0.5 * r_truth && r_fill > 2.0 * r_guide, "fill {r_fill}, picture {r_truth}, guide {r_guide}");
 }

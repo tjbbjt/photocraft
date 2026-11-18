@@ -12,6 +12,12 @@ pub(super) struct Solver<'a> {
     pub(super) ch: usize,
     pub(super) r: i32,
     pub(super) img: &'a mut Vec<f32>,
+    /// A guided fill's guide at this level and how many pixels soft it is here
+    /// ([`Solver::refresh_match`]); `None` unguided.
+    pub(super) guide: Option<(&'a [f32], usize)>,
+    /// What patches are compared on when guided ([`Solver::m`]): the picture, with the hole as
+    /// the guide plus the current fill's own detail.
+    pub(super) mimg: Option<Vec<f32>>,
     pub(super) px: &'a [Px],
     /// Valid source centres: the whole patch is inside the grid and may be copied from.
     pub(super) valid: Vec<bool>,
@@ -63,6 +69,42 @@ pub(crate) fn fit(a: Adapt, n: f32, st: f32, stt: f32, ss: f32, sss: f32) -> (f3
 }
 
 impl Solver<'_> {
+    /// The pixels patches are compared on: the match image of a guided fill, else the picture.
+    #[inline]
+    pub(super) fn m(&self) -> &[f32] {
+        self.mimg.as_deref().unwrap_or(&self.img[..])
+    }
+
+    /// A guided fill's match image, from the current fill: outside the hole the picture, in it the
+    /// guide plus the fill's detail finer than the guide (the fill less its mean over the guide's
+    /// softness). The guide decides each patch's layout and colour and never drifts; the detail,
+    /// which a soft guide lacks, comes from the copies voted in so far, so neighbouring matches
+    /// agree and the copies stay sharp. Nothing unguided.
+    pub(super) fn refresh_match(&mut self) {
+        let Some((guide, soft)) = self.guide else { return };
+        let (w, h, ch) = (self.w, self.h, self.ch);
+        let r = soft / 2;
+        let mut m = self.mimg.take().unwrap_or_else(|| self.img.to_vec());
+        let (img, px) = (&self.img[..], self.px);
+        par::chunks_mut(&mut m, w * ch, w * h >= PAR_MIN_PATCHES, |y, row| {
+            let (y0, y1) = (y.saturating_sub(r), (y + r + 1).min(h));
+            for x in 0..w {
+                if px[y * w + x] != Px::Hole {
+                    continue;
+                }
+                let (x0, x1) = (x.saturating_sub(r), (x + r + 1).min(w));
+                let n = ((y1 - y0) * (x1 - x0)) as f32;
+                for c in 0..ch {
+                    let i = (y * w + x) * ch + c;
+                    let mean =
+                        if r == 0 { img[i] } else { (y0..y1).flat_map(|yy| (x0..x1).map(move |xx| (yy * w + xx) * ch + c)).map(|j| img[j]).sum::<f32>() / n };
+                    row[x * ch + c] = guide[i] + img[i] - mean;
+                }
+            }
+        });
+        self.mimg = Some(m);
+    }
+
     #[inline]
     pub(super) fn is_valid(&self, x: i32, y: i32) -> bool {
         x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h && self.valid[y as usize * self.w + x as usize]
@@ -95,7 +137,7 @@ impl Solver<'_> {
         if !keep_source_moments {
             return;
         }
-        let (ch, img, valid, ctl) = (self.ch, &*self.img, &self.valid, &self.ctl);
+        let (ch, img, valid, ctl) = (self.ch, self.m(), &self.valid, &self.ctl);
         let mut smom = vec![[0.0f32; 2]; w * h * c8];
         par::chunks_mut(&mut smom, w * c8, w * h >= PAR_MIN_PATCHES, |y, out| {
             if ctl.cancelled() {
@@ -124,6 +166,7 @@ impl Solver<'_> {
 
     /// [`Solver::dist`] without adaptation, of a patch that may be clipped.
     pub(super) fn dist_clipped(&self, t: (i32, i32), s: (i32, i32), cutoff: f32) -> f32 {
+        let img = self.m();
         let (w, h, ch, r) = (self.w as i32, self.h as i32, self.ch, self.r);
         let full = ((2 * r + 1) * (2 * r + 1)) as f32 * ch as f32;
         let mut sum = 0.0f32;
@@ -142,7 +185,7 @@ impl Solver<'_> {
                 let ti = (ty as usize * self.w + tx as usize) * ch;
                 let si = (sy as usize * self.w + (s.0 + dx) as usize) * ch;
                 for c in 0..ch {
-                    let d = self.img[ti + c] - self.img[si + c];
+                    let d = img[ti + c] - img[si + c];
                     sum += d * d;
                 }
                 n += ch;
@@ -159,6 +202,7 @@ impl Solver<'_> {
     /// (infinity) as soon as the sum shows the patch is worse than `cutoff`, which the sum, only
     /// growing, can show after any pixel: the caller only asks whether it is better.
     pub(super) fn dist_full(&self, t: (i32, i32), s: (i32, i32), cutoff: f32) -> f32 {
+        let img = self.m();
         let (w, ch, r) = (self.w, self.ch, self.r);
         let side = (2 * r + 1) as usize;
         let full = ((2 * r + 1) * (2 * r + 1)) as f32 * ch as f32;
@@ -167,7 +211,7 @@ impl Solver<'_> {
         for dy in -r..=r {
             let ti = ((t.1 + dy) as usize * w + (t.0 - r) as usize) * ch;
             let si = ((s.1 + dy) as usize * w + (s.0 - r) as usize) * ch;
-            for (tp, sp) in self.img[ti..ti + span].chunks_exact(ch).zip(self.img[si..si + span].chunks_exact(ch)) {
+            for (tp, sp) in img[ti..ti + span].chunks_exact(ch).zip(img[si..si + span].chunks_exact(ch)) {
                 for (a, b) in tp.iter().zip(sp) {
                     let d = a - b;
                     sum += d * d;
@@ -183,6 +227,7 @@ impl Solver<'_> {
     /// Moments of the target patch at `t` and the source patch at `s` per channel:
     /// `[Σt, Σt², Σs, Σs², Σts]`, and the sample count.
     pub(super) fn moments(&self, t: (i32, i32), s: (i32, i32), m: &mut [[f32; 5]]) -> usize {
+        let img = self.m();
         let (w, h, ch, r) = (self.w as i32, self.h as i32, self.ch, self.r);
         m.iter_mut().for_each(|v| *v = [0.0; 5]);
         let mut n = 0usize;
@@ -200,7 +245,7 @@ impl Solver<'_> {
                 let ti = (ty as usize * self.w + tx as usize) * ch;
                 let si = (sy as usize * self.w + (s.0 + dx) as usize) * ch;
                 for (c, mc) in m.iter_mut().enumerate().take(ch) {
-                    let (a, b) = (self.img[ti + c], self.img[si + c]);
+                    let (a, b) = (img[ti + c], img[si + c]);
                     mc[0] += a;
                     mc[1] += a * a;
                     mc[2] += b;
@@ -217,6 +262,7 @@ impl Solver<'_> {
     /// sums kept from [`Solver::costs`], the source's from [`Solver::prepare`] when kept, each
     /// summed in the same order as there.
     pub(super) fn moments_full(&self, k: usize, t: (i32, i32), s: (i32, i32), m: &mut [[f32; 5]]) {
+        let img = self.m();
         let (w, ch, r) = (self.w, self.ch, self.r);
         let c8 = m.len();
         let side = (2 * r + 1) as usize;
@@ -226,7 +272,7 @@ impl Solver<'_> {
         for dy in -r..=r {
             let ti = ((t.1 + dy) as usize * w + (t.0 - r) as usize) * ch;
             let si = ((s.1 + dy) as usize * w + (s.0 - r) as usize) * ch;
-            let (trow, srow) = (&self.img[ti..ti + side * ch], &self.img[si..si + side * ch]);
+            let (trow, srow) = (&img[ti..ti + side * ch], &img[si..si + side * ch]);
             if sm.is_some() {
                 for (tp, sp) in trow.chunks_exact(ch).zip(srow.chunks_exact(ch)) {
                     for c in 0..c8 {
@@ -533,7 +579,7 @@ impl Solver<'_> {
             let c8 = ch.min(MOM_CH);
             let side = 2 * r + 1;
             let mut tmom = std::mem::take(&mut self.tmom);
-            let (img, full, ctl) = (&*self.img, &self.full, &self.ctl);
+            let (img, full, ctl) = (self.m(), &self.full, &self.ctl);
             self.cells.rows_mut(&mut tmom, c8, par, |y, runs, out| {
                 if ctl.cancelled() {
                     return;

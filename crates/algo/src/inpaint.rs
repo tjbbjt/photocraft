@@ -133,7 +133,7 @@ pub fn complete_masked(
     p: &CompleteParams,
     ctl: &photocraft_raster::Interrupt,
 ) -> Result<Option<Vec<f32>>, photocraft_raster::Cancelled> {
-    Ok(complete_cow(w, h, ch, Cow::Borrowed(img), px, p, ctl)?.ok())
+    Ok(complete_cow(w, h, ch, Cow::Borrowed(img), px, None, p, ctl)?.ok())
 }
 
 /// [`complete_masked`] that fills `img` itself instead of a copy of it (only the hole changes):
@@ -147,17 +147,42 @@ pub fn complete_masked_owned(
     p: &CompleteParams,
     ctl: &photocraft_raster::Interrupt,
 ) -> Result<Result<Vec<f32>, Vec<f32>>, photocraft_raster::Cancelled> {
-    Ok(complete_cow(w, h, ch, Cow::Owned(img), px, p, ctl)?.map_err(Cow::into_owned))
+    Ok(complete_cow(w, h, ch, Cow::Owned(img), px, None, p, ctl)?.map_err(Cow::into_owned))
 }
 
-/// The completion, on the caller's pixels or a copy of them: `Err` gives them back when there is
-/// nothing to copy from.
+/// [`complete_masked_owned`] guided by `guide`, a picture the size of `img` of what the hole
+/// should look like: a model's fill at a reduced size, scaled up `scale` times (1 for a guide at
+/// full sharpness). The guide decides the layout (where the sky ends, which way a ridge runs) and
+/// the picture the detail: at every level the hole's patches are matched as the guide shows them,
+/// against the picture softened to the guide's sharpness, and the fill copies the matched pieces
+/// of the picture at their full sharpness. The guide is never overwritten, so the matching
+/// cannot drift away from it the way a fill that only starts from it does.
+#[allow(clippy::too_many_arguments)]
+pub fn complete_guided_owned(
+    w: usize,
+    h: usize,
+    ch: usize,
+    img: Vec<f32>,
+    px: &[Px],
+    guide: &[f32],
+    scale: f32,
+    p: &CompleteParams,
+    ctl: &photocraft_raster::Interrupt,
+) -> Result<Result<Vec<f32>, Vec<f32>>, photocraft_raster::Cancelled> {
+    assert_eq!(guide.len(), img.len(), "the guide is the picture's size");
+    Ok(complete_cow(w, h, ch, Cow::Owned(img), px, Some((guide, scale.max(1.0))), p, ctl)?.map_err(Cow::into_owned))
+}
+
+/// The completion, on the caller's pixels or a copy of them, guided or not: `Err` gives them
+/// back when there is nothing to copy from.
+#[allow(clippy::too_many_arguments)]
 fn complete_cow<'a>(
     w: usize,
     h: usize,
     ch: usize,
     img: Cow<'a, [f32]>,
     px: &'a [Px],
+    guide: Option<(&[f32], f32)>,
     p: &CompleteParams,
     ctl: &photocraft_raster::Interrupt,
 ) -> Result<Result<Vec<f32>, Cow<'a, [f32]>>, photocraft_raster::Cancelled> {
@@ -176,6 +201,8 @@ fn complete_cow<'a>(
     let psz = 2 * r + 1;
     let Pyramid { mut levels, boxes, exts, thin } = build_pyramid(Level { w, h, img, px: Cow::Borrowed(px) }, ch, hb0, psz, ctl)?;
     let nlev = levels.len();
+    // The guide at each level's size, finest first, and how much softer than that level it is.
+    let guides: Option<(Vec<Vec<f32>>, f32)> = guide.map(|(g, scale)| (guide_pyramid(g, w, h, ch, nlev), scale));
     // The coarser level's result.
     let mut prev: Option<Coarser> = None;
     let total_px: usize = levels.iter().map(|l| l.w * l.h).sum();
@@ -203,6 +230,15 @@ fn complete_cow<'a>(
         let coarser = prev.take();
         match &coarser {
             Some(c) => copy_up_coarser(&mut limg, &lpx, lw, ch, hb, c),
+            // Guided: the hole starts as the guide.
+            None if guides.as_ref().is_some_and(|(g, _)| g[li].len() == limg.len()) => {
+                let g = guides.as_ref().map_or(&[][..], |(g, _)| &g[li][..]);
+                for (i, k) in lpx.iter().enumerate() {
+                    if *k == Px::Hole {
+                        limg[i * ch..(i + 1) * ch].copy_from_slice(&g[i * ch..(i + 1) * ch]);
+                    }
+                }
+            }
             // A thin hole, when peeling it would take too long, takes the membrane below: a few
             // patches thick here, a membrane across it is its surroundings.
             None if sources.len() > 0 && (!thin || peel_affordable(lw, &lpx, hb, sources.len())) => {
@@ -210,6 +246,11 @@ fn complete_cow<'a>(
             }
             None => fill_hole_with_membrane(&mut limg, &lpx, (lw, lh, ch), r, thin),
         }
+        // A guided fill's guide at this level, and how many of this level's pixels soft it is.
+        let guide_here: Option<(&[f32], usize)> = guides
+            .as_ref()
+            .filter(|(g, _)| g[li].len() == limg.len())
+            .map(|(g, scale)| (&g[li][..], (scale / (1u64 << li.min(63)) as f32).ceil().max(1.0) as usize));
         if sources.len() == 0 {
             prev = Some(Coarser { w: lw, h: lh, img: limg, field: Vec::new(), cells });
             continue;
@@ -224,6 +265,8 @@ fn complete_cow<'a>(
             ch,
             r: ri,
             img: &mut limg,
+            guide: guide_here,
+            mimg: None,
             px: &lpx,
             valid,
             cells,
@@ -233,6 +276,7 @@ fn complete_cow<'a>(
             adapt: p.adapt,
             ctl: *ctl,
         };
+        solver.refresh_match();
         solver.prepare(keep_source_moments);
         ctl.check()?;
         // NNF init: the coarser level's matches scaled up where they land on a valid source,
@@ -258,6 +302,9 @@ fn complete_cow<'a>(
         let full_search = (lw.max(lh)) as i32;
         for it in 0..em {
             // Costs change as hole pixels are re-estimated: refresh before each PatchMatch.
+            if it > 0 || upsampled {
+                solver.refresh_match();
+            }
             solver.costs(&nnf, &mut cost)?;
             // Wide random search on the coarsest level and on each level's first iteration,
             // local refinement afterwards.
@@ -330,6 +377,38 @@ fn build_pyramid<'a>(
         exts.push(ext);
     }
     Ok(Pyramid { levels, boxes, exts, thin })
+}
+
+/// A `w × h × ch` guide at each of `levels` pyramid levels, finest first: halved as the pyramid
+/// halves the picture (each cell the mean of its 2 × 2 pixels within the grid).
+fn guide_pyramid(g: &[f32], w: usize, h: usize, ch: usize, levels: usize) -> Vec<Vec<f32>> {
+    let mut out = vec![g.to_vec()];
+    let (mut cw, mut chh) = (w, h);
+    while out.len() < levels {
+        let cur = &out[out.len() - 1];
+        let (nw, nh) = (cw.div_ceil(2), chh.div_ceil(2));
+        let mut next = vec![0.0f32; nw * nh * ch];
+        par::chunks_mut(&mut next, nw * ch, nw * nh >= common::PAR_MIN, |y, row| {
+            for x in 0..nw {
+                let mut n = 0.0f32;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (sx, sy) = (2 * x + dx, 2 * y + dy);
+                    if sx < cw && sy < chh {
+                        for c in 0..ch {
+                            row[x * ch + c] += cur[(sy * cw + sx) * ch + c];
+                        }
+                        n += 1.0;
+                    }
+                }
+                for v in &mut row[x * ch..(x + 1) * ch] {
+                    *v /= n;
+                }
+            }
+        });
+        out.push(next);
+        (cw, chh) = (nw, nh);
+    }
+    out
 }
 
 /// The level's own pixels to fill: the caller's, or a copy made in parallel.
