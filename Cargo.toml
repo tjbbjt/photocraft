@@ -343,6 +343,7 @@ egui_system_font_provider = { git = "https://github.com/storytold/egui.git", rev
 eframe = { git = "https://github.com/storytold/egui.git", rev = "e9711ca9b69772f875ae0d1cef1977ff8c16234d" }
 egui_demo_lib = { git = "https://github.com/storytold/egui.git", rev = "e9711ca9b69772f875ae0d1cef1977ff8c16234d" }
 egui_inspection = { git = "https://github.com/storytold/egui.git", rev = "e9711ca9b69772f875ae0d1cef1977ff8c16234d" }
-winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457d84ee4975110bfda6797c44dc" }
+# The Wayland busy reader (tjbbjt/winit, on storytold/winit a517b38): keeps reading while the event loop is busy.
+winit = { git = "https://github.com/tjbbjt/winit.git", rev = "01c564f7b1e655b31331fe3fda957b70f2b14da0" }
 
 
