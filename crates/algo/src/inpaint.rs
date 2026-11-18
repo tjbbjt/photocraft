@@ -73,6 +73,9 @@ use sources::{hole_bbox, integral};
 use synthesis::onion_peel;
 pub use synthesis::{best_offset, synthesize};
 
+/// How strongly a guided fill favours coherent matches ([`Solver::coherence`]).
+const GUIDED_COHERENCE: f32 = 1.0;
+
 /// Parameters for [`complete`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompleteParams {
@@ -267,6 +270,7 @@ fn complete_cow<'a>(
             img: &mut limg,
             guide: guide_here,
             mimg: None,
+            coherence: if guides.is_some() { GUIDED_COHERENCE } else { 0.0 },
             px: &lpx,
             valid,
             cells,

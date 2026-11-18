@@ -55,10 +55,35 @@ fn every_contents_option_fills() {
     fill(&mut app, json!({"contents": "color", "color": "#336699"})).unwrap();
     app.run("select.rect", json!({"x": 15, "y": 10, "width": 6, "height": 6})).unwrap();
     fill(&mut app, json!({"contents": "white"})).unwrap();
-    fill(&mut app, json!({"contents": "contentAware", "colorAdaptation": false})).unwrap();
+    fill(&mut app, json!({"contents": "contentAware", "colorAdaptation": false, "fillMode": "parity"})).unwrap();
     assert!(close(px(&app, 17, 12), [0.2, 0.4, 0.6, 1.0]), "{:?}", px(&app, 17, 12));
     // Each fill is one history step.
     assert_eq!(app.session.active().unwrap().history.past_len(), 12);
+}
+
+/// Content-Aware with PhotoCraft features on runs the Content-Aware Fill command with Fill's
+/// sampling, the method and the edge band; Parity, other contents and masks run Fill itself.
+#[test]
+fn photocraft_content_aware_runs_the_content_aware_fill_command() {
+    let app = app();
+    let mut f = fields(&app);
+    assert_eq!(f["fillMode"], "photocraft");
+    assert_eq!(photocraft_params(&f), None, "Foreground is Fill's");
+    f.insert("contents".into(), json!("contentAware"));
+    f.insert("method".into(), json!("lama"));
+    f.insert("edgeFeather".into(), json!(12.4));
+    f.insert("colorAdaptation".into(), json!(false));
+    let p = photocraft_params(&f).expect("PhotoCraft content-aware");
+    assert_eq!(p["sampling"], "rectangular");
+    assert_eq!(p["colorAdaptation"], "none");
+    assert_eq!(p["method"], "lama");
+    assert_eq!(p["edgeGrow"], json!(EDGE_GROW));
+    assert_eq!(p["edgeFeather"], json!(12.0));
+    f.insert("__target".into(), json!("mask"));
+    assert_eq!(photocraft_params(&f), None, "a mask is Fill's (which refuses it)");
+    f.insert("__target".into(), json!("pixels"));
+    f.insert("fillMode".into(), json!("parity"));
+    assert_eq!(photocraft_params(&f), None, "Parity is Fill's");
 }
 
 #[test]

@@ -40,7 +40,8 @@ pub fn control(app: &mut PhotocraftApp, ui: &Value) -> Result<Value, String> {
         }
     }
     let after = app.distort.caf.as_ref().map(|w| w.opts.clone());
-    if after.as_ref().is_some_and(|a| a.sample_all != before.sample_all) {
+    // The edge band changes the fill area, so the base is worked out again, as for Sample All Layers.
+    if after.as_ref().is_some_and(|a| a.sample_all != before.sample_all || a.edge() != before.edge()) {
         rebase(app);
     } else if after.as_ref().is_some_and(|a| *a != before)
         && let Some(w) = app.distort.caf.as_mut()

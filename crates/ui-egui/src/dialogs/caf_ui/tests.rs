@@ -35,7 +35,28 @@ fn app_with_selection() -> PhotocraftApp {
         .unwrap();
     app.session.execute("select.rect", json!({"x": 90, "y": 70, "width": 20, "height": 20})).unwrap();
     app.sync_views();
+    // The tests below check Photoshop's fill; PhotoCraft's has its own test.
+    app.session.prefs.edit(|p| p.dialogs.insert(REMEMBERED.into(), json!({"fillMode": "parity"})));
     app
+}
+
+/// PhotoCraft features on fills with the method and the edge band; Parity with Classic and no
+/// band, whatever they are set to. The band widens the fill area the engine fills.
+#[test]
+fn photocraft_behavior_sends_the_method_and_the_edge_band() {
+    let mut app = app_with_selection();
+    open(&mut app).unwrap();
+    control(&mut app, &json!({"method": "lama", "edgeGrow": 3, "edgeFeather": 5})).unwrap();
+    let p = plan_params(ws(&app), true);
+    assert_eq!((p["method"].clone(), p["edgeGrow"].clone(), p["edgeFeather"].clone()), (json!("classic"), json!(0.0), json!(0.0)), "Parity: {p}");
+    let (_, _, parity_hole) = engine_source(&app);
+    control(&mut app, &json!({"fillMode": "photocraft", "method": "classic"})).unwrap();
+    let p = plan_params(ws(&app), true);
+    assert_eq!((p["method"].clone(), p["edgeGrow"].clone(), p["edgeFeather"].clone()), (json!("classic"), json!(3.0), json!(5.0)), "PhotoCraft: {p}");
+    let (_, _, hole) = engine_source(&app);
+    let count = |h: &[bool]| h.iter().filter(|h| **h).count();
+    assert!(count(&hole) > count(&parity_hole), "the band widens the fill area");
+    assert!(control(&mut app, &json!({"fillMode": "fancy"})).is_err());
 }
 
 fn px(app: &PhotocraftApp, layer: LayerId, x: i32, y: i32) -> Vec<f32> {
@@ -72,12 +93,12 @@ fn settings_dropdowns_are_named_for_their_visible_labels() {
 }
 
 /// Photoshop opens the workspace with the Sampling Brush subtracting at a tenth of the
-/// window's side, Auto sampling, output to a new layer.
+/// window's side, Auto sampling, output to a new layer (PhotoCraft features off: no edge band).
 #[test]
 fn opens_like_photoshop() {
     let mut app = app_with_selection();
     app.session.prefs.edit(|p| {
-        p.dialogs.remove(REMEMBERED);
+        p.dialogs.insert(REMEMBERED.into(), json!({"fillMode": "parity"}));
     });
     open(&mut app).unwrap();
     let d = ws(&app).describe();
@@ -285,7 +306,7 @@ fn failed_cancelled_and_stale_jobs_do_not_close_a_caf_workspace() {
     open(&mut app).unwrap();
     let document = ws(&app).document;
     let job = JobId(71);
-    app.distort.caf.as_mut().unwrap().pending_fill = Some(PendingFill { job, close_on_success: true });
+    app.distort.caf.as_mut().unwrap().pending_fill = Some(PendingFill { job, close_on_success: true, started: web_time::Instant::now() });
 
     let mut event = JobEvent {
         id: JobId(70),
@@ -305,7 +326,7 @@ fn failed_cancelled_and_stale_jobs_do_not_close_a_caf_workspace() {
     assert!(ws(&app).pending_fill.is_none());
     assert_eq!(ws(&app).error.as_deref(), Some("cancelled"));
 
-    app.distort.caf.as_mut().unwrap().pending_fill = Some(PendingFill { job: JobId(72), close_on_success: true });
+    app.distort.caf.as_mut().unwrap().pending_fill = Some(PendingFill { job: JobId(72), close_on_success: true, started: web_time::Instant::now() });
     event.id = JobId(72);
     event.outcome = JobOutcome::Failed("fill failed".into());
     on_job_event(&mut app, &event);
@@ -313,7 +334,7 @@ fn failed_cancelled_and_stale_jobs_do_not_close_a_caf_workspace() {
     assert!(ws(&app).pending_fill.is_none());
     assert_eq!(ws(&app).error.as_deref(), Some("fill failed"));
 
-    app.distort.caf.as_mut().unwrap().pending_fill = Some(PendingFill { job: JobId(73), close_on_success: true });
+    app.distort.caf.as_mut().unwrap().pending_fill = Some(PendingFill { job: JobId(73), close_on_success: true, started: web_time::Instant::now() });
     cancel(&mut app);
     open(&mut app).unwrap();
     event.id = JobId(73);
@@ -331,7 +352,7 @@ fn a_success_for_an_inactive_document_does_not_close_its_workspace() {
     crate::distort_ui::drop_foreign(&mut app);
     let document = ws(&app).document;
     let job = JobId(74);
-    app.distort.caf.as_mut().unwrap().pending_fill = Some(PendingFill { job, close_on_success: true });
+    app.distort.caf.as_mut().unwrap().pending_fill = Some(PendingFill { job, close_on_success: true, started: web_time::Instant::now() });
     app.session.execute("file.new", json!({"width": 32, "height": 32, "depth": 8})).unwrap();
 
     let event = JobEvent {
@@ -429,6 +450,7 @@ fn settings_are_remembered_and_the_menu_opens_the_workspace() {
     crate::menus::invoke(&mut app, &ctx, "edit.contentAwareFill", json!({"ui": {"cancel": true}})).unwrap();
     open(&mut app).unwrap();
     let mut want = CafOpts::default();
+    want.apply(&json!({"fillMode": "parity"})).unwrap();
     want.apply(&set).unwrap();
     assert_eq!(ws(&app).opts, want);
     // Bad values are errors; the engine command with params still runs directly.

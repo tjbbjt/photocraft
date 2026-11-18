@@ -18,6 +18,11 @@ pub(super) struct Solver<'a> {
     /// What patches are compared on when guided ([`Solver::m`]): the picture, with the hole as
     /// the guide plus the current fill's own detail.
     pub(super) mimg: Option<Vec<f32>>,
+    /// How much PatchMatch favours coherent matches: a match its left or upper neighbour's
+    /// shifted by one is taken over a better one unless that is better by this share (0: the best
+    /// wins). A guided fill sets it, so neighbouring pixels copy one piece of the picture and the
+    /// vote stamps it rather than averaging many pieces that match a soft guide about equally.
+    pub(super) coherence: f32,
     pub(super) px: &'a [Px],
     /// Valid source centres: the whole patch is inside the grid and may be copied from.
     pub(super) valid: Vec<bool>,
@@ -355,21 +360,27 @@ impl Solver<'_> {
         search_radius: i32,
     ) -> ((i32, i32), f32) {
         let (mut best, mut bc) = cur;
+        // A coherent match (a neighbour's, shifted) counts as `favour` times better than it is.
+        let favour = 1.0 + self.coherence;
+        let mut coherent = false;
         if let Some(c) = left {
             let cand = (c.0 + step, c.1);
+            coherent |= cand == best;
             if self.is_valid(cand.0, cand.1) && cand != best {
-                let d = self.dist(t, k, cand, bc);
-                if d < bc {
-                    (best, bc) = (cand, d);
+                let d = self.dist(t, k, cand, bc * favour);
+                if d < bc * favour {
+                    (best, bc, coherent) = (cand, d, true);
                 }
             }
         }
         if let Some(c) = up {
             let cand = (c.0, c.1 + step);
+            coherent |= cand == best;
             if self.is_valid(cand.0, cand.1) && cand != best {
-                let d = self.dist(t, k, cand, bc);
-                if d < bc {
-                    (best, bc) = (cand, d);
+                let lim = if coherent { bc } else { bc * favour };
+                let d = self.dist(t, k, cand, lim);
+                if d < lim {
+                    (best, bc, coherent) = (cand, d, true);
                 }
             }
         }
@@ -377,9 +388,10 @@ impl Solver<'_> {
         while rad >= 1 {
             let cand = (best.0 + rng.range(-rad, rad), best.1 + rng.range(-rad, rad));
             if self.is_valid(cand.0, cand.1) && cand != best {
-                let d = self.dist(t, k, cand, bc);
-                if d < bc {
-                    (best, bc) = (cand, d);
+                let lim = if coherent { bc / favour } else { bc };
+                let d = self.dist(t, k, cand, lim);
+                if d < lim {
+                    (best, bc, coherent) = (cand, d, false);
                 }
             }
             rad /= 2;

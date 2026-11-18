@@ -410,6 +410,7 @@ fn full_patches_measure_as_clipped_ones() {
                 img: &mut img,
                 guide: None,
                 mimg: None,
+                coherence: 0.0,
                 px: &px,
                 valid: valid.clone(),
                 cells,

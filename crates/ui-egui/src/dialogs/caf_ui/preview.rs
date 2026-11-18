@@ -40,6 +40,11 @@ pub(super) struct Preview {
     /// The base being worked out on a worker ([`start_base`]).
     #[cfg(not(target_arch = "wasm32"))]
     base_running: Option<BaseRun>,
+    /// When the running preview started, for the timer beside the spinner.
+    pub(super) started: Option<web_time::Instant>,
+    /// How long the last preview and the last Apply / OK fill took, s (shown in the panel).
+    pub(super) last_secs: Option<f32>,
+    pub(super) last_fill_secs: Option<f32>,
 }
 
 /// A base being worked out on a worker: its answer, its job (to cancel it), and what to do with it.
@@ -101,8 +106,10 @@ pub(super) fn plan_params(w: &CafWorkspace, strokes: bool) -> Value {
         "scale": o.scale,
         "mirror": o.mirror,
         "output": o.output,
-        "method": o.method,
+        "method": o.fill_method(),
         "detail": o.detail,
+        "edgeGrow": o.edge().0,
+        "edgeFeather": o.edge().1,
         "layer": w.layer.0,
         "fillEdits": w.fill_edits,
     });
@@ -538,10 +545,18 @@ pub(super) fn drive_preview(app: &mut PhotocraftApp, ctx: &egui::Context, draggi
             Ok(r) => {
                 let generation = *generation;
                 pv.running = None;
+                let secs = pv.started.take().map(|t| t.elapsed().as_secs_f32());
                 if generation == pv.want {
                     match r {
                         Err(e) if e == "cancelled" => {}
-                        r => pv.finish(generation, r),
+                        r => {
+                            if let Some(secs) = secs {
+                                pv.last_secs = Some(secs);
+                                let how = if r.is_ok() { "done" } else { "failed" };
+                                log::info!("content-aware preview ({}): {how} in {secs:.1} s", w.opts.fill_method());
+                            }
+                            pv.finish(generation, r)
+                        }
                     }
                 }
             }
@@ -574,7 +589,10 @@ pub(super) fn drive_preview(app: &mut PhotocraftApp, ctx: &egui::Context, draggi
         repaint.request_repaint();
     });
     match spawned {
-        Ok(_) => w.preview.running = Some((generation, rx, job)),
+        Ok(_) => {
+            w.preview.running = Some((generation, rx, job));
+            w.preview.started = Some(web_time::Instant::now());
+        }
         Err(e) => w.preview.error = Some(format!("could not start the preview: {e}")),
     }
 }

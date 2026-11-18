@@ -969,6 +969,32 @@ fn content_aware_fill_of_a_border_ring_changes_only_the_ring() {
     assert!(changed > 0, "the ring is filled");
 }
 
+/// The edge band (`edgeGrow`, `edgeFeather`) widens the fill area: the grown pixels take all of
+/// the fill, the feathered ones part of it, fading with the distance, and pixels past the band
+/// stay out. Without it the fill area is the selection's.
+#[test]
+fn the_edge_band_widens_the_fill_area_and_fades_it_out() {
+    let mut s = blob_session(8);
+    s.execute("select.rect", json!({"x": 24, "y": 16, "width": 16, "height": 16})).unwrap();
+    let st = s.active().unwrap();
+    let id = st.active_layer.unwrap();
+    let plan = |p: Value| content_aware_plan(&st.doc, id, &p, "edit.contentAwareFill").unwrap();
+    let (plain, banded) = (plan(json!({})), plan(json!({"edgeGrow": 2, "edgeFeather": 4})));
+    let at = |plan: &CafPlan, x: i32, y: i32| {
+        let i = (y - plan.rect.y0) as usize * plan.rect.width() as usize + (x - plan.rect.x0) as usize;
+        (plan.hole[i], plan.cover[i])
+    };
+    assert_eq!(at(&plain, 24, 20), (true, 1.0));
+    assert_eq!(at(&plain, 22, 20), (false, 0.0));
+    assert_eq!(at(&banded, 24, 20), (true, 1.0), "inside");
+    assert_eq!(at(&banded, 22, 20), (true, 1.0), "2 px out: grown");
+    let (inside, part) = at(&banded, 20, 20);
+    assert!(inside && part > 0.3 && part < 0.9, "4 px out: feathered ({part})");
+    assert!(at(&banded, 19, 20).1 < part, "fading outwards");
+    assert_eq!(at(&banded, 17, 20), (false, 0.0), "7 px out: past the band");
+    assert!(content_aware_plan(&st.doc, id, &json!({"edgeGrow": 300}), "edit.contentAwareFill").is_err());
+}
+
 /// A model's fill guides the fill (`detail`): the hole takes the guide's layout, red where it says
 /// red and blue where it says blue, in pixels copied from the picture; without `detail` it takes
 /// the guide as it is. Nothing outside the hole changes. (No model runs: the guide is given.)
