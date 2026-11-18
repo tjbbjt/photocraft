@@ -74,6 +74,10 @@ pub struct DocState {
     /// copy above each. Only meaningful while the document's selection still equals the one kept
     /// here; anything else that changes the selection makes it stale (see `selection_sources`).
     pub(crate) selection_layers: Option<(photocraft_raster::Surface, Vec<LayerId>)>,
+    /// The count of steps whose damage was not empty: pixel thumbnails (the Channels panel's composite and colour
+    /// rows) change only when it moves, so a selection-only or view-only step keeps them. Written only by
+    /// `Session::dispatch` and the job apply path.
+    pub pixel_revision: u64,
 }
 
 impl DocState {
@@ -134,15 +138,14 @@ impl DocState {
             source_snapshot: None,
             typed_names: Default::default(),
             selection_layers: None,
+            pixel_revision: 0,
         }
     }
     /// The selected layers in bottom-to-top document order, always including the active layer.
     /// Robust against stale state: ids no longer in the document are skipped, and if the active
     /// layer was changed without updating the set, the selection is just the active layer.
     pub fn selected_layers(&self) -> Vec<LayerId> {
-        let Some(active) = self.active_layer else { return Vec::new() };
-        let set: &[LayerId] = if self.selected_layers.contains(&active) { &self.selected_layers } else { std::slice::from_ref(&active) };
-        self.doc.walk().into_iter().map(|(_, _, l)| l.id).filter(|id| set.contains(id)).collect()
+        selected_in(&self.doc, self.active_layer, &self.selected_layers)
     }
     /// The layers whose thumbnails built the current selection ([`Self::selection_layers`]),
     /// if the selection is still exactly the one they built and they are all still here.
@@ -258,6 +261,19 @@ impl ToolState {
     /// background (reveal-paint first).
     pub const MASK_COLORS: [[f32; 4]; 2] = [[1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 1.0]];
 
+    /// The pixel colour pair a fresh session starts with: black foreground, white background.
+    pub const PIXEL_COLORS: [[f32; 4]; 2] = [[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]];
+
+    /// The swatches as `Preferences::tool_colors` keeps them: the pixel pair, the mask pair and the CMYK picks.
+    pub fn saved_colors(pairs: [[[f32; 4]; 2]; 2], cmyk_picks: &[([f32; 3], [f32; 4])]) -> serde_json::Value {
+        let [[foreground, background], [mask_foreground, mask_background]] = pairs;
+        serde_json::json!({
+            "foreground": foreground, "background": background,
+            "maskForeground": mask_foreground, "maskBackground": mask_background,
+            "cmykPicks": cmyk_picks,
+        })
+    }
+
     /// Note that `brush` or `current_preset` changed. Every setter of either (commands and the
     /// shell's tool-switch paths) calls this; the last-brush persistence only serialises when the
     /// revision has moved since the stored value ([`Self::brush_saved_rev`]).
@@ -285,8 +301,8 @@ impl ToolState {
 impl Default for ToolState {
     fn default() -> Self {
         Self {
-            foreground: [0.0, 0.0, 0.0, 1.0],
-            background: [1.0, 1.0, 1.0, 1.0],
+            foreground: Self::PIXEL_COLORS[0],
+            background: Self::PIXEL_COLORS[1],
             // Photoshop's Brush tool starts at 10 % Smoothing.
             brush: photocraft_paint::BrushSettings {
                 smoothing: photocraft_paint::brush::Smoothing { amount: 0.1, ..Default::default() },
@@ -328,3 +344,11 @@ pub struct CopiedStyle {
 /// Cut aren't: whether they have anything to copy (a selection over transparent pixels, a group
 /// or fill layer) is known only when they run.
 pub const PRECHECKED: &[&str] = &["layer.new.layer", "layer.new.group", "layer.new.groupFromLayers", "layer.new.layerFromBackground"];
+
+/// The selected layers of `doc` whose active layer is `active` and whose selection set is `selected`, in bottom-to-top
+/// order ([`DocState::selected_layers`]), for a reader that holds the document without its editing state.
+pub fn selected_in(doc: &Document, active: Option<LayerId>, selected: &[LayerId]) -> Vec<LayerId> {
+    let Some(active) = active else { return Vec::new() };
+    let set: &[LayerId] = if selected.contains(&active) { selected } else { std::slice::from_ref(&active) };
+    doc.walk().into_iter().map(|(_, _, l)| l.id).filter(|id| set.contains(id)).collect()
+}
