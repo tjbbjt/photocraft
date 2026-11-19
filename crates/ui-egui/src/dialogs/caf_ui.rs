@@ -217,7 +217,7 @@ impl CafOpts {
         if let Some(s) = pick("output", &["current", "new", "duplicate"])? {
             self.output = s;
         }
-        if let Some(s) = pick("method", &["classic", "lama", "migan", "mix"])? {
+        if let Some(s) = pick("method", &["classic", "quality", "lama", "migan", "mix"])? {
             self.method = s;
         }
         if let Some(s) = pick("fillMode", &["parity", "photocraft"])? {

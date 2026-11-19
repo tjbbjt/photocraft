@@ -26,6 +26,9 @@ pub(super) struct Solver<'a> {
     /// A guided fill's vote stamps: each pixel takes the best match covering it (the highest
     /// weight) rather than the mean of all of them, so the copies stay sharp. Off unguided.
     pub(super) stamp: bool,
+    /// A nearby fill's reach at this level ([`CompleteParams::nearby`]): sources at most this
+    /// many pixels from their target across and down; 0 anywhere.
+    pub(super) reach: i32,
     pub(super) px: &'a [Px],
     /// Valid source centres: the whole patch is inside the grid and may be copied from.
     pub(super) valid: Vec<bool>,
@@ -125,6 +128,26 @@ impl Solver<'_> {
             }
         });
         self.mimg = Some(m);
+    }
+
+    /// Whether target `t` may copy source `s`: within reach of it, for a nearby fill.
+    #[inline]
+    pub(super) fn allowed(&self, t: (i32, i32), s: (i32, i32)) -> bool {
+        self.reach <= 0 || ((s.0 - t.0).abs() <= self.reach && (s.1 - t.1).abs() <= self.reach)
+    }
+
+    /// A source within a nearby fill's reach of `t`: one of 16 random tries, else the nearest.
+    fn within_reach(&self, t: (i32, i32), rng: &mut Rng) -> Option<(i32, i32)> {
+        let r = self.reach;
+        for _ in 0..16 {
+            let cand = (t.0 + rng.range(-r, r), t.1 + rng.range(-r, r));
+            if self.is_valid(cand.0, cand.1) {
+                return Some(cand);
+            }
+        }
+        (1..=r).find_map(|d| {
+            (-d..=d).flat_map(|i| [(t.0 + i, t.1 - d), (t.0 + i, t.1 + d), (t.0 - d, t.1 + i), (t.0 + d, t.1 + i)]).find(|c| self.is_valid(c.0, c.1))
+        })
     }
 
     #[inline]
@@ -365,7 +388,7 @@ impl Solver<'_> {
     /// windows around the best (two numbers from `rng` per window).
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    fn pm_step(
+    pub(super) fn pm_step(
         &self,
         t: (i32, i32),
         k: usize,
@@ -377,13 +400,20 @@ impl Solver<'_> {
         search_radius: i32,
     ) -> ((i32, i32), f32) {
         let (mut best, mut bc) = cur;
+        // Nearby: a match out of reach (a random start, a coarser level's) is replaced by one
+        // within it: a random one, or the nearest when the hole leaves few to pick from.
+        if !self.allowed(t, best)
+            && let Some(cand) = self.within_reach(t, rng)
+        {
+            (best, bc) = (cand, self.dist(t, k, cand, f32::INFINITY));
+        }
         // A coherent match (a neighbour's, shifted) counts as `favour` times better than it is.
         let favour = 1.0 + self.coherence;
         let mut coherent = false;
         if let Some(c) = left {
             let cand = (c.0 + step, c.1);
             coherent |= cand == best;
-            if self.is_valid(cand.0, cand.1) && cand != best {
+            if self.is_valid(cand.0, cand.1) && cand != best && self.allowed(t, cand) {
                 let d = self.dist(t, k, cand, bc * favour);
                 if d < bc * favour {
                     (best, bc, coherent) = (cand, d, true);
@@ -393,7 +423,7 @@ impl Solver<'_> {
         if let Some(c) = up {
             let cand = (c.0, c.1 + step);
             coherent |= cand == best;
-            if self.is_valid(cand.0, cand.1) && cand != best {
+            if self.is_valid(cand.0, cand.1) && cand != best && self.allowed(t, cand) {
                 let lim = if coherent { bc } else { bc * favour };
                 let d = self.dist(t, k, cand, lim);
                 if d < lim {
@@ -404,7 +434,7 @@ impl Solver<'_> {
         let mut rad = search_radius;
         while rad >= 1 {
             let cand = (best.0 + rng.range(-rad, rad), best.1 + rng.range(-rad, rad));
-            if self.is_valid(cand.0, cand.1) && cand != best {
+            if self.is_valid(cand.0, cand.1) && cand != best && self.allowed(t, cand) {
                 let lim = if coherent { bc / favour } else { bc };
                 let d = self.dist(t, k, cand, lim);
                 if d < lim {

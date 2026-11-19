@@ -303,12 +303,13 @@ fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Resul
         "custom" => return Err(bad(cmd, "custom sampling needs `area` [x,y,w,h], `channel` (alpha channel index or name) or `samplingStrokes`")),
         other => return Err(bad(cmd, format!("unknown sampling `{other}` (auto|rectangular|custom)"))),
     }
-    let opts = FillOptions {
+    let mut opts = FillOptions {
         color_adaptation: color_level(str_or(p, "colorAdaptation", "default")),
         rotations: rotation_level(str_or(p, "rotationAdaptation", "none")),
         scale: bool_or(p, "scale", false),
         mirror: bool_or(p, "mirror", false),
         seed: p.get("seed").and_then(Value::as_u64).unwrap_or(1),
+        ..FillOptions::default()
     };
     let output = str_or(p, "output", "current").to_string();
     if !matches!(output.as_str(), "current" | "new" | "duplicate") {
@@ -317,7 +318,13 @@ fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Resul
     let model = match str_or(p, "method", "classic") {
         "classic" => None,
         m @ ("lama" | "migan" | "mix") => Some(FillModel { method: m.to_string(), detail: bool_or(p, "detail", true) }),
-        other => return Err(bad(cmd, format!("unknown method `{other}` (classic|lama|migan|mix)"))),
+        // Quality: Classic, copying only from near each hole pixel, started from LaMa's layout.
+        "quality" => {
+            opts.nearby = true;
+            opts.layout_only = true;
+            Some(FillModel { method: "lama".to_string(), detail: true })
+        }
+        other => return Err(bad(cmd, format!("unknown method `{other}` (classic|quality|lama|migan|mix)"))),
     };
     let edge = edge_param(p, cmd)?;
     let surf = doc.layer(id).and_then(|l| l.surface()).ok_or(EngineError::NoLayer(id))?;

@@ -75,6 +75,8 @@ pub use synthesis::{best_offset, synthesize};
 
 /// How strongly a guided fill favours coherent matches ([`Solver::coherence`]).
 const GUIDED_COHERENCE: f32 = 6.0;
+/// The least distance a nearby fill copies from ([`CompleteParams::nearby`]), full-size px.
+const NEARBY_MIN: usize = 64;
 
 /// Parameters for [`complete`].
 #[derive(Clone, Debug, PartialEq)]
@@ -93,11 +95,20 @@ pub struct CompleteParams {
     /// Colour adaptation of the copies.
     pub adapt: Adapt,
     pub seed: u64,
+    /// Copy only from near each hole pixel: no farther than the hole is thick (at least 64 px).
+    /// Classic copied whatever matched best from anywhere, a far, smaller-scale stretch of
+    /// ground into a near one; nearby, the pieces are from the surroundings and keep their size.
+    pub nearby: bool,
+    /// A guided fill whose guide only lays the hole out: the hole starts as the guide, and from
+    /// then on the fill matches, votes and keeps Classic's way. The guide's colours never steer a
+    /// match, so the pieces are chosen and blended as Classic chooses them, only around a start
+    /// that already has the rocks low and the grass high.
+    pub layout_only: bool,
 }
 
 impl Default for CompleteParams {
     fn default() -> Self {
-        Self { patch_radius: 3, em_iters: 10, min_em_iters: 3, pm_iters: 2, refine_extent: 192, adapt: Adapt::NONE, seed: 1 }
+        Self { patch_radius: 3, em_iters: 10, min_em_iters: 3, pm_iters: 2, refine_extent: 192, adapt: Adapt::NONE, seed: 1, nearby: false, layout_only: false }
     }
 }
 
@@ -286,7 +297,7 @@ fn complete_cow<'a>(
     }
     let r = p.patch_radius.max(1);
     let psz = 2 * r + 1;
-    let Pyramid { mut levels, boxes, exts, thin } = build_pyramid(Level { w, h, img, px: Cow::Borrowed(px) }, ch, hb0, psz, ctl)?;
+    let Pyramid { mut levels, boxes, exts, thin, thickness } = build_pyramid(Level { w, h, img, px: Cow::Borrowed(px) }, ch, hb0, psz, ctl)?;
     let nlev = levels.len();
     // The guide at each level's size, finest first, and how much softer than that level it is.
     let guides: Option<(Vec<Vec<f32>>, f32)> = guide.map(|(g, scale)| (guide_pyramid(g, w, h, ch, nlev), scale));
@@ -334,8 +345,10 @@ fn complete_cow<'a>(
             None => fill_hole_with_membrane(&mut limg, &lpx, (lw, lh, ch), r, thin),
         }
         // A guided fill's guide at this level, and how many of this level's pixels soft it is.
+        let steer = guides.is_some() && !p.layout_only;
         let guide_here: Option<(&[f32], usize)> = guides
             .as_ref()
+            .filter(|_| steer)
             .filter(|(g, _)| g[li].len() == limg.len())
             .map(|(g, scale)| (&g[li][..], (scale / (1u64 << li.min(63)) as f32).ceil().max(1.0) as usize));
         if sources.len() == 0 {
@@ -354,8 +367,9 @@ fn complete_cow<'a>(
             img: &mut limg,
             guide: guide_here,
             mimg: None,
-            coherence: if guides.is_some() { GUIDED_COHERENCE } else { 0.0 },
-            stamp: guides.is_some(),
+            coherence: if steer { GUIDED_COHERENCE } else { 0.0 },
+            stamp: steer,
+            reach: if p.nearby { (thickness.max(NEARBY_MIN) >> li).max(2 * psz) as i32 } else { 0 },
             px: &lpx,
             valid,
             cells,
@@ -400,6 +414,8 @@ fn complete_cow<'a>(
             } else {
                 (4 * psz as i32).min(full_search)
             };
+            // Nearby: nothing farther is taken, so nothing farther is searched.
+            let radius = if solver.reach > 0 { radius.min(solver.reach) } else { radius };
             for pass in 0..pm_iters {
                 ctl.check()?;
                 solver.patchmatch(&mut nnf, &mut cost, pass + it * pm_iters, p.seed.wrapping_add((li * 1000 + it) as u64), radius);
@@ -429,6 +445,8 @@ struct Pyramid<'a> {
     exts: Vec<usize>,
     /// The hole is a thin one: its thickness, not its length, decides how deep to go.
     thin: bool,
+    /// The hole's thickness at full size.
+    thickness: usize,
 }
 
 /// Shrinks the image until the hole is about four patches across (a deeper pyramid decides the
@@ -461,7 +479,7 @@ fn build_pyramid<'a>(
         ext = ext.div_ceil(2);
         exts.push(ext);
     }
-    Ok(Pyramid { levels, boxes, exts, thin })
+    Ok(Pyramid { levels, boxes, exts, thin, thickness })
 }
 
 /// A `w × h × ch` guide at each of `levels` pyramid levels, finest first: halved as the pyramid

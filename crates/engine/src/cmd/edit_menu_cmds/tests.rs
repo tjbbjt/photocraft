@@ -1038,11 +1038,26 @@ fn a_model_guide_lays_out_the_fill() {
     }
 }
 
-/// `method` takes classic, lama, migan or mix; anything else is refused before any work.
+/// `method` takes classic, quality, lama, migan or mix; anything else is refused before any work.
 #[test]
 fn content_aware_fill_refuses_an_unknown_method() {
     let mut s = blob_session(8);
     let e = s.execute("edit.contentAwareFill", json!({"method": "dall-e"})).unwrap_err().to_string();
     assert!(e.contains("unknown method"), "{e}");
     s.execute("edit.contentAwareFill", json!({"method": "classic", "colorAdaptation": "none"})).unwrap();
+}
+
+/// Quality is Classic, copying from near the hole, around LaMa's layout: LaMa fills, its fill
+/// only lays the hole out, and the detail is always rebuilt.
+#[test]
+fn quality_is_classic_nearby_around_lamas_layout() {
+    let mut s = blob_session(8);
+    s.execute("select.rect", json!({"x": 24, "y": 16, "width": 16, "height": 16})).unwrap();
+    let st = s.active().unwrap();
+    let id = st.active_layer.unwrap();
+    let plan = content_aware_plan(&st.doc, id, &json!({"method": "quality", "detail": false}), "edit.contentAwareFill").unwrap();
+    assert_eq!(plan.model, Some(FillModel { method: "lama".into(), detail: true }));
+    assert!(plan.opts.nearby && plan.opts.layout_only);
+    let lama = content_aware_plan(&st.doc, id, &json!({"method": "lama"}), "edit.contentAwareFill").unwrap();
+    assert!(!lama.opts.nearby && !lama.opts.layout_only);
 }

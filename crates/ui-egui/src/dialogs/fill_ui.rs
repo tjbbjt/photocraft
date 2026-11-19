@@ -8,7 +8,7 @@
 //!
 //! A PhotoCraft features switch at the top: off (parity), the dialog and its fill are
 //! Photoshop's (`edit.fill`, on the spot); on, Content-Aware runs the Content-Aware Fill command
-//! in the background with the same sampling, and adds its fill methods (LaMa, MI-GAN, their mix)
+//! in the background with the same sampling, and adds its fill methods (Quality, LaMa, MI-GAN, their mix)
 //! and the edge band that blends the fill into the picture.
 
 use serde_json::{Map, Value, json};
@@ -37,7 +37,8 @@ const KEYS: [&str; 12] =
     ["contents", "color", "pattern", "colorAdaptation", "mode", "opacity", "preserveTransparency", "fillMode", "method", "detail", "edgeGrow", "edgeFeather"];
 
 /// Content-Aware's methods: (param, label).
-pub const METHODS: [(&str, &str); 4] = [("classic", "Classic"), ("lama", "LaMa"), ("migan", "MI-GAN"), ("mix", "Mix (LaMa + MI-GAN)")];
+pub const METHODS: [(&str, &str); 5] =
+    [("classic", "Classic"), ("quality", "Quality (Classic + LaMa)"), ("lama", "LaMa"), ("migan", "MI-GAN"), ("mix", "Mix (LaMa + MI-GAN)")];
 
 /// The edge band PhotoCraft starts with, in px: grown outright, then feathered.
 pub const EDGE_GROW: f64 = 2.0;
@@ -345,7 +346,7 @@ fn content_aware_body(ui: &mut egui::Ui, f: &mut Map<String, Value>, label: &dyn
     ui.horizontal(|ui| {
         label(ui, "");
         let mut on = f.get("detail").and_then(Value::as_bool).unwrap_or(true);
-        ui.add_enabled_ui(method != "classic", |ui| {
+        ui.add_enabled_ui(!matches!(method.as_str(), "classic" | "quality"), |ui| {
             if crate::widgets::checkbox(ui, &mut on, tl!("Rebuild Detail from the Photo")).changed() {
                 f.insert("detail".into(), json!(on));
             }

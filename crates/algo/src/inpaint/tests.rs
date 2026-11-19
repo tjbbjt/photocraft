@@ -412,6 +412,7 @@ fn full_patches_measure_as_clipped_ones() {
                 mimg: None,
                 coherence: 0.0,
                 stamp: false,
+                reach: 0,
                 px: &px,
                 valid: valid.clone(),
                 cells,
@@ -639,4 +640,73 @@ fn a_guide_lighter_than_the_picture_takes_its_tones() {
     let hole_mean = (0..w * h).filter(|&i| hole[i]).map(|i| g[i * ch]).sum::<f32>() / (0..w * h).filter(|&i| hole[i]).count() as f32;
     assert!((hole_mean - 0.3).abs() < 0.03, "the hole's mean {hole_mean}");
     assert!(g.iter().zip(&before).enumerate().all(|(k, (a, b))| hole[k / ch] || a == b), "the picture is untouched");
+}
+
+/// Nearby: every match a search step gives is within reach of its target, also from a start
+/// out of reach (a random one, a coarser level's) and with the whole picture searched.
+#[test]
+fn a_nearby_fill_takes_matches_only_within_reach() {
+    let (w, h, ch, r) = (90, 60, 3, 3);
+    let mut img = busy(w, h, ch, 4);
+    let hole = disc(w, h, 45.0, 30.0, 8.0);
+    let px: Vec<Px> = hole.iter().map(|hh| if *hh { Px::Hole } else { Px::Source }).collect();
+    let none = photocraft_raster::Interrupt::NONE;
+    let hb = hole_bounds(w, h, &px).unwrap();
+    let valid = valid_sources(w, h, r, &px, &none).unwrap();
+    let far = Sources::new(&valid, w).all(&valid, w).into_iter().max_by_key(|p| (p.0 - 45).abs() + (p.1 - 30).abs()).unwrap();
+    let reach = 12;
+    let mut s = Solver {
+        w,
+        h,
+        ch,
+        r: r as i32,
+        img: &mut img,
+        guide: None,
+        mimg: None,
+        coherence: 0.0,
+        stamp: false,
+        reach,
+        px: &px,
+        valid: valid.clone(),
+        cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
+        full: Vec::new(),
+        tmom: Vec::new(),
+        smom: Vec::new(),
+        adapt: Adapt::NONE,
+        ctl: none,
+    };
+    s.prepare(false);
+    assert!(!s.allowed((45, 30), far) && s.allowed((45, 30), (45 + reach, 30 - reach)));
+    let mut rng = Rng::new(9);
+    let cells: Vec<(usize, usize, usize)> = s.cells.iter().collect();
+    for (k, x, y) in cells {
+        let t = (x as i32, y as i32);
+        let (m, c) = s.pm_step(t, k, (far, 0.0), Some(far), Some(far), 1, &mut rng, w as i32);
+        assert!(s.allowed(t, m), "{t:?} took {m:?}");
+        assert!(c.is_finite());
+    }
+}
+
+/// Layout only: the guide decides where the bright and dark parts go, and the fill is Classic's
+/// otherwise: no guide colour is matched against, so the pieces are the picture's.
+#[test]
+fn a_layout_only_guide_lays_out_the_hole_and_classic_fills_it() {
+    let (w, h, ch) = (120, 96, 3);
+    let base = busy(w, h, ch, 6);
+    let truth: Vec<f32> = base.iter().enumerate().map(|(i, v)| if i / ch / w < 40 { (v + 0.4).min(1.0) } else { v * 0.5 }).collect();
+    let hole = disc(w, h, 60.0, 40.0, 22.0);
+    let px = roles(w, h, &hole);
+    let none = photocraft_raster::Interrupt::NONE;
+    // A guide that is the truth's layout in flat tones: bright above the line, dark below.
+    let flat: Vec<f32> = (0..w * h * ch).map(|i| if i / ch / w < 40 { 0.8 } else { 0.2 }).collect();
+    let p = CompleteParams { layout_only: true, nearby: true, ..Default::default() };
+    let out = complete_guided_owned(w, h, ch, truth.clone(), &px, &flat, 1.0, &p, &none).unwrap().unwrap();
+    let mean = |y: usize| (45..75).map(|x| out[(y * w + x) * ch]).sum::<f32>() / 30.0;
+    assert!(mean(30) > mean(50) + 0.2, "{} above vs {} below", mean(30), mean(50));
+    // Textured like the picture, not flat like the guide.
+    let spread = |y: usize| {
+        let m = mean(y);
+        ((45..75).map(|x| (out[(y * w + x) * ch] - m).powi(2)).sum::<f32>() / 30.0).sqrt()
+    };
+    assert!(spread(30) > 0.05 && spread(50) > 0.02, "spread {} / {}", spread(30), spread(50));
 }

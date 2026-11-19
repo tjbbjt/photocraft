@@ -175,13 +175,15 @@ fn caf_props_panel(
             ui.label(tl!("Method"));
             let o = [
                 ("classic".to_string(), tl!("Classic")),
+                ("quality".to_string(), tl!("Quality (Classic + LaMa)")),
                 ("lama".to_string(), tl!("LaMa")),
                 ("migan".to_string(), tl!("MI-GAN")),
                 ("mix".to_string(), tl!("Mix (LaMa + MI-GAN)")),
             ];
             widgets::dropdown(ui, "caf-method", tl!("Method"), &mut w.opts.method, &o, 150.0);
         });
-        ui.add_enabled_ui(w.opts.method != "classic", |ui| {
+        // Quality always rebuilds the detail: it is Classic around LaMa's layout.
+        ui.add_enabled_ui(!matches!(w.opts.method.as_str(), "classic" | "quality"), |ui| {
             widgets::checkbox(ui, &mut w.opts.detail, tl!("Rebuild Detail from the Photo"));
         });
         // The band that blends the fill into the picture; dragging changes the fill area, so the
