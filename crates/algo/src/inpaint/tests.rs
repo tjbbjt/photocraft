@@ -668,7 +668,7 @@ fn a_nearby_fill_takes_matches_only_within_reach() {
         coherence: 0.0,
         stamp: false,
         reach,
-        depth: None,
+        depth: Some(solver::Depth::new(&valid, w, h, reach as usize, reach, 0.0, 0.0)),
         uses: None,
         px: &px,
         valid: valid.clone(),
@@ -691,27 +691,48 @@ fn a_nearby_fill_takes_matches_only_within_reach() {
     }
 }
 
-/// Same depth: a target copies from about its own rows, more the lower it is; one with no
-/// source within reach in its rows, as far again as the nearest rows that have one, twice over.
+/// Same depth: a target copies from about its own rows, more the farther it is from the
+/// horizon; one with no source within reach in its rows, as far again as the nearest rows that
+/// have one, twice over; and each block has a source to fall back on, within both.
 #[test]
 fn a_same_depth_fill_copies_from_about_its_own_rows() {
     let (w, h, reach) = (64, 64, 8);
     // Sources only in the top 16 rows.
     let valid: Vec<bool> = (0..w * h).map(|i| i / w < 16).collect();
-    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0);
-    assert_eq!(d.rows((30, 8)), 2, "a row with sources");
-    // Rows further down may go further: a fifth of their row.
-    let d5 = solver::Depth::new(&valid, w, h, reach, 2, 0.2);
-    assert_eq!((d5.rows((30, 4)), d5.rows((30, 15))), (2, 3));
-    assert_eq!(d5.rows((30, 40)), 8 + 2 * 32);
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0, 0.0);
+    assert_eq!(d.rows((30, 8)), 8, "a row with sources: at least a block");
     // Row 40 is in block row 5 (of 8 rows each); the nearest with sources is block row 1.
-    assert_eq!(d.rows((30, 40)), 2 + 2 * 32);
+    assert_eq!(d.rows((30, 40)), 8 + 2 * 32);
+    // From a horizon at row 40: half the distance to it.
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.5, 40.0);
+    assert_eq!((d.rows((30, 10)), d.rows((30, 40))), (15, 8 + 2 * 32));
     // Sources across the picture's top, and down its left 40 columns: block column 7 (columns
-    // 56..64) has none within 8 columns but in the top block row, 5 block rows up.
+    // 56..64) has none within 8 columns of all its pixels but in the top block row, 5 block rows
+    // up; block column 5 (40..48) has column 39.
     let valid: Vec<bool> = (0..w * h).map(|i| i % w < 40 || i / w < 8).collect();
-    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0);
-    assert_eq!(d.rows((44, 40)), 2, "valid columns within reach");
-    assert_eq!(d.rows((60, 40)), 2 + 2 * 40);
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0, 0.0);
+    assert_eq!(d.rows((44, 40)), 8, "valid columns within reach");
+    assert_eq!(d.rows((60, 40)), 8 + 2 * 40);
+    for t in [(44, 40), (60, 40), (63, 63)] {
+        let s = d.fallback(t).unwrap();
+        assert!(valid[s.1 as usize * w + s.0 as usize] && (s.0 - t.0).abs() <= reach as i32 && (s.1 - t.1).abs() <= d.rows(t), "{t:?}: {s:?}");
+    }
+}
+
+/// The horizon: the row that best splits the picture into sky (bluer than red) above and
+/// ground below; none without a clear split, or without colour.
+#[test]
+fn the_horizon_is_where_the_sky_meets_the_ground() {
+    let (w, h) = (40, 30);
+    let px = vec![Px::Source; w * h];
+    let land: Vec<f32> = (0..w * h).flat_map(|i| if i / w < 12 { [0.2, 0.3, 0.6] } else { [0.4, 0.3, 0.2] }).collect();
+    assert_eq!(solver::horizon(&land, &px, w, h, 3), Some(12.0));
+    // A hole over part of it changes nothing.
+    let holed: Vec<Px> = (0..w * h).map(|i| if i % w < 10 { Px::Hole } else { Px::Source }).collect();
+    assert_eq!(solver::horizon(&land, &holed, w, h, 3), Some(12.0));
+    let stripes: Vec<f32> = (0..w * h).flat_map(|i| if i % 2 == 0 { [0.2, 0.3, 0.6] } else { [0.4, 0.3, 0.2] }).collect();
+    assert_eq!(solver::horizon(&stripes, &px, w, h, 3), None, "no clear split");
+    assert_eq!(solver::horizon(&vec![0.5; w * h], &px, w, h, 1), None, "no colour");
 }
 
 /// Uses: a block copied once (a stretch copied whole) costs nothing more; each further copy of
@@ -743,7 +764,7 @@ fn a_same_depth_fill_takes_matches_only_from_its_rows() {
     let hb = hole_bounds(w, h, &px).unwrap();
     let valid = valid_sources(w, h, r, &px, &none).unwrap();
     let reach = 40;
-    let depth = Some(solver::Depth::new(&valid, w, h, reach, 8, 0.0));
+    let depth = Some(solver::Depth::new(&valid, w, h, reach, 8, 0.0, 0.0));
     let mut s = Solver {
         w,
         h,

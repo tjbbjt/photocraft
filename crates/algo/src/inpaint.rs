@@ -78,7 +78,8 @@ const GUIDED_COHERENCE: f32 = 6.0;
 /// The least distance a nearby fill copies from ([`CompleteParams::nearby`]), full-size px.
 const NEARBY_MIN: usize = 64;
 /// The rows up or down a fill at the same depth copies from ([`CompleteParams::same_depth`]),
-/// as a share of the target's row: rows near the top are far off, and each spans more ground.
+/// as a share of the target's distance from the horizon: rows near it are far off, and each
+/// spans more ground.
 const SAME_DEPTH_PER_ROW: f32 = 0.2;
 /// What each further copy of a part of the picture costs in a nearby fill, as a share of the
 /// patch distance ([`solver::Uses`]).
@@ -115,9 +116,9 @@ pub struct CompleteParams {
     /// that already has the rocks low and the grass high.
     pub layout_only: bool,
     /// A nearby fill copies at the same depth: from about the same rows as each hole pixel (up
-    /// or down a fifth of its distance from the top of the picture), so ground far off, finer and
-    /// smoother, is not copied into ground close by, where it reads as a road. Only with
-    /// [`Self::nearby`].
+    /// or down a fifth of its distance from the horizon, or from the top of the picture without
+    /// one), so ground far off, finer and smoother, is not copied into ground close by, where it
+    /// reads as a road. Only with [`Self::nearby`].
     pub same_depth: bool,
 }
 
@@ -386,7 +387,16 @@ fn complete_cow<'a>(
         // Source moments are worth keeping when there are few sources for the matches tried.
         let keep_source_moments = lw * lh <= SOURCE_MOMENTS_MAX && sources.len() <= n_targets.saturating_mul(if refine_only { 4 } else { 64 });
         let reach = if p.nearby { (thickness.max(NEARBY_MIN) >> li).max(2 * psz) } else { 0 };
-        let depth = (p.nearby && p.same_depth).then(|| Depth::new(&valid, lw, lh, reach, psz as i32, SAME_DEPTH_PER_ROW));
+        // A nearby fill's rows, and a fallback source for each block; at the same depth, rows
+        // from the horizon (the picture's top without one).
+        let depth = p.nearby.then(|| {
+            if p.same_depth {
+                let horizon = solver::horizon(&limg, &lpx, lw, lh, ch).unwrap_or(0.0);
+                Depth::new(&valid, lw, lh, reach, psz as i32, SAME_DEPTH_PER_ROW, horizon)
+            } else {
+                Depth::new(&valid, lw, lh, reach, reach as i32, 0.0, 0.0)
+            }
+        });
         ctl.check()?;
         let mut solver = Solver {
             w: lw,

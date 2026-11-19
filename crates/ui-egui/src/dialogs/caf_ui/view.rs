@@ -175,6 +175,7 @@ fn caf_props_panel(
             ui.label(tl!("Method"));
             let o = [
                 ("classic".to_string(), tl!("Classic")),
+                ("classicDepth".to_string(), tl!("Classic + Depth")),
                 ("lama".to_string(), tl!("LaMa")),
                 ("migan".to_string(), tl!("MI-GAN")),
                 ("mix".to_string(), tl!("Mix (LaMa + MI-GAN)")),
@@ -182,7 +183,7 @@ fn caf_props_panel(
             widgets::dropdown(ui, "caf-method", tl!("Method"), &mut w.opts.method, &o, 150.0);
         });
         // Stamping always rebuilds the detail: Classic fills around the model's layout.
-        let model = w.opts.method != "classic";
+        let model = !matches!(w.opts.method.as_str(), "classic" | "classicDepth");
         ui.add_enabled_ui(model, |ui| {
             widgets::checkbox(ui, &mut w.opts.stamp, tl!("Stamp with Classic"))
                 .on_hover_text(tl!("The model only lays the fill out; Classic fills it with pieces of the photo from nearby."));

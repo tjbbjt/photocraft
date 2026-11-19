@@ -317,6 +317,13 @@ fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Resul
     }
     let model = match str_or(p, "method", "classic") {
         "classic" => None,
+        // Classic + Depth: Classic, copying only from near each hole pixel and from about its
+        // rows (Match Depth), with no model.
+        "classicDepth" => {
+            opts.nearby = true;
+            opts.same_depth = true;
+            None
+        }
         m @ ("lama" | "migan" | "mix") => {
             // Stamp: Classic fills, copying only from near each hole pixel, started from the
             // model's layout; the model's fill decides where things go, the photo's pieces fill.
@@ -327,7 +334,7 @@ fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Resul
             opts.same_depth = stamp && bool_or(p, "matchDepth", false);
             Some(FillModel { method: m.to_string(), detail: stamp || bool_or(p, "detail", true) })
         }
-        other => return Err(bad(cmd, format!("unknown method `{other}` (classic|lama|migan|mix)"))),
+        other => return Err(bad(cmd, format!("unknown method `{other}` (classic|classicDepth|lama|migan|mix)"))),
     };
     let edge = edge_param(p, cmd)?;
     let surf = doc.layer(id).and_then(|l| l.surface()).ok_or(EngineError::NoLayer(id))?;

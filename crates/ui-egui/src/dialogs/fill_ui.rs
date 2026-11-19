@@ -51,7 +51,8 @@ const KEYS: [&str; 14] = [
 ];
 
 /// Content-Aware's methods: (param, label).
-pub const METHODS: [(&str, &str); 4] = [("classic", "Classic"), ("lama", "LaMa"), ("migan", "MI-GAN"), ("mix", "Mix (LaMa + MI-GAN)")];
+pub const METHODS: [(&str, &str); 5] =
+    [("classic", "Classic"), ("classicDepth", "Classic + Depth"), ("lama", "LaMa"), ("migan", "MI-GAN"), ("mix", "Mix (LaMa + MI-GAN)")];
 
 /// The edge band PhotoCraft starts with, in px: grown outright, then feathered.
 pub const EDGE_GROW: f64 = 2.0;
@@ -361,7 +362,7 @@ fn content_aware_body(ui: &mut egui::Ui, f: &mut Map<String, Value>, label: &dyn
         }
     });
     // Stamping always rebuilds the detail: Classic fills around the model's layout.
-    let model = method != "classic";
+    let model = !matches!(method.as_str(), "classic" | "classicDepth");
     let stamp = f.get("stamp").and_then(Value::as_bool).unwrap_or(true);
     for (key, name, enabled) in [
         ("stamp", tl!("Stamp with Classic"), model),

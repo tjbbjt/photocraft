@@ -1038,7 +1038,7 @@ fn a_model_guide_lays_out_the_fill() {
     }
 }
 
-/// `method` takes classic, lama, migan or mix; anything else is refused before any work.
+/// `method` takes classic, classicDepth, lama, migan or mix; anything else is refused before any work.
 #[test]
 fn content_aware_fill_refuses_an_unknown_method() {
     let mut s = blob_session(8);
@@ -1067,6 +1067,8 @@ fn a_stamped_model_fill_is_classic_nearby_around_the_models_layout() {
         assert_eq!(own.model, Some(FillModel { method: m.into(), detail: false }));
         assert!(!own.opts.nearby && !own.opts.layout_only, "{m}");
     }
-    let classic = plan(json!({"method": "classic", "stamp": true}));
-    assert!(classic.model.is_none() && !classic.opts.nearby, "Classic stays Classic");
+    let classic = plan(json!({"method": "classic", "stamp": true, "matchDepth": true}));
+    assert!(classic.model.is_none() && !classic.opts.nearby && !classic.opts.same_depth, "Classic stays Classic");
+    let depth = plan(json!({"method": "classicDepth"}));
+    assert!(depth.model.is_none() && depth.opts.nearby && depth.opts.same_depth && !depth.opts.layout_only, "Classic + Depth");
 }

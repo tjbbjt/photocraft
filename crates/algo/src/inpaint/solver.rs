@@ -170,20 +170,17 @@ impl Solver<'_> {
         self.depth.as_ref().map_or(self.reach, |d| d.rows(t).min(self.reach))
     }
 
-    /// A source `t` may copy ([`Self::allowed`]): one of 16 random tries, else the nearest; else
-    /// the nearest valid one, when the rule leaves none.
+    /// A source `t` may copy ([`Self::allowed`]): one of 8 random tries, else the one found
+    /// ahead for its block ([`Depth::fallback`]).
     fn within_reach(&self, t: (i32, i32), rng: &mut Rng) -> Option<(i32, i32)> {
         let (r, rows) = (self.reach, self.rows_of(t));
-        for _ in 0..16 {
+        for _ in 0..8 {
             let cand = (t.0 + rng.range(-r, r), t.1 + rng.range(-rows, rows));
             if self.is_valid(cand.0, cand.1) && self.allowed(t, cand) {
                 return Some(cand);
             }
         }
-        let nearest = |ok: &dyn Fn((i32, i32)) -> bool| {
-            (1..=r).find_map(|d| (-d..=d).flat_map(|i| [(t.0 + i, t.1 - d), (t.0 + i, t.1 + d), (t.0 - d, t.1 + i), (t.0 + d, t.1 + i)]).find(|c| ok(*c)))
-        };
-        nearest(&|c| self.is_valid(c.0, c.1) && self.allowed(t, c)).or_else(|| nearest(&|c| self.is_valid(c.0, c.1)))
+        self.depth.as_ref().and_then(|d| d.fallback(t))
     }
 
     #[inline]
@@ -1046,21 +1043,26 @@ pub(super) fn least_sum(v: f32, n: f32, strict: bool) -> f32 {
     e
 }
 
-/// Rows of the same depth, for a nearby fill that copies at the same depth
-/// ([`CompleteParams::same_depth`](super::CompleteParams::same_depth)): in a landscape the
-/// distance goes with the height in the picture, so a target copies from about its own rows,
-/// and a far, finer stretch of ground never lands in a near one. How many rows grows with the
-/// target's own row, as in perspective: near the top (far off) a row of the picture spans much
-/// more ground than near the bottom (close by). A target with no source within reach in its own
-/// rows (deep in a hole along the bottom) may go as far again up or down as the nearest rows
-/// that have one, twice over.
+/// Where a nearby fill copies from, up and down ([`CompleteParams::nearby`](super::CompleteParams::nearby)),
+/// and a source it can always fall back on.
+///
+/// At the same depth ([`CompleteParams::same_depth`](super::CompleteParams::same_depth)): in a
+/// landscape the distance goes with the height in the picture, so a target copies from about
+/// its own rows, and a far, finer stretch of ground never lands in a near one. How many rows
+/// grows with the target's distance from the horizon, as in perspective: just below it a row
+/// spans much more ground than at the bottom, close by (and the sky's clouds the same, above).
+/// A target with no source within reach in its own rows (deep in a hole along the bottom) may
+/// go as far again up or down as the nearest rows that have one, twice over.
 pub(super) struct Depth {
     /// Rows up or down any target may go.
     least: i32,
-    /// And per row down from the top: a target in row `y` may go `y * per_row` rows.
+    /// And per row from the horizon: a target `d` rows from it may go `d * per_row` rows.
     per_row: f32,
-    /// Per block of [`DEPTH_BLOCK`] px: rows to the nearest rows with a source within reach.
-    to_sources: Vec<u16>,
+    /// The horizon's row ([`horizon`]).
+    horizon: f32,
+    /// Per block of [`DEPTH_BLOCK`] px: rows to the nearest rows with a source within reach of
+    /// all its pixels, and one such source (x < 0: none in its columns).
+    to_sources: Vec<(u16, (i32, i32))>,
     /// Blocks across.
     bw: usize,
 }
@@ -1069,49 +1071,107 @@ pub(super) struct Depth {
 const DEPTH_BLOCK: usize = 8;
 
 impl Depth {
-    /// `valid`: the level's valid sources, `w` by `h`; `reach`: the fill's reach there; `least`
-    /// and `per_row`: the rows up or down a target may go ([`Depth`]).
-    pub(super) fn new(valid: &[bool], w: usize, h: usize, reach: usize, least: i32, per_row: f32) -> Self {
+    /// `valid`: the level's valid sources, `w` by `h`; `reach`: the fill's reach there; `least`,
+    /// `per_row` and `horizon`: the rows up or down a target may go ([`Depth`]); `least` is at
+    /// least a block, so a source found in a block's own rows is within it.
+    pub(super) fn new(valid: &[bool], w: usize, h: usize, reach: usize, least: i32, per_row: f32, horizon: f32) -> Self {
         let (bw, bh) = (w.div_ceil(DEPTH_BLOCK), h.div_ceil(DEPTH_BLOCK));
-        // Which blocks have a source within reach across in their rows.
-        let mut near = vec![false; bw * bh];
-        let mut count = vec![0u32; w + 1];
+        const NONE: (i32, i32) = (-1, -1);
+        // A source in each block's rows within reach of all its pixels, if any.
+        let mut found = vec![NONE; bw * bh];
+        let mut next = vec![usize::MAX; w + 1];
         for (y, row) in valid.chunks_exact(w).enumerate().take(h) {
-            for (x, v) in row.iter().enumerate() {
-                count[x + 1] = count[x] + u32::from(*v);
+            // next[x]: the first valid column at or after x.
+            next[w] = usize::MAX;
+            for x in (0..w).rev() {
+                next[x] = if row[x] { x } else { next[x + 1] };
             }
             for bx in 0..bw {
-                let (a, b) = ((bx * DEPTH_BLOCK).saturating_sub(reach), ((bx + 1) * DEPTH_BLOCK + reach).min(w));
-                near[(y / DEPTH_BLOCK) * bw + bx] |= count[b] > count[a];
+                let k = (y / DEPTH_BLOCK) * bw + bx;
+                if found[k] != NONE {
+                    continue;
+                }
+                let (x0, x1) = (bx * DEPTH_BLOCK, ((bx + 1) * DEPTH_BLOCK).min(w));
+                let (a, b) = ((x1 - 1).saturating_sub(reach), (x0 + reach + 1).min(w));
+                if a < b && next[a] < b {
+                    found[k] = (next[a] as i32, y as i32);
+                }
             }
         }
-        // Blocks to the nearest such block up or down, in rows.
-        let mut to_sources = vec![u16::MAX; bw * bh];
+        // Blocks to the nearest such block up or down, in rows, with its source.
+        let mut to_sources = vec![(u16::MAX, NONE); bw * bh];
         for bx in 0..bw {
-            let mut d = u16::MAX;
+            let mut d = (u16::MAX, NONE);
             for by in 0..bh {
-                d = if near[by * bw + bx] { 0 } else { d.saturating_add(1) };
+                d = if found[by * bw + bx] != NONE { (0, found[by * bw + bx]) } else { (d.0.saturating_add(1), d.1) };
                 to_sources[by * bw + bx] = d;
             }
-            d = u16::MAX;
+            d = (u16::MAX, NONE);
             for by in (0..bh).rev() {
-                d = if near[by * bw + bx] { 0 } else { d.saturating_add(1) };
+                d = if found[by * bw + bx] != NONE { (0, found[by * bw + bx]) } else { (d.0.saturating_add(1), d.1) };
                 let k = &mut to_sources[by * bw + bx];
-                *k = (*k).min(d);
+                if d.0 < k.0 {
+                    *k = d;
+                }
             }
         }
         for k in &mut to_sources {
-            *k = k.saturating_mul(DEPTH_BLOCK as u16);
+            k.0 = k.0.saturating_mul(DEPTH_BLOCK as u16);
         }
-        Self { least, per_row, to_sources, bw }
+        Self { least: least.max(DEPTH_BLOCK as i32), per_row, horizon, to_sources, bw }
+    }
+
+    #[inline]
+    fn block(&self, t: (i32, i32)) -> Option<&(u16, (i32, i32))> {
+        self.to_sources.get((t.1.max(0) as usize / DEPTH_BLOCK) * self.bw + t.0.max(0) as usize / DEPTH_BLOCK)
     }
 
     /// Rows up or down target `t` may copy from.
     #[inline]
     pub(super) fn rows(&self, t: (i32, i32)) -> i32 {
-        let k = (t.1.max(0) as usize / DEPTH_BLOCK) * self.bw + t.0.max(0) as usize / DEPTH_BLOCK;
-        ((t.1 as f32 * self.per_row) as i32).max(self.least) + 2 * i32::from(self.to_sources.get(k).copied().unwrap_or(0))
+        let off = ((t.1 as f32 - self.horizon).abs() * self.per_row) as i32;
+        off.max(self.least) + 2 * i32::from(self.block(t).map_or(0, |b| b.0))
     }
+
+    /// A valid source within reach of `t` and within its rows, found ahead.
+    #[inline]
+    pub(super) fn fallback(&self, t: (i32, i32)) -> Option<(i32, i32)> {
+        self.block(t).map(|b| b.1).filter(|s| s.0 >= 0)
+    }
+}
+
+/// The row of the horizon in a landscape, for [`Depth`]: the row that best splits the known
+/// pixels into sky above (bluer than red, clouds included) and ground below (not). `None` when
+/// that split fits under three in four of them (no clear horizon), or the picture has no colour.
+pub(super) fn horizon(img: &[f32], px: &[Px], w: usize, h: usize, ch: usize) -> Option<f32> {
+    if ch < 3 {
+        return None;
+    }
+    // Per row: known pixels, and how many look like sky.
+    let mut rows = vec![(0u32, 0u32); h];
+    for (i, k) in px.iter().enumerate().take(w * h) {
+        if *k == Px::Hole {
+            continue;
+        }
+        let p = &img[i * ch..i * ch + 3];
+        let r = &mut rows[i / w];
+        r.0 += 1;
+        r.1 += u32::from(p[2] > p[0] * 1.04 + 1e-4);
+    }
+    let known: u64 = rows.iter().map(|r| u64::from(r.0)).sum();
+    let ground: u64 = rows.iter().map(|r| u64::from(r.0 - r.1)).sum();
+    if known == 0 {
+        return None;
+    }
+    // Agreement with "sky above y, ground from y on", for each y.
+    let (mut fit, mut best) = (ground, (ground, 0usize));
+    for (y, r) in rows.iter().enumerate() {
+        fit = fit + u64::from(r.1) - u64::from(r.0 - r.1);
+        if fit > best.0 {
+            best = (fit, y + 1);
+        }
+    }
+    (best.0 * 4 >= known * 3 && best.1 > 0 && best.1 < h).then_some(best.1 as f32)
 }
 
 /// How often each part of the picture is copied, for a nearby fill: Classic takes whatever
