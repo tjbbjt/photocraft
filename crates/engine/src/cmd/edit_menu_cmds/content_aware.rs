@@ -341,6 +341,10 @@ fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Resul
     Ok(CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, model, edge, surf })
 }
 
+/// How far from a not-quite-opaque pixel a nearby fill's sources start, px
+/// ([`photocraft_algo::inpaint::drop_fringe`]).
+const CAF_FRINGE: usize = 4;
+
 /// Work out a Content-Aware Fill (see [`CafPlan`]) on layer `id` of `doc`.
 pub fn content_aware_plan(doc: &Document, id: LayerId, p: &Value, cmd: &str) -> Result<CafPlan> {
     content_aware_plan_with(doc, id, p, cmd, &photocraft_raster::Interrupt::NONE)
@@ -499,6 +503,12 @@ pub fn content_aware_plan_with(doc: &Document, id: LayerId, p: &Value, cmd: &str
     let mut source = base.clone();
     paint_strokes(&mut source, rect, &strokes);
     source.par_iter_mut().zip(&hole).for_each(|(s, h)| *s &= !*h);
+    // Nearby fills (Classic + Depth, Stamp) copy from right by the hole, where a transparent
+    // edge's fringe is: keep it out (Classic as it was).
+    if opts.nearby && fmt.alpha {
+        stop()?;
+        photocraft_algo::inpaint::drop_fringe(&mut source, &img, w, h, n, CAF_FRINGE);
+    }
     Ok(CafPlan { layer: id, rect, window, fmt, img, layer_px, cover, hole, base, source, opts, output, model })
 }
 
@@ -669,16 +679,7 @@ pub fn caf_fill(
     photocraft_algo::inpaint::match_guide_tones(w, h, n, fmt.mode.color_channels(), &mut g, hole, (32.0 * scale).round() as usize);
     ctl.check()?;
     if model.detail {
-        // Stamped: the sky is the model's drawing with the fill's fine texture; copied pieces
-        // repeat whole clouds where the model lays them out and finishes them (RGB only: the sky
-        // is found by its blue).
-        let horizon =
-            (opts.layout_only && fmt.mode == photocraft_color::ColorMode::Rgb).then(|| photocraft_algo::inpaint::horizon_line(&img, hole, w, h, n)).flatten();
-        ctl.check()?;
-        let mut out = photocraft_algo::content_aware::fill_guided_owned(w, h, n, img, hole, source, &g, scale, opts, ctl)?;
-        if let Some(horizon) = horizon {
-            photocraft_algo::inpaint::sky_from_guide(&mut out, &g, hole, w, h, n, cc, (scale / 2.0).ceil() as usize, &horizon);
-        }
+        let out = photocraft_algo::content_aware::fill_guided_owned(w, h, n, img, hole, source, &g, scale, opts, ctl)?;
         ctl.check()?;
         return Ok(levels(out));
     }

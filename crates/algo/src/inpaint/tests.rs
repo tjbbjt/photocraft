@@ -805,26 +805,62 @@ fn a_fill_takes_the_levels_of_the_picture_beside_it() {
     assert_eq!(big[(32 * w + 120) * ch], 0.7);
 }
 
-/// The sky from the model: well above the horizon a hole pixel is the model's tone with the
-/// fill's fine texture on it; at the horizon it stays the fill's; outside the hole, the picture.
+/// A mask grown by r: each set pixel spreads r px across and down (a square), no farther.
 #[test]
-fn the_sky_is_the_models_drawing_with_the_fills_texture() {
-    let (w, h, ch) = (64, 120, 3);
-    let hole = vec![true; w * h];
-    // The fill: a checker of 0.48 / 0.52 (mean 0.5); the model: a flat 0.7.
-    let mut img: Vec<f32> = (0..w * h).flat_map(|i| [if (i % w + i / w) % 2 == 0 { 0.48 } else { 0.52 }; 3]).collect();
-    let guide = vec![0.7; w * h * ch];
-    let fill = img.clone();
-    sky_from_guide(&mut img, &guide, &hole, w, h, ch, 3, 1, &[100.0; 64]);
-    let at = |x: usize, y: usize| img[(y * w + x) * ch];
-    // Row 10 (90 above the horizon): the model's 0.7, the checker on it (a box mean of 3 x 3 of
-    // a checker is 0.5 +- 0.02/9).
-    assert!((at(10, 10) - fill[(10 * w + 10) * ch] - 0.2).abs() < 0.005, "{}", at(10, 10));
-    // A strong edge in the fill (a copied cloud's) adds at most SKY_DETAIL_MAX.
-    let mut edge: Vec<f32> = (0..w * h).flat_map(|i| [if i % w < 32 { 0.2 } else { 0.9 }; 3]).collect();
-    sky_from_guide(&mut edge, &guide, &hole, w, h, ch, 3, 1, &[100.0; 64]);
-    assert!((edge[(10 * w + 32) * ch] - 0.73).abs() < 1e-5, "{}", edge[(10 * w + 32) * ch]);
-    assert_eq!(at(10, 95), fill[(95 * w + 10) * ch], "at the horizon, the fill");
+fn a_mask_grows_by_its_radius_each_way() {
+    let (w, h) = (30, 20);
+    let mut m = vec![false; w * h];
+    m[10 * w + 15] = true;
+    let g = dilate_mask(&m, w, h, 3);
+    for y in 0..h {
+        for x in 0..w {
+            let inside = (12..=18).contains(&x) && (7..=13).contains(&y);
+            assert_eq!(g[y * w + x], inside, "({x}, {y})");
+        }
+    }
+    assert_eq!(dilate_mask(&m, w, h, 0), m);
+}
+
+/// A transparent edge's fringe (alpha below 1) and the pixels within `fringe` of it are not
+/// sources; the opaque picture past them is.
+#[test]
+fn the_fringe_of_a_transparent_edge_is_not_copied() {
+    let (w, h, ch) = (20, 6, 4);
+    // Transparent left of x 5, half at x 5, opaque from x 6.
+    let img: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            let a = match i % w {
+                0..5 => 0.0,
+                5 => 0.5,
+                _ => 1.0,
+            };
+            [0.3, 0.6, 0.9, a]
+        })
+        .collect();
+    let mut source: Vec<bool> = (0..w * h).map(|i| i % w >= 5).collect();
+    drop_fringe(&mut source, &img, w, h, ch, 2);
+    for x in 0..w {
+        assert_eq!(source[2 * w + x], x >= 8, "x {x}");
+    }
+    // With nothing left it keeps the sources it had.
+    let mut thin: Vec<bool> = (0..w * h).map(|i| i % w == 6).collect();
+    drop_fringe(&mut thin, &img, w, h, ch, 2);
+    assert!(thin[2 * w + 6]);
+}
+
+/// The fallback source of a block with no source in its rows lies inside the sources by more
+/// than a block's shift, not on their edge.
+#[test]
+fn a_fallback_source_lies_inside_the_picture() {
+    let (w, h) = (64, 100);
+    // Sources below row 50 only: block row 6 (rows 48..56) has sources from row 50, and one
+    // inside them by more than 4 + 1 rows at row 55.
+    let valid: Vec<bool> = (0..w * h).map(|i| i / w >= 50).collect();
+    let d = Depth::new(&valid, w, h, 64, 2, 0.0, &[]);
+    let s = d.fallback((20, 4)).expect("a fallback");
+    assert_eq!(s.1, 55, "{s:?}");
+    assert_eq!(d.rows((20, 4)), 2 + 2 * 48, "the rows measured to the sources' edge");
+    assert!(valid[s.1 as usize * w + s.0 as usize]);
 }
 
 /// Uses: a block copied once (a stretch copied whole) costs nothing more; each further copy of

@@ -1113,25 +1113,43 @@ impl Depth {
     pub(super) fn new(valid: &[bool], w: usize, h: usize, reach: usize, least: i32, per_row: f32, horizon: &[f32]) -> Self {
         let (bw, bh) = (w.div_ceil(DEPTH_BLOCK), h.div_ceil(DEPTH_BLOCK));
         const NONE: (i32, i32) = (-1, -1);
-        // A source in each block's rows within reach of all its pixels, if any.
+        // A fallback lies inside the sources by more than a block's shift where its block's
+        // rows have such a source, so the block copies the picture's texture, not its outermost
+        // pixels (a frayed edge): the first source met going in was the edge's own pixel.
+        let away = super::levels::dilate_mask(&valid.iter().map(|v| !*v).collect::<Vec<_>>(), w, h, DEPTH_BLOCK / 2 + 1);
+        let inner: Vec<bool> = valid.iter().zip(&away).map(|(v, a)| *v && !*a).collect();
+        // A source in each block's rows within reach of all its pixels, if any (and one inside).
         let mut found = vec![NONE; bw * bh];
-        let mut next = vec![usize::MAX; w + 1];
-        for (y, row) in valid.chunks_exact(w).enumerate().take(h) {
+        let mut inside = vec![NONE; bw * bh];
+        let first = |row: &[bool], next: &mut [usize]| {
             // next[x]: the first valid column at or after x.
             next[w] = usize::MAX;
             for x in (0..w).rev() {
                 next[x] = if row[x] { x } else { next[x + 1] };
             }
+        };
+        let (mut next, mut next_in) = (vec![usize::MAX; w + 1], vec![usize::MAX; w + 1]);
+        for (y, (row, row_in)) in valid.chunks_exact(w).zip(inner.chunks_exact(w)).enumerate().take(h) {
+            first(row, &mut next);
+            first(row_in, &mut next_in);
             for bx in 0..bw {
                 let k = (y / DEPTH_BLOCK) * bw + bx;
-                if found[k] != NONE {
-                    continue;
-                }
                 let (x0, x1) = (bx * DEPTH_BLOCK, ((bx + 1) * DEPTH_BLOCK).min(w));
                 let (a, b) = ((x1 - 1).saturating_sub(reach), (x0 + reach + 1).min(w));
-                if a < b && next[a] < b {
+                if a >= b {
+                    continue;
+                }
+                if found[k] == NONE && next[a] < b {
                     found[k] = (next[a] as i32, y as i32);
                 }
+                if inside[k] == NONE && next_in[a] < b {
+                    inside[k] = (next_in[a] as i32, y as i32);
+                }
+            }
+        }
+        for (f, i) in found.iter_mut().zip(&inside) {
+            if *f != NONE && *i != NONE {
+                *f = *i;
             }
         }
         // Blocks to the nearest such block up or down, in rows, with its source.

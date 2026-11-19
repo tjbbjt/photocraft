@@ -1,7 +1,7 @@
-//! A filled picture's last steps: its levels brought to the picture's around it, the horizon of a
-//! landscape, and a sky drawn by a model with the picture's own fine texture.
+//! A fill's sources and last steps: the fringe of a transparent edge kept out of its sources,
+//! and its levels brought to the picture's around it.
 
-use super::Px;
+use crate::par;
 use crate::poisson::membrane_fill;
 
 /// The block [`seamless_levels`] measures and corrects in, px.
@@ -86,79 +86,68 @@ pub fn seamless_levels(img: &mut [f32], hole: &[bool], w: usize, h: usize, ch: u
     }
 }
 
-/// The horizon of an RGB landscape as a row per column ([`super::solver::horizon_line`]), from
-/// the pixels outside `hole`; `None` without a clear one.
-pub fn horizon_line(img: &[f32], hole: &[bool], w: usize, h: usize, ch: usize) -> Option<Vec<f32>> {
-    let px: Vec<Px> = hole.iter().map(|hh| if *hh { Px::Hole } else { Px::Source }).collect();
-    super::solver::horizon_line(img, &px, w, h, ch)
+/// `mask` grown by `r` px each way (a square): true where any of `mask` is within `r` across
+/// and `r` down. Two running counts, so it costs the same for any `r`.
+pub fn dilate_mask(mask: &[bool], w: usize, h: usize, r: usize) -> Vec<bool> {
+    if r == 0 || w == 0 || h == 0 {
+        return mask.to_vec();
+    }
+    // Across: per row, a prefix count of set pixels.
+    let mut across = vec![false; w * h];
+    par::chunks_mut(&mut across, w, w * h >= PAR_PIXELS, |y, row| {
+        let src = &mask[y * w..(y + 1) * w];
+        let mut pre = vec![0u32; w + 1];
+        for (x, s) in src.iter().enumerate() {
+            pre[x + 1] = pre[x] + u32::from(*s);
+        }
+        for (x, o) in row.iter_mut().enumerate() {
+            *o = pre[(x + r + 1).min(w)] > pre[x.saturating_sub(r)];
+        }
+    });
+    // Down: a count per column over the rows within `r`, slid down the picture.
+    let mut out = vec![false; w * h];
+    let mut count = vec![0u32; w];
+    let add = |count: &mut [u32], y: usize, by: i32| {
+        for (c, a) in count.iter_mut().zip(&across[y * w..(y + 1) * w]) {
+            if *a {
+                *c = c.wrapping_add_signed(by);
+            }
+        }
+    };
+    for y in 0..r.min(h) {
+        add(&mut count, y, 1);
+    }
+    for y in 0..h {
+        if y + r < h {
+            add(&mut count, y + r, 1);
+        }
+        if y > r {
+            add(&mut count, y - r - 1, -1);
+        }
+        for (o, c) in out[y * w..(y + 1) * w].iter_mut().zip(&count) {
+            *o = *c > 0;
+        }
+    }
+    out
 }
 
-/// Rows above the horizon where [`sky_from_guide`] starts, and over how many more it takes over.
-const SKY_START: f32 = 16.0;
-const SKY_RAMP: f32 = 32.0;
-/// The most fine texture [`sky_from_guide`] adds, per channel.
-const SKY_DETAIL_MAX: f32 = 0.03;
+/// Above this many pixels [`dilate_mask`] works its rows in parallel.
+const PAR_PIXELS: usize = 1 << 16;
+/// An alpha below this is not solid ([`drop_fringe`]).
+const ALPHA_SOLID: f32 = 0.999;
 
-/// The sky of a stamped fill from the model's drawing: the model lays clouds out and finishes
-/// them better than copied pieces, which repeat whole clouds, but draws them soft. Above the
-/// `horizon` (a row per column), each hole pixel becomes the model's (`guide`, in the picture's
-/// tones) plus the fill's own fine texture (it less its box mean of `radius`, at most
-/// [`SKY_DETAIL_MAX`]), taking over from
-/// the fill over [`SKY_RAMP`] rows from [`SKY_START`] above the horizon. Worked in bands of rows,
-/// so only a band's box means are held. `cc`: the colour channels, the first of `ch`.
-#[allow(clippy::too_many_arguments)]
-pub fn sky_from_guide(img: &mut [f32], guide: &[f32], hole: &[bool], w: usize, h: usize, ch: usize, cc: usize, radius: usize, horizon: &[f32]) {
-    let cc = cc.clamp(1, ch.min(4));
-    let r = radius.max(1);
-    let weight = |x: usize, y: usize| ((horizon.get(x).copied().unwrap_or(0.0) - SKY_START - y as f32) / SKY_RAMP).clamp(0.0, 1.0);
-    let top = horizon.iter().copied().fold(0.0f32, f32::max).max(0.0).ceil() as usize;
-    const BAND: usize = 256;
-    for y0 in (0..top.min(h)).step_by(BAND) {
-        let y1 = (y0 + BAND).min(h);
-        if !(y0..y1).any(|y| (0..w).any(|x| hole[y * w + x] && weight(x, y) > 0.0)) {
-            continue;
-        }
-        // Box means of the fill over the band (with `r` rows of margin), per colour channel.
-        let (a, b) = (y0.saturating_sub(r), (y1 + r).min(h));
-        let bh = b - a;
-        let mut mean = vec![0f32; w * (y1 - y0) * cc];
-        for c in 0..cc {
-            // Across: prefix sums per row.
-            let mut across = vec![0f32; w * bh];
-            let mut pre = vec![0f64; w + 1];
-            for y in a..b {
-                for x in 0..w {
-                    pre[x + 1] = pre[x] + f64::from(img[(y * w + x) * ch + c]);
-                }
-                for x in 0..w {
-                    let (l, rr) = (x.saturating_sub(r), (x + r + 1).min(w));
-                    across[(y - a) * w + x] = ((pre[rr] - pre[l]) / (rr - l) as f64) as f32;
-                }
-            }
-            // Down.
-            for x in 0..w {
-                for y in y0..y1 {
-                    let (l, rr) = (y.saturating_sub(r).max(a), (y + r + 1).min(b));
-                    let s: f32 = (l..rr).map(|yy| across[(yy - a) * w + x]).sum();
-                    mean[((y - y0) * w + x) * cc + c] = s / (rr - l) as f32;
-                }
-            }
-        }
-        for y in y0..y1 {
-            for x in 0..w {
-                let i = y * w + x;
-                let t = weight(x, y);
-                if !hole[i] || t == 0.0 {
-                    continue;
-                }
-                for c in 0..cc {
-                    let v = img[i * ch + c];
-                    // Fine texture only: a copied cloud's edge would etch a line into the sky.
-                    let detail = (v - mean[((y - y0) * w + x) * cc + c]).clamp(-SKY_DETAIL_MAX, SKY_DETAIL_MAX);
-                    let sky = guide[i * ch + c] + detail;
-                    img[i * ch + c] = (v * (1.0 - t) + sky * t).max(0.0);
-                }
-            }
-        }
+/// Takes the fringe of a transparent edge out of `source`: pixels that are not quite opaque,
+/// and those within `fringe` px of one. A stitched panorama's edge fades out over a few pixels
+/// whose colours are left over from the stitch (barely seen, at their alpha), and copied
+/// opaque they came out as coloured noise; the last pixels before it are often frayed too.
+/// The alpha is the last of `ch` channels. Left as it is if nothing would be left.
+pub fn drop_fringe(source: &mut [bool], img: &[f32], w: usize, h: usize, ch: usize, fringe: usize) {
+    if ch == 0 {
+        return;
+    }
+    let soft: Vec<bool> = par::map(w * h, w * h >= PAR_PIXELS, |i| img[i * ch + ch - 1] < ALPHA_SOLID);
+    let near = dilate_mask(&soft, w, h, fringe);
+    if source.iter().zip(&near).any(|(s, n)| *s && !*n) {
+        source.iter_mut().zip(&near).for_each(|(s, n)| *s &= !*n);
     }
 }

@@ -1050,6 +1050,28 @@ fn content_aware_fill_refuses_an_unknown_method() {
 /// `stamp` with a model: Classic fills, copying from near the hole, around the model's layout:
 /// the model fills, its fill only lays the hole out, and the detail is always rebuilt;
 /// `matchDepth` with it copies from about the same rows.
+/// A nearby fill keeps a transparent edge's fringe (alpha below 1, and 4 px past it) out of
+/// its sources; Classic samples as it did.
+#[test]
+fn a_nearby_fill_keeps_a_transparent_edges_fringe_out_of_its_sources() {
+    let mut s = blob_session(8);
+    s.edit("edge", |doc, active| {
+        let surf = doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap();
+        surf.fill_rect(Rect::new(0, 0, 10, 48), &[0.0, 0.0, 0.0, 0.0]);
+        surf.fill_rect(Rect::new(10, 0, 12, 48), &[1.0, 0.0, 1.0, 0.5]);
+        Ok(())
+    })
+    .unwrap();
+    s.execute("select.rect", json!({"x": 0, "y": 0, "width": 10, "height": 48})).unwrap();
+    let st = s.active().unwrap();
+    let id = st.active_layer.unwrap();
+    let plan = |m: &str| content_aware_plan(&st.doc, id, &json!({"method": m, "sampling": "rectangular"}), "edit.contentAwareFill").unwrap();
+    let at = |p: &CafPlan, x: i32, y: i32| p.source[(y - p.rect.y0) as usize * p.rect.width() as usize + (x - p.rect.x0) as usize];
+    let depth = plan("classicDepth");
+    assert!(!at(&depth, 11, 20) && !at(&depth, 15, 20) && at(&depth, 17, 20), "the fringe is left out");
+    assert!(at(&plan("classic"), 11, 20), "Classic as it was");
+}
+
 #[test]
 fn a_stamped_model_fill_is_classic_nearby_around_the_models_layout() {
     let mut s = blob_session(8);

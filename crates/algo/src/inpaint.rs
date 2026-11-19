@@ -64,7 +64,7 @@ use common::Bounds;
 pub(crate) use common::Rng;
 pub use common::{Adapt, Px};
 use common::{Level, SOURCE_MOMENTS_MAX};
-pub use levels::{horizon_line, seamless_levels, sky_from_guide};
+pub use levels::{dilate_mask, drop_fringe, seamless_levels};
 pub(crate) use solver::fit;
 #[cfg(test)]
 use solver::least_sum;
