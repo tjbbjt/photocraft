@@ -8,7 +8,7 @@
 //!
 //! A PhotoCraft features switch at the top: off (parity), the dialog and its fill are
 //! Photoshop's (`edit.fill`, on the spot); on, Content-Aware runs the Content-Aware Fill command
-//! in the background with the same sampling, and adds its fill methods (Quality, LaMa, MI-GAN, their mix)
+//! in the background with the same sampling, and adds its fill methods (LaMa, MI-GAN, their mix, each optionally stamped with Classic)
 //! and the edge band that blends the fill into the picture.
 
 use serde_json::{Map, Value, json};
@@ -33,12 +33,24 @@ pub const CONTENTS: [(&str, &str); 9] = [
 ];
 
 /// Params the dialog edits and remembers.
-const KEYS: [&str; 12] =
-    ["contents", "color", "pattern", "colorAdaptation", "mode", "opacity", "preserveTransparency", "fillMode", "method", "detail", "edgeGrow", "edgeFeather"];
+const KEYS: [&str; 13] = [
+    "contents",
+    "color",
+    "pattern",
+    "colorAdaptation",
+    "mode",
+    "opacity",
+    "preserveTransparency",
+    "fillMode",
+    "method",
+    "detail",
+    "stamp",
+    "edgeGrow",
+    "edgeFeather",
+];
 
 /// Content-Aware's methods: (param, label).
-pub const METHODS: [(&str, &str); 5] =
-    [("classic", "Classic"), ("quality", "Quality (Classic + LaMa)"), ("lama", "LaMa"), ("migan", "MI-GAN"), ("mix", "Mix (LaMa + MI-GAN)")];
+pub const METHODS: [(&str, &str); 4] = [("classic", "Classic"), ("lama", "LaMa"), ("migan", "MI-GAN"), ("mix", "Mix (LaMa + MI-GAN)")];
 
 /// The edge band PhotoCraft starts with, in px: grown outright, then feathered.
 pub const EDGE_GROW: f64 = 2.0;
@@ -63,7 +75,7 @@ fn valid(app: &PhotocraftApp, key: &str, v: &Value) -> bool {
         "mode" | "opacity" | "preserveTransparency" => crate::dialog_blend_ui::valid(key, v),
         "color" => v.as_str().is_some_and(|h| h.len() == 7 && h.starts_with('#') && h.get(1..).is_some_and(|d| d.chars().all(|c| c.is_ascii_hexdigit()))),
         "pattern" => v.as_str().is_some_and(|p| app.session.patterns.items.iter().any(|q| q.id == p)),
-        "colorAdaptation" | "detail" => v.is_boolean(),
+        "colorAdaptation" | "detail" | "stamp" => v.is_boolean(),
         "fillMode" => matches!(v.as_str(), Some("parity" | "photocraft")),
         "method" => v.as_str().is_some_and(|m| METHODS.iter().any(|(k, _)| *k == m)),
         "edgeGrow" | "edgeFeather" => v.as_f64().is_some_and(|n| (0.0..=EDGE_MAX).contains(&n)),
@@ -86,6 +98,7 @@ pub fn default_fields(app: &PhotocraftApp) -> Map<String, Value> {
     f.insert("fillMode".into(), json!("photocraft"));
     f.insert("method".into(), json!("classic"));
     f.insert("detail".into(), json!(true));
+    f.insert("stamp".into(), json!(true));
     f.insert("edgeGrow".into(), json!(EDGE_GROW));
     f.insert("edgeFeather".into(), json!(EDGE_FEATHER));
     f.insert("mode".into(), json!("normal"));
@@ -180,6 +193,7 @@ pub fn photocraft_params(f: &Map<String, Value>) -> Option<Value> {
         "colorAdaptation": if adapt { "default" } else { "none" },
         "method": get("method").unwrap_or("classic"),
         "detail": f.get("detail").and_then(Value::as_bool).unwrap_or(true),
+        "stamp": f.get("stamp").and_then(Value::as_bool).unwrap_or(true),
         "edgeGrow": px("edgeGrow", EDGE_GROW),
         "edgeFeather": px("edgeFeather", EDGE_FEATHER),
         "output": "current",
@@ -343,15 +357,20 @@ fn content_aware_body(ui: &mut egui::Ui, f: &mut Map<String, Value>, label: &dyn
             f.insert("method".into(), json!(method));
         }
     });
-    ui.horizontal(|ui| {
-        label(ui, "");
-        let mut on = f.get("detail").and_then(Value::as_bool).unwrap_or(true);
-        ui.add_enabled_ui(!matches!(method.as_str(), "classic" | "quality"), |ui| {
-            if crate::widgets::checkbox(ui, &mut on, tl!("Rebuild Detail from the Photo")).changed() {
-                f.insert("detail".into(), json!(on));
-            }
+    // Stamping always rebuilds the detail: Classic fills around the model's layout.
+    let model = method != "classic";
+    let stamp = f.get("stamp").and_then(Value::as_bool).unwrap_or(true);
+    for (key, name, enabled) in [("stamp", tl!("Stamp with Classic"), model), ("detail", tl!("Rebuild Detail from the Photo"), model && !stamp)] {
+        ui.horizontal(|ui| {
+            label(ui, "");
+            let mut on = f.get(key).and_then(Value::as_bool).unwrap_or(true);
+            ui.add_enabled_ui(enabled, |ui| {
+                if crate::widgets::checkbox(ui, &mut on, name).changed() {
+                    f.insert(key.into(), json!(on));
+                }
+            });
         });
-    });
+    }
     for (key, name, default) in [("edgeGrow", tl!("Edge Grow:"), EDGE_GROW), ("edgeFeather", tl!("Edge Feather:"), EDGE_FEATHER)] {
         ui.horizontal(|ui| {
             label(ui, name);

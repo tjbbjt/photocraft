@@ -1038,7 +1038,7 @@ fn a_model_guide_lays_out_the_fill() {
     }
 }
 
-/// `method` takes classic, quality, lama, migan or mix; anything else is refused before any work.
+/// `method` takes classic, lama, migan or mix; anything else is refused before any work.
 #[test]
 fn content_aware_fill_refuses_an_unknown_method() {
     let mut s = blob_session(8);
@@ -1047,17 +1047,23 @@ fn content_aware_fill_refuses_an_unknown_method() {
     s.execute("edit.contentAwareFill", json!({"method": "classic", "colorAdaptation": "none"})).unwrap();
 }
 
-/// Quality is Classic, copying from near the hole, around LaMa's layout: LaMa fills, its fill
-/// only lays the hole out, and the detail is always rebuilt.
+/// `stamp` with a model: Classic fills, copying from near the hole, around the model's layout:
+/// the model fills, its fill only lays the hole out, and the detail is always rebuilt.
 #[test]
-fn quality_is_classic_nearby_around_lamas_layout() {
+fn a_stamped_model_fill_is_classic_nearby_around_the_models_layout() {
     let mut s = blob_session(8);
     s.execute("select.rect", json!({"x": 24, "y": 16, "width": 16, "height": 16})).unwrap();
     let st = s.active().unwrap();
     let id = st.active_layer.unwrap();
-    let plan = content_aware_plan(&st.doc, id, &json!({"method": "quality", "detail": false}), "edit.contentAwareFill").unwrap();
-    assert_eq!(plan.model, Some(FillModel { method: "lama".into(), detail: true }));
-    assert!(plan.opts.nearby && plan.opts.layout_only);
-    let lama = content_aware_plan(&st.doc, id, &json!({"method": "lama"}), "edit.contentAwareFill").unwrap();
-    assert!(!lama.opts.nearby && !lama.opts.layout_only);
+    let plan = |p: Value| content_aware_plan(&st.doc, id, &p, "edit.contentAwareFill").unwrap();
+    for m in ["lama", "migan", "mix"] {
+        let stamped = plan(json!({"method": m, "stamp": true, "detail": false}));
+        assert_eq!(stamped.model, Some(FillModel { method: m.into(), detail: true }));
+        assert!(stamped.opts.nearby && stamped.opts.layout_only, "{m}");
+        let own = plan(json!({"method": m, "detail": false}));
+        assert_eq!(own.model, Some(FillModel { method: m.into(), detail: false }));
+        assert!(!own.opts.nearby && !own.opts.layout_only, "{m}");
+    }
+    let classic = plan(json!({"method": "classic", "stamp": true}));
+    assert!(classic.model.is_none() && !classic.opts.nearby, "Classic stays Classic");
 }

@@ -77,6 +77,9 @@ fn photocraft_content_aware_runs_the_content_aware_fill_command() {
     assert_eq!(p["sampling"], "rectangular");
     assert_eq!(p["colorAdaptation"], "none");
     assert_eq!(p["method"], "lama");
+    assert_eq!(p["stamp"], true, "a model stamps with Classic unless told not to");
+    f.insert("stamp".into(), json!(false));
+    assert_eq!(photocraft_params(&f).unwrap()["stamp"], false);
     assert_eq!(p["edgeGrow"], json!(EDGE_GROW));
     assert_eq!(p["edgeFeather"], json!(12.0));
     f.insert("__target".into(), json!("mask"));

@@ -108,6 +108,7 @@ pub(super) fn plan_params(w: &CafWorkspace, strokes: bool) -> Value {
         "output": o.output,
         "method": o.fill_method(),
         "detail": o.detail,
+        "stamp": o.stamp,
         "edgeGrow": o.edge().0,
         "edgeFeather": o.edge().1,
         "layer": w.layer.0,

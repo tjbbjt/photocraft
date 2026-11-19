@@ -122,6 +122,9 @@ pub struct CafOpts {
     /// With a model: rebuild the detail from the picture (the model's fill guiding PatchMatch)
     /// rather than keep the model's own fill.
     pub detail: bool,
+    /// With a model: Classic fills, copying from near the hole, around the model's layout (the
+    /// engine's `stamp`). Detail is then always rebuilt.
+    pub stamp: bool,
     /// The PhotoCraft features switch: on, the method, the edge band, timers and the resizable
     /// preview; off (parity), Photoshop's panel and fill (Classic, no band), whatever the method
     /// and band are set to.
@@ -156,6 +159,7 @@ impl Default for CafOpts {
             output: "new".into(),
             method: "classic".into(),
             detail: true,
+            stamp: true,
             photocraft: true,
             edge_grow: EDGE_GROW,
             edge_feather: EDGE_FEATHER,
@@ -176,6 +180,7 @@ impl CafOpts {
             ("scale", &mut self.scale),
             ("mirror", &mut self.mirror),
             ("detail", &mut self.detail),
+            ("stamp", &mut self.stamp),
         ] {
             if let Some(b) = flag(k) {
                 *slot = b;
@@ -217,7 +222,7 @@ impl CafOpts {
         if let Some(s) = pick("output", &["current", "new", "duplicate"])? {
             self.output = s;
         }
-        if let Some(s) = pick("method", &["classic", "quality", "lama", "migan", "mix"])? {
+        if let Some(s) = pick("method", &["classic", "lama", "migan", "mix"])? {
             self.method = s;
         }
         if let Some(s) = pick("fillMode", &["parity", "photocraft"])? {
@@ -242,6 +247,7 @@ impl CafOpts {
             "output": self.output,
             "method": self.method,
             "detail": self.detail,
+            "stamp": self.stamp,
             "fillMode": if self.photocraft { "photocraft" } else { "parity" },
             "edgeGrow": self.edge_grow,
             "edgeFeather": self.edge_feather,

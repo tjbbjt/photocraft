@@ -57,6 +57,12 @@ fn photocraft_behavior_sends_the_method_and_the_edge_band() {
     let count = |h: &[bool]| h.iter().filter(|h| **h).count();
     assert!(count(&hole) > count(&parity_hole), "the band widens the fill area");
     assert!(control(&mut app, &json!({"fillMode": "fancy"})).is_err());
+    // A model stamps with Classic unless told not to.
+    control(&mut app, &json!({"method": "migan"})).unwrap();
+    let p = plan_params(ws(&app), true);
+    assert_eq!((p["method"].clone(), p["stamp"].clone()), (json!("migan"), json!(true)));
+    control(&mut app, &json!({"stamp": false})).unwrap();
+    assert_eq!(plan_params(ws(&app), true)["stamp"], false);
 }
 
 fn px(app: &PhotocraftApp, layer: LayerId, x: i32, y: i32) -> Vec<f32> {
