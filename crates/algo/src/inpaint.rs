@@ -396,7 +396,11 @@ fn complete_cow<'a>(
         let depth = p.nearby.then(|| {
             if p.same_depth {
                 let horizon = solver::horizon_line(&limg, &lpx, lw, lh, ch).unwrap_or_default();
-                Depth::new(&valid, lw, lh, reach, p.patch_radius as i32, SAME_DEPTH_PER_ROW, &horizon)
+                let mut d = Depth::new(&valid, lw, lh, reach, p.patch_radius as i32, SAME_DEPTH_PER_ROW, &horizon);
+                if !horizon.is_empty() {
+                    d.sky = solver::SkyRule::new(&limg, &lpx, lw, lh, ch, |x| d.horizon_at(x), p.patch_radius, reach);
+                }
+                d
             } else {
                 Depth::new(&valid, lw, lh, reach, reach as i32, 0.0, &[])
             }

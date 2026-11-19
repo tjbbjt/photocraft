@@ -863,6 +863,36 @@ fn a_fallback_source_lies_inside_the_picture() {
     assert!(valid[s.1 as usize * w + s.0 as usize]);
 }
 
+/// The sky rule: above the horizon, where the hole's edge is mostly cloud a target may copy
+/// cloud; where it is sky, only sky away from any cloud. Below the horizon, anything.
+#[test]
+fn the_sky_goes_on_with_clouds_only_where_the_edge_is_cloud() {
+    let (w, h, ch) = (64, 64, 3);
+    // Sky above row 40, ground below; a grey cloud over columns 0..20, rows 6..30.
+    let img: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            if y >= 40 {
+                [0.35, 0.3, 0.25]
+            } else if x < 20 && y < 30 {
+                [0.45, 0.46, 0.48]
+            } else {
+                [0.2, 0.25, 0.35]
+            }
+        })
+        .collect();
+    // The hole: a strip along the top.
+    let px: Vec<Px> = (0..w * h).map(|i| if i / w < 6 { Px::Hole } else { Px::Source }).collect();
+    let k = solver::SkyRule::new(&img, &px, w, h, ch, |_| 40, 1, 8).expect("a sky rule");
+    let (cloud, sky) = ((10, 15), (50, 20));
+    assert!(k.allows((4, 2), cloud, w), "over the cut cloud, cloud goes on");
+    assert!(!k.allows((50, 2), cloud, w), "over sky, no new cloud");
+    assert!(k.allows((50, 2), sky, w));
+    // No split without clouds.
+    let clear: Vec<f32> = (0..w * h).flat_map(|i| if i / w >= 40 { [0.35, 0.3, 0.25] } else { [0.2, 0.25, 0.35] }).collect();
+    assert!(solver::SkyRule::new(&clear, &px, w, h, ch, |_| 40, 1, 8).is_none());
+}
+
 /// Uses: a block copied once (a stretch copied whole) costs nothing more; each further copy of
 /// it costs the weight times the patch distance more.
 #[test]

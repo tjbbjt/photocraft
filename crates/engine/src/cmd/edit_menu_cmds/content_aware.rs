@@ -336,6 +336,11 @@ fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Resul
         }
         other => return Err(bad(cmd, format!("unknown method `{other}` (classic|classicDepth|lama|migan|mix)"))),
     };
+    // A nearby fill copies from close by at about its depth, so its pieces already fit; a
+    // gain and bias per patch only pushed smooth sky apart into coloured specks and pale blocks.
+    if opts.nearby {
+        opts.color_adaptation = color_level("none");
+    }
     let edge = edge_param(p, cmd)?;
     let surf = doc.layer(id).and_then(|l| l.surface()).ok_or(EngineError::NoLayer(id))?;
     Ok(CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, model, edge, surf })

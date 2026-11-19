@@ -1093,4 +1093,6 @@ fn a_stamped_model_fill_is_classic_nearby_around_the_models_layout() {
     assert!(classic.model.is_none() && !classic.opts.nearby && !classic.opts.same_depth, "Classic stays Classic");
     let depth = plan(json!({"method": "classicDepth"}));
     assert!(depth.model.is_none() && depth.opts.nearby && depth.opts.same_depth && !depth.opts.layout_only, "Classic + Depth");
+    assert_eq!(depth.opts.color_adaptation, photocraft_algo::inpaint::Adapt::NONE, "nearby fills adapt no colours");
+    assert_ne!(classic.opts.color_adaptation, photocraft_algo::inpaint::Adapt::NONE, "Classic keeps its colour adaptation");
 }
