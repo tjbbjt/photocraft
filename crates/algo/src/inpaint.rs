@@ -66,7 +66,7 @@ use common::{Level, SOURCE_MOMENTS_MAX};
 pub(crate) use solver::fit;
 #[cfg(test)]
 use solver::least_sum;
-use solver::{Depth, Solver, Uses};
+use solver::{Depth, SkyLayout, Solver, Uses};
 use sources::{Coarser, Sources, THIN_RATIO, downsample, hole_bounds, hole_thickness, peel_affordable, valid_sources, window_count};
 #[cfg(test)]
 use sources::{hole_bbox, integral};
@@ -118,7 +118,8 @@ pub struct CompleteParams {
     /// A nearby fill copies at the same depth: from about the same rows as each hole pixel (up
     /// or down a fifth of its distance from the horizon, or from the top of the picture without
     /// one), so ground far off, finer and smoother, is not copied into ground close by, where it
-    /// reads as a road. Only with [`Self::nearby`].
+    /// reads as a road. In the sky, clouds cut by the hole are finished and no new ones made
+    /// ([`solver::SkyLayout`]). Only with [`Self::nearby`].
     pub same_depth: bool,
 }
 
@@ -333,6 +334,8 @@ fn complete_cow<'a>(
     let total_px: usize = levels.iter().map(|l| l.w * l.h).sum();
     let mut done_px = 0usize;
     let ri = r as i32;
+    // A fill at the same depth's sky layout, made once ([`SkyLayout`]).
+    let mut sky_layout: Option<SkyLayout> = None;
     for li in (0..nlev).rev() {
         ctl.check()?;
         let Level { w: lw, h: lh, img: limg, px: lpx } = std::mem::replace(&mut levels[li], Level::EMPTY);
@@ -398,6 +401,10 @@ fn complete_cow<'a>(
             }
         });
         ctl.check()?;
+        if p.nearby && p.same_depth && sky_layout.is_none() && (lw >= SkyLayout::MIN_WIDTH || li == 0) {
+            sky_layout = solver::horizon(&limg, &lpx, lw, lh, ch).and_then(|hz| SkyLayout::new(&mut limg, &lpx, lw, lh, ch, hz));
+        }
+        let sky = sky_layout.as_ref().map(|l| l.view(&limg, lw, lh, ch));
         let mut solver = Solver {
             w: lw,
             h: lh,
@@ -407,9 +414,13 @@ fn complete_cow<'a>(
             guide: guide_here,
             mimg: None,
             coherence: if steer { GUIDED_COHERENCE } else { 0.0 },
-            stamp: steer,
+            // Nearby, too: the pieces stay sharp, not a blend of near misses that greys their
+            // colours (green sage turned brown); blended only against the picture.
+            stamp: steer || p.nearby,
+            blend_edge: p.nearby && !steer,
             reach: reach as i32,
             depth,
+            sky,
             uses: (p.nearby && li >= NEARBY_REUSE_FROM).then(|| Uses::new(lw, lh, psz, NEARBY_REUSE)),
             px: &lpx,
             valid,

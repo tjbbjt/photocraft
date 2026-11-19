@@ -26,6 +26,9 @@ pub(super) struct Solver<'a> {
     /// A guided fill's vote stamps: each pixel takes the best match covering it (the highest
     /// weight) rather than the mean of all of them, so the copies stay sharp. Off unguided.
     pub(super) stamp: bool,
+    /// With [`Self::stamp`]: a pixel within a patch of the picture around the hole is still the
+    /// mean, so a stamped fill blends into the picture rather than meeting it at a hard edge.
+    pub(super) blend_edge: bool,
     /// A nearby fill's reach at this level ([`CompleteParams::nearby`]): sources at most this
     /// many pixels from their target across and down; 0 anywhere.
     pub(super) reach: i32,
@@ -35,6 +38,9 @@ pub(super) struct Solver<'a> {
     /// A nearby fill's count of how often each part of the picture is copied: a part copied
     /// more than once costs more for the next target ([`Uses`]).
     pub(super) uses: Option<Uses>,
+    /// At the same depth with a sky: cloud copied only into the sky's clouds, sky into its sky
+    /// ([`SkyLayout`]).
+    pub(super) sky: Option<SkyView>,
     pub(super) px: &'a [Px],
     /// Valid source centres: the whole patch is inside the grid and may be copied from.
     pub(super) valid: Vec<bool>,
@@ -140,7 +146,7 @@ impl Solver<'_> {
     /// about its depth, for one at the same depth.
     #[inline]
     pub(super) fn allowed(&self, t: (i32, i32), s: (i32, i32)) -> bool {
-        self.reach <= 0 || ((s.0 - t.0).abs() <= self.reach && (s.1 - t.1).abs() <= self.rows_of(t))
+        (self.reach <= 0 || ((s.0 - t.0).abs() <= self.reach && (s.1 - t.1).abs() <= self.rows_of(t))) && self.sky.as_ref().is_none_or(|k| k.allows(t, s))
     }
 
     /// What copying `s` costs on top of the patch distance: [`Uses::factor`], 1 without.
@@ -757,7 +763,19 @@ impl Solver<'_> {
         let per = ch + 1;
         let mut out = vec![0.0f32; n * per];
         {
-            let votes = Votes { w, h, ch, r: r as usize, cells: &self.cells, img: &*self.img, wt: &wt, src: &src, gb: &gb, stamp: self.stamp };
+            let votes = Votes {
+                w,
+                h,
+                ch,
+                r: r as usize,
+                cells: &self.cells,
+                img: &*self.img,
+                wt: &wt,
+                src: &src,
+                gb: &gb,
+                stamp: self.stamp,
+                blend_edge: self.blend_edge.then_some(self.px),
+            };
             let (px, ctl) = (self.px, &self.ctl);
             self.cells.rows_mut(&mut out, per, par, |y, runs, orow| {
                 if ctl.cancelled() {
@@ -811,6 +829,9 @@ struct Votes<'a> {
     gb: &'a [(f32, f32)],
     /// Each pixel from the best match covering it ([`Solver::stamp`]), not the mean.
     stamp: bool,
+    /// The pixel roles, when a pixel a patch of the picture covers takes the mean anyway
+    /// ([`Solver::blend_edge`]).
+    blend_edge: Option<&'a [Px]>,
 }
 
 impl Votes<'_> {
@@ -838,6 +859,7 @@ impl Votes<'_> {
         let mut acc = [0.0f32; CH];
         let mut wsum = 0.0f32;
         let mut best = (0.0f32, [0.0f32; CH]);
+        let mut picture = false;
         for ty in y.saturating_sub(r)..=(y + r).min(self.h - 1) {
             let dy = ty as isize - y as isize;
             self.each_in(ty, x.saturating_sub(r), (x + r).min(w - 1), |k, tx| {
@@ -861,10 +883,11 @@ impl Votes<'_> {
                 if self.stamp && wt > best.0 {
                     best = (wt, v);
                 }
+                picture |= self.blend_edge.is_some_and(|px| px[ty * w + tx] != Px::Hole);
                 wsum += wt;
             });
         }
-        if self.stamp && wsum > 0.0 {
+        if self.stamp && wsum > 0.0 && !picture {
             out[..CH].copy_from_slice(&best.1);
             return true;
         }
@@ -883,6 +906,7 @@ impl Votes<'_> {
         let mut acc = vec![0.0f32; ch];
         let mut wsum = 0.0f32;
         let (mut best_wt, mut best) = (0.0f32, vec![0.0f32; ch]);
+        let mut picture = false;
         for ty in y.saturating_sub(r)..=(y + r).min(self.h - 1) {
             let dy = ty as isize - y as isize;
             self.each_in(ty, x.saturating_sub(r), (x + r).min(w - 1), |k, tx| {
@@ -907,10 +931,11 @@ impl Votes<'_> {
                         best[c] = v;
                     }
                 }
+                picture |= self.blend_edge.is_some_and(|px| px[ty * w + tx] != Px::Hole);
                 wsum += wt;
             });
         }
-        if self.stamp && wsum > 0.0 {
+        if self.stamp && wsum > 0.0 && !picture {
             out.copy_from_slice(&best);
             return true;
         }
@@ -1218,5 +1243,181 @@ impl Uses {
         let n = self.block(s).and_then(|k| self.counts.get(k)).copied().unwrap_or(0) as f32;
         let once = (self.side * self.side) as f32;
         1.0 + self.weight * (n / once - 1.0).max(0.0)
+    }
+}
+
+/// Where the sky's clouds go, for a fill at the same depth, laid out once on a level at least
+/// [`SkyLayout::MIN_WIDTH`] px across. Above the horizon the known pixels split into two tones,
+/// sky and cloud (Otsu); each cloud in the fill so far (the model's, or Classic's coarser one)
+/// that touches a cloud of the picture finishes that cloud and stays. One touching none is a new
+/// cloud, and becomes plain sky, unless the picture has [`SkyLayout::SCATTERED`] small clouds in
+/// rows near it, a sky of many small clouds where another is one more of them.
+pub(super) struct SkyLayout {
+    /// Per pixel of the level it was laid out on: 0 below the horizon, 1 sky, 2 cloud.
+    class: Vec<u8>,
+    w: usize,
+    h: usize,
+    /// The tone between sky and cloud.
+    split: f32,
+}
+
+impl SkyLayout {
+    /// The narrowest level the layout is made on (or the finest, when narrower).
+    pub(super) const MIN_WIDTH: usize = 256;
+    /// Small clouds in nearby rows that let a new cloud stay.
+    const SCATTERED: usize = 16;
+
+    /// The layout of `img` (the level's picture and fill so far, `w` by `h`, `ch` channels, at
+    /// least three) above `horizon`; new clouds in the fill become the sky's mean colour. `None`
+    /// without two clear tones above the horizon.
+    pub(super) fn new(img: &mut [f32], px: &[Px], w: usize, h: usize, ch: usize, horizon: f32) -> Option<Self> {
+        let tone = |img: &[f32], i: usize| img[i * ch..i * ch + 3].iter().sum::<f32>() / 3.0;
+        let hz = (horizon as usize).min(h);
+        if ch < 3 || hz < 2 {
+            return None;
+        }
+        // Otsu over the known sky's tones.
+        const BINS: usize = 64;
+        let mut hist = [0f64; BINS];
+        for i in (0..w * hz).filter(|i| px[*i] != Px::Hole) {
+            hist[((tone(img, i).clamp(0.0, 1.0) * BINS as f32) as usize).min(BINS - 1)] += 1.0;
+        }
+        let n: f64 = hist.iter().sum();
+        let centre = |b: usize| (b as f64 + 0.5) / BINS as f64;
+        let total: f64 = hist.iter().enumerate().map(|(b, v)| v * centre(b)).sum();
+        let (mut n0, mut s0, mut best) = (0.0, 0.0, (-1.0, 0usize, 0.0, 0.0));
+        for (b, v) in hist.iter().enumerate().take(BINS - 1) {
+            n0 += v;
+            s0 += v * centre(b);
+            let n1 = n - n0;
+            if n0 >= 1.0 && n1 >= 1.0 {
+                let (m0, m1) = (s0 / n0, (total - s0) / n1);
+                let between = n0 * n1 * (m1 - m0) * (m1 - m0);
+                if between > best.0 {
+                    best = (between, b, n0 / n, m1 - m0);
+                }
+            }
+        }
+        // Two clear tones, each at least 5 % of the sky.
+        let (_, cut, low_share, apart) = best;
+        if n < 20.0 || apart < 0.15 || !(0.05..=0.95).contains(&low_share) {
+            return None;
+        }
+        let split = (cut + 1) as f32 / BINS as f32;
+        let mut class = vec![0u8; w * h];
+        for (i, c) in class.iter_mut().enumerate().take(w * hz) {
+            *c = if tone(img, i) > split { 2 } else { 1 };
+        }
+        // The clouds (4-connected): whether each touches the picture, its known pixels, its rows.
+        let mut comp = vec![u32::MAX; w * hz];
+        let mut clouds: Vec<(bool, usize, usize, usize)> = Vec::new();
+        let mut stack = Vec::new();
+        for start in 0..w * hz {
+            if class[start] != 2 || comp[start] != u32::MAX {
+                continue;
+            }
+            let id = clouds.len() as u32;
+            let mut c = (false, 0usize, usize::MAX, 0usize);
+            comp[start] = id;
+            stack.push(start);
+            while let Some(i) = stack.pop() {
+                if px[i] != Px::Hole {
+                    c.0 = true;
+                    c.1 += 1;
+                }
+                let (x, y) = (i % w, i / w);
+                (c.2, c.3) = (c.2.min(y), c.3.max(y));
+                for (nx, ny) in [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)] {
+                    if nx >= w || ny >= hz {
+                        continue;
+                    }
+                    let j = ny * w + nx;
+                    if class[j] == 2 && comp[j] == u32::MAX {
+                        comp[j] = id;
+                        stack.push(j);
+                    }
+                }
+            }
+            clouds.push(c);
+        }
+        // Small clouds of the picture: under 0.5 % of its known sky.
+        let sky_px = (0..w * hz).filter(|i| px[*i] != Px::Hole).count().max(1);
+        let small: Vec<(usize, usize)> = clouds.iter().filter(|c| c.0 && c.1 * 200 <= sky_px).map(|c| (c.2, c.3)).collect();
+        let keep: Vec<bool> = clouds
+            .iter()
+            .map(|c| {
+                // A new cloud stays among enough small ones within twice its height.
+                c.0 || {
+                    let m = 2 * (c.3 - c.2 + 1);
+                    small.iter().filter(|s| s.1 + m >= c.2 && s.0 <= c.3 + m).count() >= Self::SCATTERED
+                }
+            })
+            .collect();
+        let (mut sum, mut count) = ([0f64; 3], 0f64);
+        for i in (0..w * hz).filter(|i| px[*i] != Px::Hole && class[*i] == 1) {
+            for (c, s) in sum.iter_mut().enumerate() {
+                *s += f64::from(img[i * ch + c]);
+            }
+            count += 1.0;
+        }
+        let mean = sum.map(|s| (s / count.max(1.0)) as f32);
+        for i in 0..w * hz {
+            if px[i] == Px::Hole && class[i] == 2 && !keep[comp[i] as usize] {
+                img[i * ch..i * ch + 3].copy_from_slice(&mean);
+                class[i] = 1;
+            }
+        }
+        Some(Self { class, w, h, split })
+    }
+
+    /// The layout for a level `w` by `h` with picture `img`: its sources' tones per 4 x 4 cell.
+    pub(super) fn view(&self, img: &[f32], w: usize, h: usize, ch: usize) -> SkyView {
+        let (cw, chh) = (w.div_ceil(4), h.div_ceil(4));
+        let (mut cell, mut n) = (vec![0.0f32; cw * chh], vec![0u16; cw * chh]);
+        for y in 0..h {
+            for x in 0..w {
+                let (k, i) = ((y / 4) * cw + x / 4, y * w + x);
+                cell[k] += img[i * ch..i * ch + ch.min(3)].iter().sum::<f32>() / ch.min(3) as f32;
+                n[k] += 1;
+            }
+        }
+        for (c, n) in cell.iter_mut().zip(&n) {
+            *c /= f32::from((*n).max(1));
+        }
+        SkyView { class: self.class.clone(), lw: self.w, lh: self.h, sx: self.w as f32 / w as f32, sy: self.h as f32 / h as f32, cell, cw, split: self.split }
+    }
+}
+
+/// A [`SkyLayout`] on one level.
+pub(super) struct SkyView {
+    class: Vec<u8>,
+    lw: usize,
+    lh: usize,
+    /// From this level to the layout's.
+    sx: f32,
+    sy: f32,
+    /// Each 4 x 4 cell's mean tone, cells across.
+    cell: Vec<f32>,
+    cw: usize,
+    split: f32,
+}
+
+impl SkyView {
+    /// Whether target `t` may copy `s`: cloud into cloud, sky into sky; either along a cloud's
+    /// edge, where its outline forms; anything below the horizon.
+    #[inline]
+    pub(super) fn allows(&self, t: (i32, i32), s: (i32, i32)) -> bool {
+        let (cx, cy) = (((t.0.max(0) as f32 * self.sx) as usize).min(self.lw - 1), ((t.1.max(0) as f32 * self.sy) as usize).min(self.lh - 1));
+        let c = self.class[cy * self.lw + cx];
+        if c == 0 {
+            return true;
+        }
+        let edge = (cy.saturating_sub(1)..(cy + 2).min(self.lh))
+            .any(|y| (cx.saturating_sub(1)..(cx + 2).min(self.lw)).any(|x| !matches!(self.class[y * self.lw + x], 0) && self.class[y * self.lw + x] != c));
+        if edge {
+            return true;
+        }
+        let tone = self.cell.get((s.1.max(0) as usize / 4) * self.cw + s.0.max(0) as usize / 4).copied().unwrap_or(self.split);
+        (tone > self.split) == (c == 2)
     }
 }

@@ -412,9 +412,11 @@ fn full_patches_measure_as_clipped_ones() {
                 mimg: None,
                 coherence: 0.0,
                 stamp: false,
+                blend_edge: false,
                 reach: 0,
                 depth: None,
                 uses: None,
+                sky: None,
                 px: &px,
                 valid: valid.clone(),
                 cells,
@@ -667,9 +669,11 @@ fn a_nearby_fill_takes_matches_only_within_reach() {
         mimg: None,
         coherence: 0.0,
         stamp: false,
+        blend_edge: false,
         reach,
         depth: Some(solver::Depth::new(&valid, w, h, reach as usize, reach, 0.0, 0.0)),
         uses: None,
+        sky: None,
         px: &px,
         valid: valid.clone(),
         cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
@@ -775,9 +779,11 @@ fn a_same_depth_fill_takes_matches_only_from_its_rows() {
         mimg: None,
         coherence: 0.0,
         stamp: false,
+        blend_edge: false,
         reach: reach as i32,
         depth,
         uses: None,
+        sky: None,
         px: &px,
         valid: valid.clone(),
         cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
@@ -821,4 +827,58 @@ fn a_layout_only_guide_lays_out_the_hole_and_classic_fills_it() {
         ((45..75).map(|x| (out[(y * w + x) * ch] - m).powi(2)).sum::<f32>() / 30.0).sqrt()
     };
     assert!(spread(30) > 0.05 && spread(50) > 0.02, "spread {} / {}", spread(30), spread(50));
+}
+
+/// A nearby fill stamps: away from the picture, each pixel is one of the picture's own (a sharp
+/// copy, not a blend of near misses); beside it, a blend.
+#[test]
+fn a_nearby_fill_copies_pixels_whole_away_from_the_picture() {
+    let (w, h, ch) = (96, 64, 3);
+    let img = busy(w, h, ch, 9);
+    let hole = disc(w, h, 48.0, 32.0, 14.0);
+    let px = roles(w, h, &hole);
+    let none = photocraft_raster::Interrupt::NONE;
+    let p = CompleteParams { nearby: true, ..Default::default() };
+    let out = complete_masked_owned(w, h, ch, img.clone(), &px, &p, &none).unwrap().unwrap();
+    let picture: std::collections::HashSet<[u32; 3]> =
+        (0..w * h).filter(|i| !hole[*i]).map(|i| [img[i * ch].to_bits(), img[i * ch + 1].to_bits(), img[i * ch + 2].to_bits()]).collect();
+    let deep = disc(w, h, 48.0, 32.0, 8.0);
+    let whole =
+        (0..w * h).filter(|i| deep[*i]).filter(|i| picture.contains(&[out[i * ch].to_bits(), out[i * ch + 1].to_bits(), out[i * ch + 2].to_bits()])).count();
+    let n = deep.iter().filter(|d| **d).count();
+    assert_eq!(whole, n, "{whole} of {n} pixels deep in the hole are copies");
+}
+
+/// The sky's layout: above the horizon, a cloud in the fill that touches one of the picture
+/// stays (the fill finishes it); one touching none becomes plain sky. Cloud is then copied only
+/// into cloud and sky into sky, either at a cloud's edge.
+#[test]
+fn a_cut_cloud_is_finished_and_no_new_one_is_made() {
+    let (w, h, ch) = (60, 40, 3);
+    let (sky, cloud, ground) = ([0.2, 0.3, 0.6], [0.9, 0.9, 0.92], [0.4, 0.3, 0.2]);
+    // Sky above row 30, ground below; a strip along the top (rows < 8) is the hole. A cloud of
+    // the picture at columns 10..20 reaches the strip; the fill so far carries it on up, and has
+    // made another at columns 40..48, touching nothing.
+    let px: Vec<Px> = (0..w * h).map(|i| if i / w < 8 { Px::Hole } else { Px::Source }).collect();
+    let mut img: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            if y >= 30 {
+                ground
+            } else if (10..20).contains(&x) && y < 16 || (40..48).contains(&x) && y < 6 {
+                cloud
+            } else {
+                sky
+            }
+        })
+        .collect();
+    let layout = solver::SkyLayout::new(&mut img, &px, w, h, ch, 30.0).unwrap();
+    let at = |x: usize, y: usize| img[(y * w + x) * ch];
+    assert_eq!(at(15, 3), 0.9, "the cut cloud is finished");
+    assert!((at(44, 3) - 0.2).abs() < 1e-6, "the new cloud is now sky: {}", at(44, 3));
+    let view = layout.view(&img, w, h, ch);
+    let s = |t, s| view.allows(t, s);
+    assert!(s((15, 3), (12, 12)) && !s((15, 3), (30, 20)), "cloud from cloud");
+    assert!(s((30, 3), (30, 20)) && !s((30, 3), (12, 12)), "sky from sky");
+    assert!(s((15, 35), (30, 20)), "below the horizon, anything");
 }

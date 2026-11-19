@@ -371,7 +371,8 @@ fn content_aware_body(ui: &mut egui::Ui, f: &mut Map<String, Value>, label: &dyn
     ] {
         ui.horizontal(|ui| {
             label(ui, "");
-            let mut on = f.get(key).and_then(Value::as_bool).unwrap_or(true);
+            // Classic + Depth always matches depth: shown ticked whatever the setting.
+            let mut on = (key == "matchDepth" && method == "classicDepth") || f.get(key).and_then(Value::as_bool).unwrap_or(true);
             ui.add_enabled_ui(enabled, |ui| {
                 if crate::widgets::checkbox(ui, &mut on, name).changed() {
                     f.insert(key.into(), json!(on));

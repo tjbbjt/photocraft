@@ -188,8 +188,12 @@ fn caf_props_panel(
             widgets::checkbox(ui, &mut w.opts.stamp, tl!("Stamp with Classic"))
                 .on_hover_text(tl!("The model only lays the fill out; Classic fills it with pieces of the photo from nearby."));
         });
+        // Classic + Depth always matches depth: shown ticked (and fixed) whatever the setting.
+        let depth_method = w.opts.method == "classicDepth";
+        let mut always = true;
+        let depth = if depth_method { &mut always } else { &mut w.opts.match_depth };
         ui.add_enabled_ui(model && w.opts.stamp, |ui| {
-            widgets::checkbox(ui, &mut w.opts.match_depth, tl!("Match Depth"))
+            widgets::checkbox(ui, depth, tl!("Match Depth"))
                 .on_hover_text(tl!("Copy from about the same height in the picture, so ground far off is not copied into ground close by."));
         });
         ui.add_enabled_ui(model && !w.opts.stamp, |ui| {
