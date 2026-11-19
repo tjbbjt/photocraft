@@ -33,7 +33,7 @@ pub const CONTENTS: [(&str, &str); 9] = [
 ];
 
 /// Params the dialog edits and remembers.
-const KEYS: [&str; 13] = [
+const KEYS: [&str; 14] = [
     "contents",
     "color",
     "pattern",
@@ -45,6 +45,7 @@ const KEYS: [&str; 13] = [
     "method",
     "detail",
     "stamp",
+    "matchDepth",
     "edgeGrow",
     "edgeFeather",
 ];
@@ -75,7 +76,7 @@ fn valid(app: &PhotocraftApp, key: &str, v: &Value) -> bool {
         "mode" | "opacity" | "preserveTransparency" => crate::dialog_blend_ui::valid(key, v),
         "color" => v.as_str().is_some_and(|h| h.len() == 7 && h.starts_with('#') && h.get(1..).is_some_and(|d| d.chars().all(|c| c.is_ascii_hexdigit()))),
         "pattern" => v.as_str().is_some_and(|p| app.session.patterns.items.iter().any(|q| q.id == p)),
-        "colorAdaptation" | "detail" | "stamp" => v.is_boolean(),
+        "colorAdaptation" | "detail" | "stamp" | "matchDepth" => v.is_boolean(),
         "fillMode" => matches!(v.as_str(), Some("parity" | "photocraft")),
         "method" => v.as_str().is_some_and(|m| METHODS.iter().any(|(k, _)| *k == m)),
         "edgeGrow" | "edgeFeather" => v.as_f64().is_some_and(|n| (0.0..=EDGE_MAX).contains(&n)),
@@ -99,6 +100,7 @@ pub fn default_fields(app: &PhotocraftApp) -> Map<String, Value> {
     f.insert("method".into(), json!("classic"));
     f.insert("detail".into(), json!(true));
     f.insert("stamp".into(), json!(true));
+    f.insert("matchDepth".into(), json!(true));
     f.insert("edgeGrow".into(), json!(EDGE_GROW));
     f.insert("edgeFeather".into(), json!(EDGE_FEATHER));
     f.insert("mode".into(), json!("normal"));
@@ -194,6 +196,7 @@ pub fn photocraft_params(f: &Map<String, Value>) -> Option<Value> {
         "method": get("method").unwrap_or("classic"),
         "detail": f.get("detail").and_then(Value::as_bool).unwrap_or(true),
         "stamp": f.get("stamp").and_then(Value::as_bool).unwrap_or(true),
+        "matchDepth": f.get("matchDepth").and_then(Value::as_bool).unwrap_or(true),
         "edgeGrow": px("edgeGrow", EDGE_GROW),
         "edgeFeather": px("edgeFeather", EDGE_FEATHER),
         "output": "current",
@@ -360,7 +363,11 @@ fn content_aware_body(ui: &mut egui::Ui, f: &mut Map<String, Value>, label: &dyn
     // Stamping always rebuilds the detail: Classic fills around the model's layout.
     let model = method != "classic";
     let stamp = f.get("stamp").and_then(Value::as_bool).unwrap_or(true);
-    for (key, name, enabled) in [("stamp", tl!("Stamp with Classic"), model), ("detail", tl!("Rebuild Detail from the Photo"), model && !stamp)] {
+    for (key, name, enabled) in [
+        ("stamp", tl!("Stamp with Classic"), model),
+        ("matchDepth", tl!("Match Depth"), model && stamp),
+        ("detail", tl!("Rebuild Detail from the Photo"), model && !stamp),
+    ] {
         ui.horizontal(|ui| {
             label(ui, "");
             let mut on = f.get(key).and_then(Value::as_bool).unwrap_or(true);

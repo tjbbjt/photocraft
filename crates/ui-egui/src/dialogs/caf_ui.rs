@@ -125,6 +125,9 @@ pub struct CafOpts {
     /// With a model: Classic fills, copying from near the hole, around the model's layout (the
     /// engine's `stamp`). Detail is then always rebuilt.
     pub stamp: bool,
+    /// Stamping: copy from about the same rows, as ground the same distance away (the engine's
+    /// `matchDepth`).
+    pub match_depth: bool,
     /// The PhotoCraft features switch: on, the method, the edge band, timers and the resizable
     /// preview; off (parity), Photoshop's panel and fill (Classic, no band), whatever the method
     /// and band are set to.
@@ -160,6 +163,7 @@ impl Default for CafOpts {
             method: "classic".into(),
             detail: true,
             stamp: true,
+            match_depth: true,
             photocraft: true,
             edge_grow: EDGE_GROW,
             edge_feather: EDGE_FEATHER,
@@ -181,6 +185,7 @@ impl CafOpts {
             ("mirror", &mut self.mirror),
             ("detail", &mut self.detail),
             ("stamp", &mut self.stamp),
+            ("matchDepth", &mut self.match_depth),
         ] {
             if let Some(b) = flag(k) {
                 *slot = b;
@@ -248,6 +253,7 @@ impl CafOpts {
             "method": self.method,
             "detail": self.detail,
             "stamp": self.stamp,
+            "matchDepth": self.match_depth,
             "fillMode": if self.photocraft { "photocraft" } else { "parity" },
             "edgeGrow": self.edge_grow,
             "edgeFeather": self.edge_feather,

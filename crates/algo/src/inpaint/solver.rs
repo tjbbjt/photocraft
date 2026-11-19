@@ -29,6 +29,12 @@ pub(super) struct Solver<'a> {
     /// A nearby fill's reach at this level ([`CompleteParams::nearby`]): sources at most this
     /// many pixels from their target across and down; 0 anywhere.
     pub(super) reach: i32,
+    /// A nearby fill at the same depth ([`CompleteParams::same_depth`]): how far up or down
+    /// each target may copy from.
+    pub(super) depth: Option<Depth>,
+    /// A nearby fill's count of how often each part of the picture is copied: a part copied
+    /// more than once costs more for the next target ([`Uses`]).
+    pub(super) uses: Option<Uses>,
     pub(super) px: &'a [Px],
     /// Valid source centres: the whole patch is inside the grid and may be copied from.
     pub(super) valid: Vec<bool>,
@@ -130,24 +136,54 @@ impl Solver<'_> {
         self.mimg = Some(m);
     }
 
-    /// Whether target `t` may copy source `s`: within reach of it, for a nearby fill.
+    /// Whether target `t` may copy source `s`: within reach of it, for a nearby fill, and at
+    /// about its depth, for one at the same depth.
     #[inline]
     pub(super) fn allowed(&self, t: (i32, i32), s: (i32, i32)) -> bool {
-        self.reach <= 0 || ((s.0 - t.0).abs() <= self.reach && (s.1 - t.1).abs() <= self.reach)
+        self.reach <= 0 || ((s.0 - t.0).abs() <= self.reach && (s.1 - t.1).abs() <= self.rows_of(t))
     }
 
-    /// A source within a nearby fill's reach of `t`: one of 16 random tries, else the nearest.
+    /// What copying `s` costs on top of the patch distance: [`Uses::factor`], 1 without.
+    #[inline]
+    fn uses_factor(&self, s: (i32, i32)) -> f32 {
+        self.uses.as_ref().map_or(1.0, |u| u.factor(s))
+    }
+
+    /// The patch distance of copying `s` to target `t`, times what copying `s` costs
+    /// ([`Self::uses_factor`]); past `limit` it may stop early, returning more than `limit`.
+    #[inline]
+    fn cost_of(&self, t: (i32, i32), k: usize, s: (i32, i32), limit: f32) -> f32 {
+        let f = self.uses_factor(s);
+        if f == 1.0 { self.dist(t, k, s, limit) } else { self.dist(t, k, s, limit / f) * f }
+    }
+
+    /// Counts how often each part of the picture is copied by `nnf` (with [`Self::uses`]).
+    pub(super) fn count_uses(&mut self, nnf: &[(i32, i32)]) {
+        if let Some(u) = &mut self.uses {
+            u.count(nnf.get(..self.cells.len()).unwrap_or(nnf));
+        }
+    }
+
+    /// How many rows up or down target `t` may copy from (a nearby fill's).
+    #[inline]
+    fn rows_of(&self, t: (i32, i32)) -> i32 {
+        self.depth.as_ref().map_or(self.reach, |d| d.rows(t).min(self.reach))
+    }
+
+    /// A source `t` may copy ([`Self::allowed`]): one of 16 random tries, else the nearest; else
+    /// the nearest valid one, when the rule leaves none.
     fn within_reach(&self, t: (i32, i32), rng: &mut Rng) -> Option<(i32, i32)> {
-        let r = self.reach;
+        let (r, rows) = (self.reach, self.rows_of(t));
         for _ in 0..16 {
-            let cand = (t.0 + rng.range(-r, r), t.1 + rng.range(-r, r));
-            if self.is_valid(cand.0, cand.1) {
+            let cand = (t.0 + rng.range(-r, r), t.1 + rng.range(-rows, rows));
+            if self.is_valid(cand.0, cand.1) && self.allowed(t, cand) {
                 return Some(cand);
             }
         }
-        (1..=r).find_map(|d| {
-            (-d..=d).flat_map(|i| [(t.0 + i, t.1 - d), (t.0 + i, t.1 + d), (t.0 - d, t.1 + i), (t.0 + d, t.1 + i)]).find(|c| self.is_valid(c.0, c.1))
-        })
+        let nearest = |ok: &dyn Fn((i32, i32)) -> bool| {
+            (1..=r).find_map(|d| (-d..=d).flat_map(|i| [(t.0 + i, t.1 - d), (t.0 + i, t.1 + d), (t.0 - d, t.1 + i), (t.0 + d, t.1 + i)]).find(|c| ok(*c)))
+        };
+        nearest(&|c| self.is_valid(c.0, c.1) && self.allowed(t, c)).or_else(|| nearest(&|c| self.is_valid(c.0, c.1)))
     }
 
     #[inline]
@@ -405,7 +441,7 @@ impl Solver<'_> {
         if !self.allowed(t, best)
             && let Some(cand) = self.within_reach(t, rng)
         {
-            (best, bc) = (cand, self.dist(t, k, cand, f32::INFINITY));
+            (best, bc) = (cand, self.cost_of(t, k, cand, f32::INFINITY));
         }
         // A coherent match (a neighbour's, shifted) counts as `favour` times better than it is.
         let favour = 1.0 + self.coherence;
@@ -414,7 +450,7 @@ impl Solver<'_> {
             let cand = (c.0 + step, c.1);
             coherent |= cand == best;
             if self.is_valid(cand.0, cand.1) && cand != best && self.allowed(t, cand) {
-                let d = self.dist(t, k, cand, bc * favour);
+                let d = self.cost_of(t, k, cand, bc * favour);
                 if d < bc * favour {
                     (best, bc, coherent) = (cand, d, true);
                 }
@@ -425,7 +461,7 @@ impl Solver<'_> {
             coherent |= cand == best;
             if self.is_valid(cand.0, cand.1) && cand != best && self.allowed(t, cand) {
                 let lim = if coherent { bc } else { bc * favour };
-                let d = self.dist(t, k, cand, lim);
+                let d = self.cost_of(t, k, cand, lim);
                 if d < lim {
                     (best, bc, coherent) = (cand, d, true);
                 }
@@ -436,7 +472,7 @@ impl Solver<'_> {
             let cand = (best.0 + rng.range(-rad, rad), best.1 + rng.range(-rad, rad));
             if self.is_valid(cand.0, cand.1) && cand != best && self.allowed(t, cand) {
                 let lim = if coherent { bc / favour } else { bc };
-                let d = self.dist(t, k, cand, lim);
+                let d = self.cost_of(t, k, cand, lim);
                 if d < lim {
                     (best, bc, coherent) = (cand, d, false);
                 }
@@ -659,7 +695,7 @@ impl Solver<'_> {
             }
             let base = runs[0].k;
             for ((i, x), c) in row_cells(runs).enumerate().zip(co.iter_mut()) {
-                *c = this.dist((x as i32, y as i32), base + i, nnf[base + i], f32::INFINITY);
+                *c = this.cost_of((x as i32, y as i32), base + i, nnf[base + i], f32::INFINITY);
             }
         });
         self.ctl.check()
@@ -1008,4 +1044,119 @@ pub(super) fn least_sum(v: f32, n: f32, strict: bool) -> f32 {
         e = e.next_up();
     }
     e
+}
+
+/// Rows of the same depth, for a nearby fill that copies at the same depth
+/// ([`CompleteParams::same_depth`](super::CompleteParams::same_depth)): in a landscape the
+/// distance goes with the height in the picture, so a target copies from about its own rows,
+/// and a far, finer stretch of ground never lands in a near one. How many rows grows with the
+/// target's own row, as in perspective: near the top (far off) a row of the picture spans much
+/// more ground than near the bottom (close by). A target with no source within reach in its own
+/// rows (deep in a hole along the bottom) may go as far again up or down as the nearest rows
+/// that have one, twice over.
+pub(super) struct Depth {
+    /// Rows up or down any target may go.
+    least: i32,
+    /// And per row down from the top: a target in row `y` may go `y * per_row` rows.
+    per_row: f32,
+    /// Per block of [`DEPTH_BLOCK`] px: rows to the nearest rows with a source within reach.
+    to_sources: Vec<u16>,
+    /// Blocks across.
+    bw: usize,
+}
+
+/// The block [`Depth`] measures in, px.
+const DEPTH_BLOCK: usize = 8;
+
+impl Depth {
+    /// `valid`: the level's valid sources, `w` by `h`; `reach`: the fill's reach there; `least`
+    /// and `per_row`: the rows up or down a target may go ([`Depth`]).
+    pub(super) fn new(valid: &[bool], w: usize, h: usize, reach: usize, least: i32, per_row: f32) -> Self {
+        let (bw, bh) = (w.div_ceil(DEPTH_BLOCK), h.div_ceil(DEPTH_BLOCK));
+        // Which blocks have a source within reach across in their rows.
+        let mut near = vec![false; bw * bh];
+        let mut count = vec![0u32; w + 1];
+        for (y, row) in valid.chunks_exact(w).enumerate().take(h) {
+            for (x, v) in row.iter().enumerate() {
+                count[x + 1] = count[x] + u32::from(*v);
+            }
+            for bx in 0..bw {
+                let (a, b) = ((bx * DEPTH_BLOCK).saturating_sub(reach), ((bx + 1) * DEPTH_BLOCK + reach).min(w));
+                near[(y / DEPTH_BLOCK) * bw + bx] |= count[b] > count[a];
+            }
+        }
+        // Blocks to the nearest such block up or down, in rows.
+        let mut to_sources = vec![u16::MAX; bw * bh];
+        for bx in 0..bw {
+            let mut d = u16::MAX;
+            for by in 0..bh {
+                d = if near[by * bw + bx] { 0 } else { d.saturating_add(1) };
+                to_sources[by * bw + bx] = d;
+            }
+            d = u16::MAX;
+            for by in (0..bh).rev() {
+                d = if near[by * bw + bx] { 0 } else { d.saturating_add(1) };
+                let k = &mut to_sources[by * bw + bx];
+                *k = (*k).min(d);
+            }
+        }
+        for k in &mut to_sources {
+            *k = k.saturating_mul(DEPTH_BLOCK as u16);
+        }
+        Self { least, per_row, to_sources, bw }
+    }
+
+    /// Rows up or down target `t` may copy from.
+    #[inline]
+    pub(super) fn rows(&self, t: (i32, i32)) -> i32 {
+        let k = (t.1.max(0) as usize / DEPTH_BLOCK) * self.bw + t.0.max(0) as usize / DEPTH_BLOCK;
+        ((t.1 as f32 * self.per_row) as i32).max(self.least) + 2 * i32::from(self.to_sources.get(k).copied().unwrap_or(0))
+    }
+}
+
+/// How often each part of the picture is copied, for a nearby fill: Classic takes whatever
+/// matches best, and in a hole along a border the same few pieces nearby match best again and
+/// again, in rows and streaks. Counted per block of a patch's size, from the matches of the pass
+/// before: a block copied about once (a stretch copied whole, one pixel each) costs nothing more;
+/// past that, each further copy of it costs [`Uses::weight`] times the patch distance more, so
+/// the search takes another part of the picture that matches nearly as well.
+pub(super) struct Uses {
+    /// The block side, px.
+    side: usize,
+    /// Blocks across.
+    bw: usize,
+    /// Targets copying from each block.
+    counts: Vec<u32>,
+    /// The extra cost of each copy past the first, as a share of the patch distance.
+    weight: f32,
+}
+
+impl Uses {
+    pub(super) fn new(w: usize, h: usize, side: usize, weight: f32) -> Self {
+        let side = side.max(1);
+        let bw = w.div_ceil(side);
+        Self { side, bw, counts: vec![0; bw * h.div_ceil(side)], weight }
+    }
+
+    pub(super) fn count(&mut self, nnf: &[(i32, i32)]) {
+        self.counts.fill(0);
+        for s in nnf {
+            if let Some(c) = self.block(*s).and_then(|k| self.counts.get_mut(k)) {
+                *c += 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn block(&self, s: (i32, i32)) -> Option<usize> {
+        (s.0 >= 0 && s.1 >= 0).then(|| (s.1 as usize / self.side) * self.bw + s.0 as usize / self.side)
+    }
+
+    /// What copying `s` costs, times the patch distance: 1 for a block copied once or less.
+    #[inline]
+    pub(super) fn factor(&self, s: (i32, i32)) -> f32 {
+        let n = self.block(s).and_then(|k| self.counts.get(k)).copied().unwrap_or(0) as f32;
+        let once = (self.side * self.side) as f32;
+        1.0 + self.weight * (n / once - 1.0).max(0.0)
+    }
 }

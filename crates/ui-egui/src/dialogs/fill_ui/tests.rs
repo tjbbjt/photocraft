@@ -78,6 +78,7 @@ fn photocraft_content_aware_runs_the_content_aware_fill_command() {
     assert_eq!(p["colorAdaptation"], "none");
     assert_eq!(p["method"], "lama");
     assert_eq!(p["stamp"], true, "a model stamps with Classic unless told not to");
+    assert_eq!(p["matchDepth"], true, "at the same depth unless told not to");
     f.insert("stamp".into(), json!(false));
     assert_eq!(photocraft_params(&f).unwrap()["stamp"], false);
     assert_eq!(p["edgeGrow"], json!(EDGE_GROW));

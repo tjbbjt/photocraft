@@ -320,9 +320,11 @@ fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Resul
         m @ ("lama" | "migan" | "mix") => {
             // Stamp: Classic fills, copying only from near each hole pixel, started from the
             // model's layout; the model's fill decides where things go, the photo's pieces fill.
+            // Match depth: from about the same rows, as ground the same distance away.
             let stamp = bool_or(p, "stamp", false);
             opts.nearby = stamp;
             opts.layout_only = stamp;
+            opts.same_depth = stamp && bool_or(p, "matchDepth", false);
             Some(FillModel { method: m.to_string(), detail: stamp || bool_or(p, "detail", true) })
         }
         other => return Err(bad(cmd, format!("unknown method `{other}` (classic|lama|migan|mix)"))),

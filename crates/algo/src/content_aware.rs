@@ -54,11 +54,22 @@ pub struct FillOptions {
     pub nearby: bool,
     /// A guided fill's guide only lays the hole out ([`crate::inpaint::CompleteParams::layout_only`]).
     pub layout_only: bool,
+    /// A nearby fill copies at the same depth ([`crate::inpaint::CompleteParams::same_depth`]).
+    pub same_depth: bool,
 }
 
 impl Default for FillOptions {
     fn default() -> Self {
-        Self { color_adaptation: color_level("default"), rotations: Vec::new(), scale: false, mirror: false, seed: 1, nearby: false, layout_only: false }
+        Self {
+            color_adaptation: color_level("default"),
+            rotations: Vec::new(),
+            scale: false,
+            mirror: false,
+            seed: 1,
+            nearby: false,
+            layout_only: false,
+            same_depth: false,
+        }
     }
 }
 
@@ -265,7 +276,14 @@ fn fill_cow(
     if !hole.iter().any(|h| *h) {
         return Ok(img.into_owned());
     }
-    let params = CompleteParams { seed: opts.seed, adapt: opts.color_adaptation, nearby: opts.nearby, layout_only: opts.layout_only, ..Default::default() };
+    let params = CompleteParams {
+        seed: opts.seed,
+        adapt: opts.color_adaptation,
+        nearby: opts.nearby,
+        layout_only: opts.layout_only,
+        same_depth: opts.same_depth,
+        ..Default::default()
+    };
     let gap = 2 * params.patch_radius + 2;
     let ok: Vec<bool> = par::map(w * h, true, |i| !hole[i] && source[i]);
     let src = Src { w, h, ch, img: &img, ok: &ok };
@@ -394,7 +412,14 @@ pub fn fill_guided_owned(
     if !hole.iter().any(|h| *h) {
         return Ok(img);
     }
-    let params = CompleteParams { seed: opts.seed, adapt: opts.color_adaptation, nearby: opts.nearby, layout_only: opts.layout_only, ..Default::default() };
+    let params = CompleteParams {
+        seed: opts.seed,
+        adapt: opts.color_adaptation,
+        nearby: opts.nearby,
+        layout_only: opts.layout_only,
+        same_depth: opts.same_depth,
+        ..Default::default()
+    };
     let roles: Vec<Px> = par::map(w * h, true, |i| {
         if hole[i] {
             Px::Hole

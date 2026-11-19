@@ -63,10 +63,10 @@ use common::Bounds;
 pub(crate) use common::Rng;
 pub use common::{Adapt, Px};
 use common::{Level, SOURCE_MOMENTS_MAX};
-use solver::Solver;
 pub(crate) use solver::fit;
 #[cfg(test)]
 use solver::least_sum;
+use solver::{Depth, Solver, Uses};
 use sources::{Coarser, Sources, THIN_RATIO, downsample, hole_bounds, hole_thickness, peel_affordable, valid_sources, window_count};
 #[cfg(test)]
 use sources::{hole_bbox, integral};
@@ -77,6 +77,16 @@ pub use synthesis::{best_offset, synthesize};
 const GUIDED_COHERENCE: f32 = 6.0;
 /// The least distance a nearby fill copies from ([`CompleteParams::nearby`]), full-size px.
 const NEARBY_MIN: usize = 64;
+/// The rows up or down a fill at the same depth copies from ([`CompleteParams::same_depth`]),
+/// as a share of the target's row: rows near the top are far off, and each spans more ground.
+const SAME_DEPTH_PER_ROW: f32 = 0.2;
+/// What each further copy of a part of the picture costs in a nearby fill, as a share of the
+/// patch distance ([`solver::Uses`]).
+const NEARBY_REUSE: f32 = 2.0;
+/// The finest level a nearby fill counts copies on (0: full size). The coarse levels lay the
+/// fill out, and there a repeat gives way to another part of the picture; on the finer ones it
+/// would only trade a sharp copy for a blend of near misses.
+const NEARBY_REUSE_FROM: usize = 2;
 
 /// Parameters for [`complete`].
 #[derive(Clone, Debug, PartialEq)]
@@ -104,11 +114,27 @@ pub struct CompleteParams {
     /// match, so the pieces are chosen and blended as Classic chooses them, only around a start
     /// that already has the rocks low and the grass high.
     pub layout_only: bool,
+    /// A nearby fill copies at the same depth: from about the same rows as each hole pixel (up
+    /// or down a fifth of its distance from the top of the picture), so ground far off, finer and
+    /// smoother, is not copied into ground close by, where it reads as a road. Only with
+    /// [`Self::nearby`].
+    pub same_depth: bool,
 }
 
 impl Default for CompleteParams {
     fn default() -> Self {
-        Self { patch_radius: 3, em_iters: 10, min_em_iters: 3, pm_iters: 2, refine_extent: 192, adapt: Adapt::NONE, seed: 1, nearby: false, layout_only: false }
+        Self {
+            patch_radius: 3,
+            em_iters: 10,
+            min_em_iters: 3,
+            pm_iters: 2,
+            refine_extent: 192,
+            adapt: Adapt::NONE,
+            seed: 1,
+            nearby: false,
+            layout_only: false,
+            same_depth: false,
+        }
     }
 }
 
@@ -359,6 +385,9 @@ fn complete_cow<'a>(
         let n_targets = cells.len();
         // Source moments are worth keeping when there are few sources for the matches tried.
         let keep_source_moments = lw * lh <= SOURCE_MOMENTS_MAX && sources.len() <= n_targets.saturating_mul(if refine_only { 4 } else { 64 });
+        let reach = if p.nearby { (thickness.max(NEARBY_MIN) >> li).max(2 * psz) } else { 0 };
+        let depth = (p.nearby && p.same_depth).then(|| Depth::new(&valid, lw, lh, reach, psz as i32, SAME_DEPTH_PER_ROW));
+        ctl.check()?;
         let mut solver = Solver {
             w: lw,
             h: lh,
@@ -369,7 +398,9 @@ fn complete_cow<'a>(
             mimg: None,
             coherence: if steer { GUIDED_COHERENCE } else { 0.0 },
             stamp: steer,
-            reach: if p.nearby { (thickness.max(NEARBY_MIN) >> li).max(2 * psz) as i32 } else { 0 },
+            reach: reach as i32,
+            depth,
+            uses: (p.nearby && li >= NEARBY_REUSE_FROM).then(|| Uses::new(lw, lh, psz, NEARBY_REUSE)),
             px: &lpx,
             valid,
             cells,
@@ -391,6 +422,7 @@ fn complete_cow<'a>(
         let mut cost = vec![f32::INFINITY; n_targets];
         // A finer level starts from the coarse matches voted with its own (sharp) pixels.
         if upsampled {
+            solver.count_uses(&nnf);
             solver.costs(&nnf, &mut cost)?;
             solver.vote(&nnf, &cost);
         }
@@ -404,6 +436,7 @@ fn complete_cow<'a>(
         let pm_iters = if refine_only { 1 } else { p.pm_iters };
         let full_search = (lw.max(lh)) as i32;
         for it in 0..em {
+            solver.count_uses(&nnf);
             solver.costs(&nnf, &mut cost)?;
             // Wide random search on the coarsest level and on each level's first iteration,
             // local refinement afterwards.
@@ -418,6 +451,9 @@ fn complete_cow<'a>(
             let radius = if solver.reach > 0 { radius.min(solver.reach) } else { radius };
             for pass in 0..pm_iters {
                 ctl.check()?;
+                if pass > 0 {
+                    solver.count_uses(&nnf);
+                }
                 solver.patchmatch(&mut nnf, &mut cost, pass + it * pm_iters, p.seed.wrapping_add((li * 1000 + it) as u64), radius);
             }
             ctl.check()?;

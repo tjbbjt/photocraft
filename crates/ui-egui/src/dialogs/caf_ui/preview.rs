@@ -109,6 +109,7 @@ pub(super) fn plan_params(w: &CafWorkspace, strokes: bool) -> Value {
         "method": o.fill_method(),
         "detail": o.detail,
         "stamp": o.stamp,
+        "matchDepth": o.match_depth,
         "edgeGrow": o.edge().0,
         "edgeFeather": o.edge().1,
         "layer": w.layer.0,
@@ -371,10 +372,15 @@ pub(super) fn compute_preview(
     let n = plan.fmt.channels();
     // A fill model works on the whole window first (at its working size), so a preview of any
     // size and the fill after it get the same model fill.
+    let started = std::time::Instant::now();
     let guide = photocraft_engine::edit_menu_cmds::model_guide(&plan, ctl).map_err(|e| match e {
         photocraft_engine::EngineError::Cancelled => "cancelled".to_string(),
         e => e.to_string(),
     })?;
+    // How long the model took, apart from the fill after it (near 0 when it kept its last fill).
+    if let Some(m) = &plan.model {
+        log::info!("content-aware preview ({}): model fill in {:.1} s", m.method, started.elapsed().as_secs_f32());
+    }
     let f = crate::filter_preview_ui::texture_factor(w as u32, h as u32, max_side) as usize;
     if f > 1 {
         return reduced_preview(plan, f, guide, ctl);

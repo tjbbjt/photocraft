@@ -60,7 +60,7 @@ fn photocraft_behavior_sends_the_method_and_the_edge_band() {
     // A model stamps with Classic unless told not to.
     control(&mut app, &json!({"method": "migan"})).unwrap();
     let p = plan_params(ws(&app), true);
-    assert_eq!((p["method"].clone(), p["stamp"].clone()), (json!("migan"), json!(true)));
+    assert_eq!((p["method"].clone(), p["stamp"].clone(), p["matchDepth"].clone()), (json!("migan"), json!(true), json!(true)));
     control(&mut app, &json!({"stamp": false})).unwrap();
     assert_eq!(plan_params(ws(&app), true)["stamp"], false);
 }

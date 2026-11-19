@@ -150,6 +150,7 @@ fn adaptations_run_and_stay_deterministic() {
         seed: 7,
         nearby: false,
         layout_only: false,
+        same_depth: false,
     };
     let a = fill(w, h, 3, &rgb, &hole, &src, &opts);
     let b = fill(w, h, 3, &rgb, &hole, &src, &opts);

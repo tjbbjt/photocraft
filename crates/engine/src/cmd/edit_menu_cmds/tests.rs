@@ -1048,7 +1048,8 @@ fn content_aware_fill_refuses_an_unknown_method() {
 }
 
 /// `stamp` with a model: Classic fills, copying from near the hole, around the model's layout:
-/// the model fills, its fill only lays the hole out, and the detail is always rebuilt.
+/// the model fills, its fill only lays the hole out, and the detail is always rebuilt;
+/// `matchDepth` with it copies from about the same rows.
 #[test]
 fn a_stamped_model_fill_is_classic_nearby_around_the_models_layout() {
     let mut s = blob_session(8);
@@ -1059,7 +1060,9 @@ fn a_stamped_model_fill_is_classic_nearby_around_the_models_layout() {
     for m in ["lama", "migan", "mix"] {
         let stamped = plan(json!({"method": m, "stamp": true, "detail": false}));
         assert_eq!(stamped.model, Some(FillModel { method: m.into(), detail: true }));
-        assert!(stamped.opts.nearby && stamped.opts.layout_only, "{m}");
+        assert!(stamped.opts.nearby && stamped.opts.layout_only && !stamped.opts.same_depth, "{m}");
+        assert!(plan(json!({"method": m, "stamp": true, "matchDepth": true})).opts.same_depth, "{m}");
+        assert!(!plan(json!({"method": m, "matchDepth": true})).opts.same_depth, "{m}: only when stamping");
         let own = plan(json!({"method": m, "detail": false}));
         assert_eq!(own.model, Some(FillModel { method: m.into(), detail: false }));
         assert!(!own.opts.nearby && !own.opts.layout_only, "{m}");

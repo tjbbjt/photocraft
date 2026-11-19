@@ -413,6 +413,8 @@ fn full_patches_measure_as_clipped_ones() {
                 coherence: 0.0,
                 stamp: false,
                 reach: 0,
+                depth: None,
+                uses: None,
                 px: &px,
                 valid: valid.clone(),
                 cells,
@@ -666,6 +668,8 @@ fn a_nearby_fill_takes_matches_only_within_reach() {
         coherence: 0.0,
         stamp: false,
         reach,
+        depth: None,
+        uses: None,
         px: &px,
         valid: valid.clone(),
         cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
@@ -684,6 +688,93 @@ fn a_nearby_fill_takes_matches_only_within_reach() {
         let (m, c) = s.pm_step(t, k, (far, 0.0), Some(far), Some(far), 1, &mut rng, w as i32);
         assert!(s.allowed(t, m), "{t:?} took {m:?}");
         assert!(c.is_finite());
+    }
+}
+
+/// Same depth: a target copies from about its own rows, more the lower it is; one with no
+/// source within reach in its rows, as far again as the nearest rows that have one, twice over.
+#[test]
+fn a_same_depth_fill_copies_from_about_its_own_rows() {
+    let (w, h, reach) = (64, 64, 8);
+    // Sources only in the top 16 rows.
+    let valid: Vec<bool> = (0..w * h).map(|i| i / w < 16).collect();
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0);
+    assert_eq!(d.rows((30, 8)), 2, "a row with sources");
+    // Rows further down may go further: a fifth of their row.
+    let d5 = solver::Depth::new(&valid, w, h, reach, 2, 0.2);
+    assert_eq!((d5.rows((30, 4)), d5.rows((30, 15))), (2, 3));
+    assert_eq!(d5.rows((30, 40)), 8 + 2 * 32);
+    // Row 40 is in block row 5 (of 8 rows each); the nearest with sources is block row 1.
+    assert_eq!(d.rows((30, 40)), 2 + 2 * 32);
+    // Sources across the picture's top, and down its left 40 columns: block column 7 (columns
+    // 56..64) has none within 8 columns but in the top block row, 5 block rows up.
+    let valid: Vec<bool> = (0..w * h).map(|i| i % w < 40 || i / w < 8).collect();
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0);
+    assert_eq!(d.rows((44, 40)), 2, "valid columns within reach");
+    assert_eq!(d.rows((60, 40)), 2 + 2 * 40);
+}
+
+/// Uses: a block copied once (a stretch copied whole) costs nothing more; each further copy of
+/// it costs the weight times the patch distance more.
+#[test]
+fn a_part_copied_more_than_once_costs_more() {
+    let mut u = solver::Uses::new(20, 20, 2, 0.5);
+    // Block (0, 0) copied whole once: 4 targets, one per pixel.
+    let mut nnf = vec![(0, 0), (1, 0), (0, 1), (1, 1)];
+    u.count(&nnf);
+    assert_eq!(u.factor((0, 0)), 1.0);
+    // ... and three more times over: 16 targets in all.
+    nnf.extend(std::iter::repeat_n([(0, 0), (1, 0), (0, 1), (1, 1)], 3).flatten());
+    u.count(&nnf);
+    assert_eq!(u.factor((1, 1)), 1.0 + 0.5 * 3.0);
+    assert_eq!(u.factor((5, 5)), 1.0, "a block nobody copies");
+    assert_eq!(u.factor((-3, 2)), 1.0, "off the picture");
+}
+
+/// Same depth, in a search: every match a step gives is within the rows its target may copy
+/// from, also from a start out of them.
+#[test]
+fn a_same_depth_fill_takes_matches_only_from_its_rows() {
+    let (w, h, ch, r) = (120, 80, 3, 3);
+    let mut img = busy(w, h, ch, 5);
+    // A strip down the right edge, as along a panorama's border.
+    let px: Vec<Px> = (0..w * h).map(|i| if i % w >= 96 && i / w >= 10 { Px::Hole } else { Px::Source }).collect();
+    let none = photocraft_raster::Interrupt::NONE;
+    let hb = hole_bounds(w, h, &px).unwrap();
+    let valid = valid_sources(w, h, r, &px, &none).unwrap();
+    let reach = 40;
+    let depth = Some(solver::Depth::new(&valid, w, h, reach, 8, 0.0));
+    let mut s = Solver {
+        w,
+        h,
+        ch,
+        r: r as i32,
+        img: &mut img,
+        guide: None,
+        mimg: None,
+        coherence: 0.0,
+        stamp: false,
+        reach: reach as i32,
+        depth,
+        uses: None,
+        px: &px,
+        valid: valid.clone(),
+        cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
+        full: Vec::new(),
+        tmom: Vec::new(),
+        smom: Vec::new(),
+        adapt: Adapt::NONE,
+        ctl: none,
+    };
+    s.prepare(false);
+    assert!(s.allowed((100, 40), (70, 46)) && !s.allowed((100, 40), (70, 60)), "8 rows up or down beside the strip");
+    let far = (3, 3);
+    let mut rng = Rng::new(4);
+    let cells: Vec<(usize, usize, usize)> = s.cells.iter().collect();
+    for (k, x, y) in cells {
+        let t = (x as i32, y as i32);
+        let (m, _) = s.pm_step(t, k, (far, 0.0), Some(far), Some(far), 1, &mut rng, w as i32);
+        assert!(s.allowed(t, m), "{t:?} took {m:?}");
     }
 }
 
