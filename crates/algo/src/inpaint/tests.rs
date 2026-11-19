@@ -416,7 +416,6 @@ fn full_patches_measure_as_clipped_ones() {
                 reach: 0,
                 depth: None,
                 uses: None,
-                sky: None,
                 px: &px,
                 valid: valid.clone(),
                 cells,
@@ -671,9 +670,8 @@ fn a_nearby_fill_takes_matches_only_within_reach() {
         stamp: false,
         blend_edge: false,
         reach,
-        depth: Some(solver::Depth::new(&valid, w, h, reach as usize, reach, 0.0, 0.0)),
+        depth: Some(solver::Depth::new(&valid, w, h, reach as usize, reach, 0.0, &[])),
         uses: None,
-        sky: None,
         px: &px,
         valid: valid.clone(),
         cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
@@ -697,34 +695,74 @@ fn a_nearby_fill_takes_matches_only_within_reach() {
 
 /// Same depth: a target copies from about its own rows, more the farther it is from the
 /// horizon; one with no source within reach in its rows, as far again as the nearest rows that
-/// have one, twice over; and each block has a source to fall back on, within both.
+/// have one, twice over; and each block has a source to fall back on.
 #[test]
 fn a_same_depth_fill_copies_from_about_its_own_rows() {
     let (w, h, reach) = (64, 64, 8);
     // Sources only in the top 16 rows.
     let valid: Vec<bool> = (0..w * h).map(|i| i / w < 16).collect();
-    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0, 0.0);
-    assert_eq!(d.rows((30, 8)), 8, "a row with sources: at least a block");
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0, &[]);
+    assert_eq!(d.rows((30, 8)), 2, "a row with sources");
     // Row 40 is in block row 5 (of 8 rows each); the nearest with sources is block row 1.
-    assert_eq!(d.rows((30, 40)), 8 + 2 * 32);
+    assert_eq!(d.rows((30, 40)), 2 + 2 * 32);
     // From a horizon at row 40: half the distance to it.
-    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.5, 40.0);
-    assert_eq!((d.rows((30, 10)), d.rows((30, 40))), (15, 8 + 2 * 32));
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.5, &[40.0; 64]);
+    assert_eq!((d.rows((30, 10)), d.rows((30, 40))), (15, 2 + 2 * 32));
     // Sources across the picture's top, and down its left 40 columns: block column 7 (columns
     // 56..64) has none within 8 columns of all its pixels but in the top block row, 5 block rows
     // up; block column 5 (40..48) has column 39.
     let valid: Vec<bool> = (0..w * h).map(|i| i % w < 40 || i / w < 8).collect();
-    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0, 0.0);
-    assert_eq!(d.rows((44, 40)), 8, "valid columns within reach");
-    assert_eq!(d.rows((60, 40)), 8 + 2 * 40);
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0, &[]);
+    assert_eq!(d.rows((44, 40)), 2, "valid columns within reach");
+    assert_eq!(d.rows((60, 40)), 2 + 2 * 40);
     for t in [(44, 40), (60, 40), (63, 63)] {
         let s = d.fallback(t).unwrap();
-        assert!(valid[s.1 as usize * w + s.0 as usize] && (s.0 - t.0).abs() <= reach as i32 && (s.1 - t.1).abs() <= d.rows(t), "{t:?}: {s:?}");
+        assert!(valid[s.1 as usize * w + s.0 as usize] && (s.0 - t.0).abs() <= reach as i32 && (s.1 - t.1).abs() <= d.rows(t) + 8, "{t:?}: {s:?}");
     }
 }
 
+/// Along a tilted horizon, the same depth is the same distance from it, not the same row: a
+/// source 10 columns on, where the horizon is 5 rows lower, matches a target 5 rows higher.
+#[test]
+fn the_same_depth_follows_a_tilted_horizon() {
+    let (w, h, ch, r) = (80, 60, 3, 3);
+    let mut img = busy(w, h, ch, 2);
+    let px: Vec<Px> = (0..w * h).map(|i| if i % w >= 64 { Px::Hole } else { Px::Source }).collect();
+    let none = photocraft_raster::Interrupt::NONE;
+    let hb = hole_bounds(w, h, &px).unwrap();
+    let valid = valid_sources(w, h, r, &px, &none).unwrap();
+    // The horizon sinks half a row per column.
+    let horizon: Vec<f32> = (0..w).map(|x| 20.0 + x as f32 / 2.0).collect();
+    let mut s = Solver {
+        w,
+        h,
+        ch,
+        r: r as i32,
+        img: &mut img,
+        guide: None,
+        mimg: None,
+        coherence: 0.0,
+        stamp: false,
+        blend_edge: false,
+        reach: 40,
+        depth: Some(solver::Depth::new(&valid, w, h, 40, 1, 0.0, &horizon)),
+        uses: None,
+        px: &px,
+        valid: valid.clone(),
+        cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
+        full: Vec::new(),
+        tmom: Vec::new(),
+        smom: Vec::new(),
+        adapt: Adapt::NONE,
+        ctl: none,
+    };
+    s.prepare(false);
+    assert!(s.allowed((70, 30), (60, 25)), "10 columns back, the horizon is 5 rows higher");
+    assert!(!s.allowed((70, 30), (60, 30)), "the same row is 5 rows deeper there");
+}
+
 /// The horizon: the row that best splits the picture into sky (bluer than red) above and
-/// ground below; none without a clear split, or without colour.
+/// ground below, per column along a tilted one; none without a clear split, or without colour.
 #[test]
 fn the_horizon_is_where_the_sky_meets_the_ground() {
     let (w, h) = (40, 30);
@@ -737,6 +775,56 @@ fn the_horizon_is_where_the_sky_meets_the_ground() {
     let stripes: Vec<f32> = (0..w * h).flat_map(|i| if i % 2 == 0 { [0.2, 0.3, 0.6] } else { [0.4, 0.3, 0.2] }).collect();
     assert_eq!(solver::horizon(&stripes, &px, w, h, 3), None, "no clear split");
     assert_eq!(solver::horizon(&vec![0.5; w * h], &px, w, h, 1), None, "no colour");
+    // Tilted: from row 40 on the left to row 60 on the right, 320 columns across; the hole over
+    // the right 60 columns takes the row of the last strip with pixels.
+    let (w, h) = (320, 100);
+    let at = |x: usize| 40.0 + 20.0 * x as f32 / w as f32;
+    let tilted: Vec<f32> = (0..w * h).flat_map(|i| if ((i / w) as f32) < at(i % w) { [0.2, 0.3, 0.6] } else { [0.4, 0.3, 0.2] }).collect();
+    let holed: Vec<Px> = (0..w * h).map(|i| if i % w >= 260 { Px::Hole } else { Px::Source }).collect();
+    let line = solver::horizon_line(&tilted, &holed, w, h, 3).unwrap();
+    assert!((line[100] - at(100)).abs() <= 1.5, "{} at column 100, not {}", line[100], at(100));
+    assert!((line[310] - line[250]).abs() <= 1.5 && line[310] > 52.0, "held on past the last: {} / {}", line[310], line[250]);
+}
+
+/// Seamless levels: a fill lighter than the picture beside it is brought down to it, all the
+/// way across a strip along the picture's edge; a step too large to be a level (a cloud by sky)
+/// is left as it is.
+#[test]
+fn a_fill_takes_the_levels_of_the_picture_beside_it() {
+    let (w, h, ch) = (160, 64, 3);
+    let hole: Vec<bool> = (0..w * h).map(|i| i % w >= 96).collect();
+    let mut img: Vec<f32> = (0..w * h).flat_map(|i| if i % w >= 96 { [0.43; 3] } else { [0.4; 3] }).collect();
+    seamless_levels(&mut img, &hole, w, h, ch, 3);
+    for x in [100, 150] {
+        let v = img[(32 * w + x) * ch];
+        assert!((v - 0.4).abs() < 0.004, "column {x}: {v}");
+    }
+    assert_eq!(img[(32 * w + 20) * ch], 0.4, "the picture is kept");
+    let mut big: Vec<f32> = (0..w * h).flat_map(|i| if i % w >= 96 { [0.7; 3] } else { [0.4; 3] }).collect();
+    seamless_levels(&mut big, &hole, w, h, ch, 3);
+    assert_eq!(big[(32 * w + 120) * ch], 0.7);
+}
+
+/// The sky from the model: well above the horizon a hole pixel is the model's tone with the
+/// fill's fine texture on it; at the horizon it stays the fill's; outside the hole, the picture.
+#[test]
+fn the_sky_is_the_models_drawing_with_the_fills_texture() {
+    let (w, h, ch) = (64, 120, 3);
+    let hole = vec![true; w * h];
+    // The fill: a checker of 0.48 / 0.52 (mean 0.5); the model: a flat 0.7.
+    let mut img: Vec<f32> = (0..w * h).flat_map(|i| [if (i % w + i / w) % 2 == 0 { 0.48 } else { 0.52 }; 3]).collect();
+    let guide = vec![0.7; w * h * ch];
+    let fill = img.clone();
+    sky_from_guide(&mut img, &guide, &hole, w, h, ch, 3, 1, &[100.0; 64]);
+    let at = |x: usize, y: usize| img[(y * w + x) * ch];
+    // Row 10 (90 above the horizon): the model's 0.7, the checker on it (a box mean of 3 x 3 of
+    // a checker is 0.5 +- 0.02/9).
+    assert!((at(10, 10) - fill[(10 * w + 10) * ch] - 0.2).abs() < 0.005, "{}", at(10, 10));
+    // A strong edge in the fill (a copied cloud's) adds at most SKY_DETAIL_MAX.
+    let mut edge: Vec<f32> = (0..w * h).flat_map(|i| [if i % w < 32 { 0.2 } else { 0.9 }; 3]).collect();
+    sky_from_guide(&mut edge, &guide, &hole, w, h, ch, 3, 1, &[100.0; 64]);
+    assert!((edge[(10 * w + 32) * ch] - 0.73).abs() < 1e-5, "{}", edge[(10 * w + 32) * ch]);
+    assert_eq!(at(10, 95), fill[(95 * w + 10) * ch], "at the horizon, the fill");
 }
 
 /// Uses: a block copied once (a stretch copied whole) costs nothing more; each further copy of
@@ -768,7 +856,7 @@ fn a_same_depth_fill_takes_matches_only_from_its_rows() {
     let hb = hole_bounds(w, h, &px).unwrap();
     let valid = valid_sources(w, h, r, &px, &none).unwrap();
     let reach = 40;
-    let depth = Some(solver::Depth::new(&valid, w, h, reach, 8, 0.0, 0.0));
+    let depth = Some(solver::Depth::new(&valid, w, h, reach, 8, 0.0, &[]));
     let mut s = Solver {
         w,
         h,
@@ -783,7 +871,6 @@ fn a_same_depth_fill_takes_matches_only_from_its_rows() {
         reach: reach as i32,
         depth,
         uses: None,
-        sky: None,
         px: &px,
         valid: valid.clone(),
         cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
@@ -847,38 +934,4 @@ fn a_nearby_fill_copies_pixels_whole_away_from_the_picture() {
         (0..w * h).filter(|i| deep[*i]).filter(|i| picture.contains(&[out[i * ch].to_bits(), out[i * ch + 1].to_bits(), out[i * ch + 2].to_bits()])).count();
     let n = deep.iter().filter(|d| **d).count();
     assert_eq!(whole, n, "{whole} of {n} pixels deep in the hole are copies");
-}
-
-/// The sky's layout: above the horizon, a cloud in the fill that touches one of the picture
-/// stays (the fill finishes it); one touching none becomes plain sky. Cloud is then copied only
-/// into cloud and sky into sky, either at a cloud's edge.
-#[test]
-fn a_cut_cloud_is_finished_and_no_new_one_is_made() {
-    let (w, h, ch) = (60, 40, 3);
-    let (sky, cloud, ground) = ([0.2, 0.3, 0.6], [0.9, 0.9, 0.92], [0.4, 0.3, 0.2]);
-    // Sky above row 30, ground below; a strip along the top (rows < 8) is the hole. A cloud of
-    // the picture at columns 10..20 reaches the strip; the fill so far carries it on up, and has
-    // made another at columns 40..48, touching nothing.
-    let px: Vec<Px> = (0..w * h).map(|i| if i / w < 8 { Px::Hole } else { Px::Source }).collect();
-    let mut img: Vec<f32> = (0..w * h)
-        .flat_map(|i| {
-            let (x, y) = (i % w, i / w);
-            if y >= 30 {
-                ground
-            } else if (10..20).contains(&x) && y < 16 || (40..48).contains(&x) && y < 6 {
-                cloud
-            } else {
-                sky
-            }
-        })
-        .collect();
-    let layout = solver::SkyLayout::new(&mut img, &px, w, h, ch, 30.0).unwrap();
-    let at = |x: usize, y: usize| img[(y * w + x) * ch];
-    assert_eq!(at(15, 3), 0.9, "the cut cloud is finished");
-    assert!((at(44, 3) - 0.2).abs() < 1e-6, "the new cloud is now sky: {}", at(44, 3));
-    let view = layout.view(&img, w, h, ch);
-    let s = |t, s| view.allows(t, s);
-    assert!(s((15, 3), (12, 12)) && !s((15, 3), (30, 20)), "cloud from cloud");
-    assert!(s((30, 3), (30, 20)) && !s((30, 3), (12, 12)), "sky from sky");
-    assert!(s((15, 35), (30, 20)), "below the horizon, anything");
 }

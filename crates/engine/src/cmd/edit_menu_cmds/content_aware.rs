@@ -653,7 +653,15 @@ pub fn caf_fill(
     ctl: &photocraft_raster::Interrupt,
 ) -> std::result::Result<Vec<f32>, photocraft_raster::Cancelled> {
     let n = fmt.channels();
-    let Some((model, guide)) = model else { return photocraft_algo::content_aware::fill_owned(w, h, n, img, hole, source, opts, ctl) };
+    let cc = fmt.mode.color_channels();
+    // A nearby fill's levels meet the picture's all round (a panorama's drift, vignetting).
+    let levels = |mut out: Vec<f32>| {
+        if opts.nearby {
+            photocraft_algo::inpaint::seamless_levels(&mut out, hole, w, h, n, cc);
+        }
+        out
+    };
+    let Some((model, guide)) = model else { return photocraft_algo::content_aware::fill_owned(w, h, n, img, hole, source, opts, ctl).map(levels) };
     let mut g = guide_at(fmt, &img, (w, h), hole, guide);
     // The model's fill in the photo's tones around it, region by region (32 of the model's px):
     // a lighter, flatter fill guided the matching to light, smooth pieces and came out hazy.
@@ -661,7 +669,18 @@ pub fn caf_fill(
     photocraft_algo::inpaint::match_guide_tones(w, h, n, fmt.mode.color_channels(), &mut g, hole, (32.0 * scale).round() as usize);
     ctl.check()?;
     if model.detail {
-        return photocraft_algo::content_aware::fill_guided_owned(w, h, n, img, hole, source, &g, scale, opts, ctl);
+        // Stamped: the sky is the model's drawing with the fill's fine texture; copied pieces
+        // repeat whole clouds where the model lays them out and finishes them (RGB only: the sky
+        // is found by its blue).
+        let horizon =
+            (opts.layout_only && fmt.mode == photocraft_color::ColorMode::Rgb).then(|| photocraft_algo::inpaint::horizon_line(&img, hole, w, h, n)).flatten();
+        ctl.check()?;
+        let mut out = photocraft_algo::content_aware::fill_guided_owned(w, h, n, img, hole, source, &g, scale, opts, ctl)?;
+        if let Some(horizon) = horizon {
+            photocraft_algo::inpaint::sky_from_guide(&mut out, &g, hole, w, h, n, cc, (scale / 2.0).ceil() as usize, &horizon);
+        }
+        ctl.check()?;
+        return Ok(levels(out));
     }
     let mut img = img;
     for (i, hh) in hole.iter().enumerate() {
