@@ -663,6 +663,25 @@ fn content_aware_fill_and_scale_run_as_jobs() {
 }
 
 #[test]
+fn fill_with_content_aware_runs_as_a_job() {
+    let mut inline = session(160, 120);
+    let mut s = session(160, 120);
+    for t in [&mut inline, &mut s] {
+        t.execute("select.rect", json!({"x": 60, "y": 40, "width": 30, "height": 30})).unwrap();
+    }
+    inline.execute("edit.fill", json!({"contents": "contentAware"})).unwrap();
+    let steps = s.active().unwrap().history.past_len();
+    let id = job(s.start("edit.fill", json!({"contents": "contentAware"})).unwrap());
+    let e = wait_event(&mut s, id);
+    let JobOutcome::Done(v) = &e.outcome else { panic!("{e:?}") };
+    assert_eq!(v["contents"], "contentAware");
+    assert_eq!(s.active().unwrap().history.past_len(), steps + 1, "one undo step");
+    assert_eq!(pixels(&s), pixels(&inline), "same fill as the synchronous command");
+    // Other contents still finish at once.
+    assert!(matches!(s.start("edit.fill", json!({"contents": "black"})).unwrap(), Started::Done(_)));
+}
+
+#[test]
 fn smart_filter_edits_run_as_jobs() {
     let mut inline = session(160, 120);
     let mut s = session(160, 120);
