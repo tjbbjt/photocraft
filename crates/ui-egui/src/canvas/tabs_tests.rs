@@ -257,3 +257,22 @@ fn the_overflow_button_is_pinned_to_the_right_end() {
         assert_eq!(a, b, "{theme:?}: the » button doesn't follow the last tab");
     }
 }
+
+/// An overflowing strip shows a run of neighbouring tabs that scrolls just far enough to show
+/// the active one, as Photoshop's does: ten documents, five fit, the eighth picked shows the
+/// fourth to the eighth.
+#[test]
+fn an_overflowing_strip_scrolls_to_the_active_tab() {
+    let natural = [100.0; 10];
+    let avail = 500.0 + crate::tab_strip::CHEVRON_W;
+    let mut start = 0;
+    let mut shown =
+        |selected: usize| -> Vec<usize> { super::tabs::fit_doc_tabs(&natural, selected, avail, &mut start).shown.iter().map(|&(i, _)| i).collect() };
+    assert_eq!(shown(0), [0, 1, 2, 3, 4]);
+    assert_eq!(shown(7), [3, 4, 5, 6, 7], "the eighth picked: the fourth to the eighth");
+    assert_eq!(shown(5), [3, 4, 5, 6, 7], "a tab already shown: the strip stays put");
+    assert_eq!(shown(9), [5, 6, 7, 8, 9]);
+    assert_eq!(shown(1), [1, 2, 3, 4, 5], "back to the left: the run starts at the active tab");
+    let all = super::tabs::fit_doc_tabs(&natural[..4], 3, avail, &mut start);
+    assert!(all.overflow.is_empty() && all.shown.len() == 4 && start == 0, "everything fits: no run");
+}
