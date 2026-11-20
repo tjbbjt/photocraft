@@ -401,7 +401,7 @@ fn full_patches_measure_as_clipped_ones() {
     assert!(picks.len() > 5);
     for adapt in [Adapt::NONE, Adapt { gain: (0.8, 1.25), bias: 0.08 }] {
         for keep in [false, true] {
-            let targets = targets_around(w, r, &px, hb, tb);
+            let cells = Cells::around(w, r, &px, hb, tb);
             let mut s = Solver {
                 w,
                 h,
@@ -410,9 +410,7 @@ fn full_patches_measure_as_clipped_ones() {
                 img: &mut img,
                 px: &px,
                 valid: valid.clone(),
-                targets,
-                hole_box: hb,
-                tbox: tb,
+                cells,
                 full: Vec::new(),
                 tmom: Vec::new(),
                 smom: Vec::new(),
@@ -420,15 +418,16 @@ fn full_patches_measure_as_clipped_ones() {
                 ctl: none,
             };
             s.prepare(keep);
-            let nnf = vec![picks[0]; tb.area()];
-            let mut cost = vec![f32::INFINITY; tb.area()];
+            let nnf = vec![picks[0]; s.cells.len()];
+            let mut cost = vec![f32::INFINITY; s.cells.len()];
             s.costs(&nnf, &mut cost).unwrap();
             let mut checked = 0;
-            for k in 0..tb.area() {
-                if !s.targets[k] || !s.full[k] {
+            let cells: Vec<(usize, usize, usize)> = s.cells.iter().collect();
+            for (k, x, y) in cells {
+                if !s.full[k] {
                     continue;
                 }
-                let t = ((tb.x0 + k % tb.width()) as i32, (tb.y0 + k / tb.width()) as i32);
+                let t = (x as i32, y as i32);
                 for &src in &picks {
                     if adapt.is_none() {
                         let exact = s.dist_clipped(t, src, f32::INFINITY);
@@ -481,4 +480,62 @@ fn synthesis_fills_hole_with_plausible_values() {
     let err = hole_rmse(&out, &clean, &hole, ch);
     assert!(err < 0.15, "{err}");
     assert!(out.iter().all(|v| v.is_finite()));
+}
+
+/// The target cells are the centres within the patch radius of a hole pixel, numbered in
+/// raster order, however ragged the hole.
+#[test]
+fn target_cells_are_the_centres_near_the_hole() {
+    let mut rng = Rng::new(5);
+    for (w, h, r) in [(41usize, 33usize, 3usize), (17, 60, 1), (64, 9, 2), (5, 5, 3)] {
+        let hole: Vec<bool> = (0..w * h).map(|i| (i % w + i / w).is_multiple_of(11) || rng.next().is_multiple_of(17)).collect();
+        let px = roles(w, h, &hole);
+        let hb = hole_bounds(w, h, &px).unwrap();
+        let tb = hb.grow(r, w, h);
+        let cells = Cells::around(w, r, &px, hb, tb);
+        let mut k = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let near = (y.saturating_sub(r)..(y + r + 1).min(h)).any(|yy| (x.saturating_sub(r)..(x + r + 1).min(w)).any(|xx| hole[yy * w + xx]));
+                assert_eq!(cells.index(x, y), near.then_some(k), "({x}, {y}) in {w}×{h}, r {r}");
+                k += usize::from(near);
+            }
+        }
+        assert_eq!(cells.len(), k);
+        assert!(cells.iter().enumerate().all(|(i, (n, x, y))| i == n && cells.index(x, y) == Some(n)));
+        for y in tb.y0..tb.y1 {
+            for x in tb.x0..tb.x1 {
+                let row: Vec<usize> = cells.iter().filter(|c| c.2 == y).map(|c| c.1).collect();
+                assert_eq!(cells.in_row(y, x, true), row.iter().filter(|c| **c < x).count());
+                assert_eq!(cells.in_row(y, x, false), row.iter().filter(|c| **c > x).count());
+            }
+            assert_eq!(cells.before_row(y + 1) - cells.before_row(y), cells.row(y).iter().map(|s| s.x1 - s.x0).sum::<usize>());
+        }
+    }
+}
+
+/// A fill area along all four borders (the selection of a panorama's empty edges) keeps its
+/// per-target tables to the ring, not to its bounds (the whole image).
+#[test]
+fn a_border_ring_has_targets_only_along_the_borders() {
+    let (w, h, r, band) = (400, 300, 3, 6);
+    let hole: Vec<bool> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            x < band || y < band || x >= w - band || y >= h - band
+        })
+        .collect();
+    let px = roles(w, h, &hole);
+    let hb = hole_bounds(w, h, &px).unwrap();
+    let cells = Cells::around(w, r, &px, hb, hb.grow(r, w, h));
+    let ring = w * h - (w - 2 * (band + r)) * (h - 2 * (band + r));
+    assert_eq!(cells.len(), ring);
+    assert!(cells.len() * 5 < hb.area(), "{} targets of {}", cells.len(), hb.area());
+    // And the ring fills from the image (deterministically, whatever the thread count).
+    let img = busy(w, h, 3, 8);
+    let p = CompleteParams { adapt: Adapt { gain: (0.8, 1.25), bias: 0.08 }, ..Default::default() };
+    let a = complete(w, h, 3, &img, &hole, &p).expect("filled");
+    let b = complete(w, h, 3, &img, &hole, &p).expect("filled");
+    assert_eq!(bits(&a), bits(&b));
+    assert!(a.iter().all(|v| v.is_finite()));
 }

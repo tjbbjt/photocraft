@@ -147,6 +147,7 @@ pub(crate) fn on_job_event(app: &mut PhotocraftApp, e: &JobEvent) {
     if e.command != CMD {
         return;
     }
+    log_fill(&e.outcome);
     let Some(w) = app.distort.caf.as_mut() else { return };
     let Some(pending) = w.pending_fill.filter(|p| p.job == e.id) else { return };
     w.pending_fill = None;
@@ -176,6 +177,30 @@ pub(crate) fn on_job_event(app: &mut PhotocraftApp, e: &JobEvent) {
             w.error = None;
         }
         refresh(app);
+    }
+}
+
+/// The log's line for a background fill: its size and how long it took (the `memory:` lines
+/// around it show what it cost).
+fn log_fill(outcome: &JobOutcome) {
+    match outcome {
+        JobOutcome::Done(v) => {
+            let size = |key: &str| {
+                let a = v.get(key).and_then(Value::as_array);
+                let at = |i: usize| a.and_then(|a| a.get(i)).and_then(Value::as_u64).unwrap_or(0);
+                (at(2), at(3))
+            };
+            let ((ww, wh), (bw, bh)) = (size("window"), size("fillBounds"));
+            let filled = v.get("filled").and_then(Value::as_u64).unwrap_or(0);
+            let ms = v.get("ms").and_then(Value::as_u64).unwrap_or(0);
+            log::info!(
+                "content-aware fill: {filled} px ({:.1} MP) filled in {ms} ms; window {ww}x{wh} ({:.1} MP), fill area bounds {bw}x{bh}",
+                filled as f64 / 1e6,
+                (ww * wh) as f64 / 1e6
+            );
+        }
+        JobOutcome::Failed(err) => log::info!("content-aware fill: failed: {err}"),
+        JobOutcome::Cancelled => log::info!("content-aware fill: cancelled"),
     }
 }
 

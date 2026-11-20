@@ -1,3 +1,4 @@
+use super::cells::Cells;
 use super::common::{Bounds, Level, PAR_MIN, Px};
 use super::{Cow, par};
 
@@ -278,49 +279,19 @@ impl Sources {
     }
 }
 
-/// Per cell of `tb` (the hole's bounds `hb` grown by the patch radius, where all of them lie): is
-/// it a target centre (its patch overlaps the hole)?
-pub(super) fn targets_around(w: usize, r: usize, px: &[Px], hb: Bounds, tb: Bounds) -> Vec<bool> {
-    // Hole counts summed over the hole's bounds: every hole pixel lies inside them.
-    let (bw, bh) = (hb.width(), hb.height());
-    let mut s = vec![0u32; (bw + 1) * (bh + 1)];
-    for y in 0..bh {
-        let mut row = 0u32;
-        for x in 0..bw {
-            row += u32::from(px[(hb.y0 + y) * w + hb.x0 + x] == Px::Hole);
-            s[(y + 1) * (bw + 1) + x + 1] = s[y * (bw + 1) + x + 1] + row;
-        }
-    }
-    let mut targets = vec![false; tb.area()];
-    let ri = r as i32;
-    let (ox, oy) = (hb.x0 as i32, hb.y0 as i32);
-    for y in tb.y0..tb.y1 {
-        for x in tb.x0..tb.x1 {
-            let k = (y - tb.y0) * tb.width() + (x - tb.x0);
-            let (x, y) = (x as i32, y as i32);
-            targets[k] = window_count(&s, bw, bh, x - ri - ox, y - ri - oy, x + ri + 1 - ox, y + ri + 1 - oy) > 0;
-        }
-    }
-    targets
-}
-
-/// A finished coarser level: its size, pixels and match field (the source centre per cell of
-/// its target box, `i32::MIN` where there is none; empty when it had nothing to copy).
+/// A finished coarser level: its size, pixels and match field (the source centre per target
+/// cell, `i32::MIN` where there is none; empty when it had nothing to copy).
 pub(super) struct Coarser {
     pub(super) w: usize,
     pub(super) h: usize,
     pub(super) img: Vec<f32>,
     pub(super) field: Vec<(i32, i32)>,
-    pub(super) tbox: Bounds,
+    pub(super) cells: Cells,
 }
 
 impl Coarser {
-    /// The match of cell `(x, y)` (`i32::MIN` outside the target box).
+    /// The match of cell `(x, y)` (`i32::MIN` where it is no target).
     pub(super) fn field_at(&self, x: usize, y: usize) -> (i32, i32) {
-        let t = self.tbox;
-        if x < t.x0 || x >= t.x1 || y < t.y0 || y >= t.y1 {
-            return (i32::MIN, i32::MIN);
-        }
-        self.field.get((y - t.y0) * t.width() + (x - t.x0)).copied().unwrap_or((i32::MIN, i32::MIN))
+        self.cells.index(x, y).and_then(|k| self.field.get(k).copied()).unwrap_or((i32::MIN, i32::MIN))
     }
 }
