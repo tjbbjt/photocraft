@@ -408,7 +408,17 @@ fn write_start_marker(sentinel: &gpu_startup::SharedSentinel, plan: &gpu_startup
     }
 }
 
+/// Counts every heap byte the process allocates, whoever allocates it, for the memory budget
+/// (`photocraft_raster::memory::set_heap_counter`): buffers outside the tile store then push
+/// image tiles to the scratch disk as they are allocated, not two seconds later. No limit is set
+/// here; the budget decides.
+#[cfg(not(target_arch = "wasm32"))]
+#[global_allocator]
+static ALLOCATOR: cap::Cap<std::alloc::System> = cap::Cap::new(std::alloc::System, usize::MAX);
+
 fn main() -> eframe::Result {
+    #[cfg(not(target_arch = "wasm32"))]
+    photocraft_raster::memory::set_heap_counter(|| ALLOCATOR.allocated() as u64);
     // Before anything starts a thread: may re-execute this process with glibc tuned to return
     // the memory of closed documents (#8743).
     photocraft_engine::malloc_tuning::apply();
