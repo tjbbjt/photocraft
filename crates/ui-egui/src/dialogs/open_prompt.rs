@@ -51,6 +51,10 @@ pub struct Held {
 /// Dialog field for the high-memory confirmation prompt.
 pub const MEMORY_FIELD: &str = "__psdMemoryOpen";
 
+/// The high-memory prompt's "Don't show again", under `Preferences::dialogs`: once ticked, files
+/// that would ask open as if "Open anyway" was chosen. The hard limit still refuses what can't fit.
+pub const MEMORY_PREF: &str = "file.open.highMemory";
+
 /// Item kind in the arrival-ordered open prompt queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PromptKind {
@@ -108,6 +112,12 @@ pub fn advance(app: &mut PhotocraftApp) {
             None => return,
             Some(PromptKind::Memory) => {
                 if let Some(front) = app.held_memory_prompts.front().cloned() {
+                    // "Don't show again" was ticked: open it as "Open anyway" would (which goes
+                    // on down the queue itself).
+                    if super::dont_show_again::dismissed(app, MEMORY_PREF) {
+                        let _ = answer_memory(app, true);
+                        return;
+                    }
                     show_memory(app, &front);
                     return;
                 } else {
@@ -388,8 +398,9 @@ pub fn owns_memory(fields: &serde_json::Map<String, Value>) -> bool {
 }
 
 /// Draws the high-memory prompt's message body from its dialog fields.
-pub(crate) fn memory_body(ui: &mut egui::Ui, fields: &serde_json::Map<String, Value>) {
+pub(crate) fn memory_body(ui: &mut egui::Ui, fields: &mut serde_json::Map<String, Value>) {
     ui.label(fields.get("message").and_then(Value::as_str).unwrap_or_default());
+    super::dont_show_again::body(ui, fields);
 }
 
 /// Advances the shared open-prompt queue; memory prompts take their turn with damage and profile
@@ -437,11 +448,21 @@ fn show_memory(app: &mut PhotocraftApp, prompt: &MemoryPrompt) {
         ("available".into(), json!(available)),
         ("capacityUnknown".into(), json!(prompt.capacity_unknown)),
         ("uncertainCapacityWarning".into(), json!(prompt.uncertain_capacity_warning)),
+        ("__dontShowAgain".into(), json!(MEMORY_PREF)),
+        ("skip".into(), json!(false)),
     ]
     .into_iter()
     .collect();
 
     app.ui.open_dialog(crate::state::DialogKind::Command, fields);
+}
+
+/// "Open anyway": keeps a ticked "Don't show again", then opens the file.
+pub(crate) fn confirm_memory(app: &mut PhotocraftApp, fields: &serde_json::Map<String, Value>) -> Result<Value, String> {
+    if fields.get("skip").and_then(Value::as_bool) == Some(true) {
+        super::dont_show_again::remember(app, MEMORY_PREF);
+    }
+    answer_memory(app, true)
 }
 
 /// Answers the front high-memory prompt: accepts and starts the approved open, or declines and
