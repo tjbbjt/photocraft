@@ -676,7 +676,14 @@ pub fn caf_fill(
         }
         out
     };
-    let Some((model, guide)) = model else { return photocraft_algo::content_aware::fill_owned(w, h, n, img, hole, source, opts, ctl).map(levels) };
+    let Some((model, guide)) = model else {
+        // A nearby fill (Classic + Depth) goes a piece at a time, each from around itself, with
+        // PHOTOCRAFT_CAF_PIECES set (to compare against the fill of the whole hole at once).
+        if opts.nearby && std::env::var_os("PHOTOCRAFT_CAF_PIECES").is_some() {
+            return photocraft_algo::content_aware::fill_in_pieces(w, h, n, img, hole, source, opts, ctl).map(levels);
+        }
+        return photocraft_algo::content_aware::fill_owned(w, h, n, img, hole, source, opts, ctl).map(levels);
+    };
     let mut g = guide_at(fmt, &img, (w, h), hole, guide);
     // The model's fill in the photo's tones around it, region by region (32 of the model's px):
     // a lighter, flatter fill guided the matching to light, smooth pieces and came out hazy.

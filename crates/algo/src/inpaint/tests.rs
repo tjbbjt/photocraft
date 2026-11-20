@@ -786,6 +786,24 @@ fn the_horizon_is_where_the_sky_meets_the_ground() {
     assert!((line[310] - line[250]).abs() <= 1.5 && line[310] > 52.0, "held on past the last: {} / {}", line[310], line[250]);
 }
 
+/// A dark ridge of the sky's blue-grey, under bright haze: the colour split alone puts the
+/// horizon at the ridge's foot (below it, the ground's brown); the line snaps to the ridge's top,
+/// where the brightness drops, as a person would draw it.
+#[test]
+fn the_horizon_is_the_ridges_top_when_the_ridge_is_not_brown() {
+    let (w, h) = (480, 200);
+    let px = vec![Px::Source; w * h];
+    let img: Vec<f32> = (0..w * h)
+        .flat_map(|i| match i / w {
+            0..=99 => [0.45, 0.46, 0.50],
+            100..=105 => [0.12, 0.12, 0.14],
+            _ => [0.20, 0.19, 0.18],
+        })
+        .collect();
+    let line = solver::horizon_line(&img, &px, w, h, 3).unwrap();
+    assert!(line.iter().all(|r| (r - 100.0).abs() <= 3.0), "{} / {}", line[0], line[300]);
+}
+
 /// Seamless levels: a fill lighter than the picture beside it is brought down to it, all the
 /// way across a strip along the picture's edge; a step too large to be a level (a cloud by sky)
 /// is left as it is.

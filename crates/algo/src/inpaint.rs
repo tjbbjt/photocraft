@@ -64,7 +64,7 @@ use common::Bounds;
 pub(crate) use common::Rng;
 pub use common::{Adapt, Px};
 use common::{Level, SOURCE_MOMENTS_MAX};
-pub use levels::{dilate_mask, drop_fringe, seamless_levels};
+pub use levels::{dilate_mask, drop_fringe, horizon_line, seamless_levels};
 pub(crate) use solver::fit;
 #[cfg(test)]
 use solver::least_sum;
@@ -124,6 +124,10 @@ pub struct CompleteParams {
     /// is found per column ([`solver::horizon_line`]), and the sky is measured from it upwards as
     /// the ground downwards. Only with [`Self::nearby`].
     pub same_depth: bool,
+    /// The horizon to measure [`Self::same_depth`] from, a row per column of the image (found in
+    /// it per level when `None`): a fill in pieces measures every piece from the whole picture's
+    /// horizon, which a piece of sky alone doesn't show.
+    pub horizon: Option<Vec<f32>>,
 }
 
 impl Default for CompleteParams {
@@ -139,6 +143,7 @@ impl Default for CompleteParams {
             nearby: false,
             layout_only: false,
             same_depth: false,
+            horizon: None,
         }
     }
 }
@@ -395,7 +400,16 @@ fn complete_cow<'a>(
         // from the horizon (the picture's top without one).
         let depth = p.nearby.then(|| {
             if p.same_depth {
-                let horizon = solver::horizon_line(&limg, &lpx, lw, lh, ch).unwrap_or_default();
+                let horizon = match &p.horizon {
+                    // The given horizon at this level's size.
+                    Some(hz) if hz.len() == w => (0..lw)
+                        .map(|x| {
+                            let sx = ((x as f32 + 0.5) * w as f32 / lw as f32) as usize;
+                            hz[sx.min(w - 1)] * lh as f32 / h as f32
+                        })
+                        .collect(),
+                    _ => solver::horizon_line(&limg, &lpx, lw, lh, ch).unwrap_or_default(),
+                };
                 let mut d = Depth::new(&valid, lw, lh, reach, p.patch_radius as i32, SAME_DEPTH_PER_ROW, &horizon);
                 if !horizon.is_empty() {
                     d.sky = solver::SkyRule::new(&limg, &lpx, lw, lh, ch, |x| d.horizon_at(x), p.patch_radius, reach);

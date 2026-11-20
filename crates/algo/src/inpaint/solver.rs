@@ -1307,7 +1307,7 @@ impl SkyRule {
                 k.1 += l.1 + u.1 - ul.1;
             }
         }
-        let kb = reach / SKY_BLOCK + 1;
+        let kb = reach / (4 * SKY_BLOCK) + 1;
         let mostly_cloud = |x: usize, y: usize| {
             let (bx, by) = (x / SKY_BLOCK, y / SKY_BLOCK);
             let (x0, y0, x1, y1) = (bx.saturating_sub(kb), by.saturating_sub(kb), (bx + kb + 1).min(bw), (by + kb + 1).min(bh));
@@ -1347,19 +1347,21 @@ pub(super) fn horizon_line(img: &[f32], px: &[Px], w: usize, h: usize, ch: usize
     for (k, a) in at.iter_mut().enumerate() {
         let (x0, x1) = (k * sw, ((k + 1) * sw).min(w));
         let mut rows = vec![(0u32, 0u32); y1 - y0];
-        for (r, y) in rows.iter_mut().zip(y0..y1) {
+        let mut lum = vec![0f32; y1 - y0];
+        for ((r, l), y) in rows.iter_mut().zip(lum.iter_mut()).zip(y0..y1) {
             for x in x0..x1 {
                 let i = y * w + x;
                 if px[i] != Px::Hole {
                     let p = &img[i * ch..i * ch + 3];
                     r.0 += 1;
                     r.1 += u32::from(p[2] > p[0] * 1.04 + 1e-4);
+                    *l += p[0] + p[1] + p[2];
                 }
             }
         }
         let known: u32 = rows.iter().map(|r| r.0).sum();
         if (known as usize) * 10 >= (x1 - x0) * (y1 - y0) * 3 {
-            *a = best_split(&rows).map(|y| (y0 + y) as f32);
+            *a = best_split(&rows).map(|y| (y0 + snap_to_edge(&rows, &lum, y)) as f32);
         }
     }
     let known: Vec<(usize, f32)> = at.iter().enumerate().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
@@ -1395,6 +1397,28 @@ pub(super) fn horizon_line(img: &[f32], px: &[Px], w: usize, h: usize, ch: usize
             })
             .collect(),
     )
+}
+
+/// Steps in brightness (the sum of the three channels, per pixel) the horizon snaps to, at least.
+const HORIZON_EDGE: f32 = 0.12;
+
+/// `row` moved to the sharpest drop in brightness (sky above, ground below) within a few percent
+/// of the strip's height of it: a dark ridge of the same grey as the haze above it doesn't split
+/// by colour at its top, and the line came out a hand below it. `lum`: the sum of each row's
+/// known pixels' brightness (`rows`' counts say how many).
+fn snap_to_edge(rows: &[(u32, u32)], lum: &[f32], row: usize) -> usize {
+    let n = rows.len();
+    let (k, reach) = ((n / 40).max(2), (n / 12).max(4));
+    let mean = |a: usize, b: usize| {
+        let (s, c) = (a..b.min(n)).fold((0f32, 0u32), |(s, c), y| (s + lum[y], c + rows[y].0));
+        (c > 0).then(|| s / c as f32)
+    };
+    let drop = |y: usize| match (mean(y.saturating_sub(k), y), mean(y, y + k)) {
+        (Some(up), Some(down)) => up - down,
+        _ => 0.0,
+    };
+    let best = (row.saturating_sub(reach).max(1)..(row + reach).min(n.saturating_sub(1))).max_by(|a, b| drop(*a).total_cmp(&drop(*b)));
+    best.filter(|y| drop(*y) >= HORIZON_EDGE).unwrap_or(row)
 }
 
 /// The row that best splits `rows` (known pixels, and how many look like sky) into sky above and
