@@ -575,7 +575,13 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             }
             continue;
         }
+        // A drop the canvas already shows as its preview: once it lands, only where the
+        // document differs from that preview (normally nothing) is redrawn, not the whole canvas.
+        let shown = if id == "layer.moveTo" { crate::layers_panel_ui::shown_reorder(app) } else { None };
         let _ = app.run(&id, p);
+        if let Some((doc, key)) = shown {
+            crate::canvas::shown_as_document(app, doc, |k| k == key);
+        }
     }
 }
 

@@ -75,11 +75,24 @@ pub(crate) struct ReorderPreview {
     pub signature: u64,
     pub key: u64,
     pub document: std::sync::Arc<Document>,
+    /// The key of what the canvas showed before this preview (the previous preview, or 0 for the
+    /// document) and the area where the two differ (`step_damage`): moving to this preview redraws
+    /// only that area. `None` when it isn't known.
+    pub from: Option<(u64, photocraft_geom::Rect)>,
 }
 
+/// Canvases of this many pixels or more (about 67 MP) show a drop's preview once the pointer rests
+/// on the target for [`SETTLE_MS`].
+const SETTLE_FROM_PX: u64 = 1 << 26;
+/// How long the pointer rests on a drop target before a large canvas shows the layers moved there.
+const SETTLE_MS: f64 = 150.0;
+
 /// Cache the on-canvas preview of the layer drop in `payload` (a `layer.moveTo` request), unless Preview on Canvas is off.
-/// Marks the destination as hovered every frame; the preview itself is rebuilt only when the target changes.
-pub(crate) fn preview_reorder(app: &mut PhotocraftApp, payload: &serde_json::Value) {
+/// Marks the destination as hovered every frame; the preview itself is rebuilt only when the target changes. On a large
+/// canvas a target the pointer only passes over isn't previewed: each preview was composited in a frame of 50–120 ms on
+/// a storyboard, so the drop line lagged behind the pointer. The last preview stays until the pointer rests on the new
+/// target for [`SETTLE_MS`].
+pub(crate) fn preview_reorder(app: &mut PhotocraftApp, ctx: &Context, payload: &serde_json::Value) {
     if !app.ui.layers_panel_options.preview_on_canvas_when_reordering_layers {
         app.reorder_preview = None;
         return;
@@ -96,16 +109,67 @@ pub(crate) fn preview_reorder(app: &mut PhotocraftApp, payload: &serde_json::Val
     if app.reorder_preview.as_ref().is_some_and(|cache| cache.signature == signature) {
         return;
     }
+    if u64::from(st.doc.size.width) * u64::from(st.doc.size.height) >= SETTLE_FROM_PX {
+        let now = crate::gpu_canvas::now_ms();
+        let since = match app.reorder_hover {
+            Some((hovered, since)) if hovered == signature => since,
+            _ => now,
+        };
+        app.reorder_hover = Some((signature, since));
+        let waited = now - since;
+        if waited < SETTLE_MS {
+            // No input arrives while the pointer rests: a frame comes when it has rested long enough.
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64((SETTLE_MS - waited) / 1000.0));
+            return;
+        }
+    }
+    let Some(st) = app.session.active() else { return };
     let (source, revision) = (st.doc.id, st.revision);
     let add_copy = app.ui.layers_panel_options.add_copy_to_copied_layers_and_groups;
-    let preview = photocraft_engine::layer_multi_cmds::preview_move(&st.doc, payload, add_copy);
-    app.reorder_preview = preview.map(|document| ReorderPreview {
-        source,
-        revision,
-        signature,
-        key: (1u64 << 60) | (signature & ((1u64 << 60) - 1)),
-        document: std::sync::Arc::new(document),
-    });
+    let Some(document) = photocraft_engine::layer_multi_cmds::preview_move(&st.doc, payload, add_copy) else {
+        app.reorder_preview = None;
+        return;
+    };
+    // What the canvas shows now: the previous preview, or the document. Each preview redrew the
+    // whole storyboard (1.1 GP, about a second) where only the layers changing places differ.
+    let (from_key, before) = match app.reorder_preview.as_ref().filter(|p| p.source == source && p.revision == revision) {
+        Some(p) => (p.key, p.document.clone()),
+        None => (0, st.doc.clone()),
+    };
+    let from = photocraft_engine::layer_multi_cmds::step_damage(&before, &document).map(|area| (from_key, area));
+    let key = (1u64 << 60) | (signature & ((1u64 << 60) - 1));
+    let document = std::sync::Arc::new(document);
+    app.reorder_shown = Some((source, revision, key, document.clone()));
+    app.reorder_preview = Some(ReorderPreview { source, revision, signature, key, document, from });
+}
+
+/// The area of document `doc` (at `revision`) that differs between what its canvas showed
+/// (`seen`: a drop preview's key, or 0 for the document) and what it shows now (`now`): from one
+/// drop preview to the next, from the document to a preview, or from the last preview back to
+/// the document when the drag is cancelled. `None` (the whole canvas) for anything else.
+pub(crate) fn reorder_damage(app: &PhotocraftApp, doc: &Document, revision: u64, seen: u64, now: u64) -> Option<photocraft_geom::Rect> {
+    if seen == now {
+        return None;
+    }
+    if let Some(p) = app.reorder_preview.as_ref().filter(|p| p.source == doc.id && p.revision == revision && p.key == now)
+        && let Some((from, area)) = p.from
+        && from == seen
+    {
+        return Some(area);
+    }
+    let (source, shown_revision, key, shown) = app.reorder_shown.as_ref()?;
+    if *source != doc.id || *shown_revision != revision || *key != seen || now != 0 {
+        return None;
+    }
+    photocraft_engine::layer_multi_cmds::step_damage(shown, doc)
+}
+
+/// The document and key of the drop preview the active canvas shows, if it was built for the
+/// document as it is: a drop that lands redraws only where it differs from that preview.
+pub(crate) fn shown_reorder(app: &PhotocraftApp) -> Option<(photocraft_doc::DocId, u64)> {
+    let st = app.session.active()?;
+    let (source, revision, key, _) = app.reorder_shown.as_ref()?;
+    (*source == st.doc.id && *revision == st.revision).then_some((*source, *key))
 }
 
 /// The cached reorder preview and its compositor cache key for document `index`, if it was built for that document's current revision.
@@ -350,6 +414,55 @@ pub fn show_dialog(app: &mut PhotocraftApp, ctx: &Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A document of `width` × `height` with layers "a" and "b" over the Background, and the
+    /// drop of "a" above "b" as the Layers panel sends it.
+    fn reorder_app(width: u32, height: u32) -> (PhotocraftApp, serde_json::Value) {
+        let mut session = photocraft_engine::Session::new();
+        session.execute("file.new", json!({"width": width, "height": height})).unwrap();
+        let a = session.execute("layer.new.layer", json!({"name": "a"})).unwrap()["layer"].as_u64().unwrap();
+        let b = session.execute("layer.new.layer", json!({"name": "b"})).unwrap()["layer"].as_u64().unwrap();
+        (PhotocraftApp::new(session, crate::Services::default()), json!({"layer": a, "target": b, "position": "above"}))
+    }
+
+    /// Going from the document to a drop preview, and back to the document when the drag is
+    /// cancelled, redraws only where the two differ, not the whole canvas.
+    #[test]
+    fn a_drop_preview_redraws_only_where_it_differs() {
+        let ctx = egui::Context::default();
+        let (mut app, drop) = reorder_app(64, 64);
+        preview_reorder(&mut app, &ctx, &drop);
+        let st = app.session.active().unwrap();
+        let (doc, revision) = (st.doc.clone(), st.revision);
+        let p = app.reorder_preview.as_ref().expect("a preview");
+        let (key, there) = (p.key, photocraft_engine::layer_multi_cmds::step_damage(&doc, &p.document));
+        assert!(there.is_some(), "a reorder's damage is known");
+        assert_eq!(reorder_damage(&app, &doc, revision, 0, key), there);
+        assert_eq!(shown_reorder(&app).map(|(_, k)| k), Some(key), "the drop would land on what the canvas shows");
+        // The drag is cancelled: the canvas goes back to the document.
+        app.reorder_preview = None;
+        let back = photocraft_engine::layer_multi_cmds::step_damage(&app.reorder_shown.as_ref().unwrap().3, &doc);
+        assert_eq!(reorder_damage(&app, &doc, revision, key, 0), back);
+        assert_eq!(reorder_damage(&app, &doc, revision + 1, key, 0), None, "not once the document has changed");
+    }
+
+    /// On a large canvas the drop's preview waits until the pointer rests on the target, so
+    /// passing over rows doesn't composite a preview for each; a small canvas shows it at once.
+    #[test]
+    fn a_large_canvas_previews_a_drop_once_the_pointer_rests_on_it() {
+        let ctx = egui::Context::default();
+        let (mut small, drop) = reorder_app(64, 64);
+        preview_reorder(&mut small, &ctx, &drop);
+        assert!(small.reorder_preview.is_some(), "a small canvas previews at once");
+
+        let (mut large, drop) = reorder_app(9000, 8000);
+        preview_reorder(&mut large, &ctx, &drop);
+        assert!(large.reorder_preview.is_none(), "not while the pointer passes over the target");
+        assert!(large.reorder_preview_hit, "the target still counts as hovered");
+        std::thread::sleep(std::time::Duration::from_millis((SETTLE_MS as u64) + 50));
+        preview_reorder(&mut large, &ctx, &drop);
+        assert!(large.reorder_preview.is_some(), "the preview once it has rested there");
+    }
 
     /// A fresh install shows Medium thumbnails of the whole document, like Photoshop's Panel Options defaults.
     #[test]

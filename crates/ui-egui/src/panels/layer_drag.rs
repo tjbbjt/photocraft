@@ -136,7 +136,7 @@ pub(super) fn layer_drag_and_drop(
                 app.reorder_preview = None;
                 actions.push(("layer.moveTo".into(), payload));
             } else if ctx.input(|i| i.pointer.primary_down()) {
-                crate::layers_panel_ui::preview_reorder(app, &payload);
+                crate::layers_panel_ui::preview_reorder(app, ctx, &payload);
             }
         }
         return;
@@ -190,7 +190,7 @@ pub(super) fn layer_drag_and_drop(
         o.insert("copy".into(), json!(true));
     }
     if !released && ctx.input(|i| i.pointer.primary_down()) {
-        crate::layers_panel_ui::preview_reorder(app, &payload);
+        crate::layers_panel_ui::preview_reorder(app, ctx, &payload);
     }
     if released {
         app.reorder_preview = None;
@@ -233,7 +233,7 @@ pub(super) fn layer_drop_zone(
         app.reorder_preview = None;
         actions.push(("layer.moveTo".into(), payload));
     } else if ctx.input(|i| i.pointer.primary_down()) {
-        crate::layers_panel_ui::preview_reorder(app, &payload);
+        crate::layers_panel_ui::preview_reorder(app, ctx, &payload);
     }
 }
 
