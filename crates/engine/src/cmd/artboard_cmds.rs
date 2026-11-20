@@ -690,7 +690,7 @@ const HYPHENATED_FORMATS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tga", "tif",
 /// sanitized, gets the first `-2`, `-3`… that no other board's own name and no earlier suffix
 /// takes. Every board still gets a file of its own on case-insensitive file systems (#6613), and
 /// the first board of a name, like every board whose name is unique, keeps the plain name.
-fn artboard_file_stems(prefix: &str, names: &[&str], hyphenate: bool) -> Vec<String> {
+pub(crate) fn artboard_file_stems(prefix: &str, names: &[&str], hyphenate: bool) -> Vec<String> {
     let plain: Vec<String> = names
         .iter()
         .map(|name| {

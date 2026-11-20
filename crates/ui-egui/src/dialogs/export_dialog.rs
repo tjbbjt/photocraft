@@ -1890,11 +1890,22 @@ pub fn quick_export_png(app: &mut PhotocraftApp) -> Result<Value, String> {
         let fmt = serde_json::to_value(prefs.quick_export_format).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "png".into());
         let same = serde_json::to_value(prefs.quick_export_location).ok().is_some_and(|v| v == "sameFolder");
         let saved = app.session.active().is_some_and(|d| d.path.is_some());
+        // A document with artboards writes one file per board (#12902): Same Folder puts them
+        // beside the document's file, else a folder is chosen. The engine refuses a board file
+        // that would replace the document's own.
+        let boards = app.session.active().is_some_and(|d| !d.doc.artboards().is_empty());
         // Same Folder writes beside the document's file without asking, except when that would
         // replace the file itself (a document opened from photo.png): then the save dialog asks,
         // so replacing it is the user's choice (#6599).
-        if same && saved && !photocraft_engine::web_cmds::quick_export_target_is_own_file(&app.session) {
+        if same && saved && (boards || !photocraft_engine::web_cmds::quick_export_target_is_own_file(&app.session)) {
             return quick_export(app, json!({}));
+        }
+        if boards {
+            let doc = app.session.active().ok_or("no document")?.doc.id;
+            return app.ask_folder(move |app, dir| {
+                app.refocus(doc)?;
+                quick_export(app, json!({"dir": dir}))
+            });
         }
         let st = app.session.active().ok_or("no document")?;
         let stem = st.doc.name.rsplit_once('.').map_or(st.doc.name.as_str(), |(a, _)| a);
@@ -1911,12 +1922,29 @@ pub fn quick_export_png(app: &mut PhotocraftApp) -> Result<Value, String> {
     confirm(app, &f)
 }
 
-/// Runs Quick Export with `p` (an explicit `path`, or none for the document's folder).
+/// Runs Quick Export with `p` (an explicit `path`, or none for the document's folder). As a
+/// background job it says what it wrote when it lands ([`quick_export_done`]).
 fn quick_export(app: &mut PhotocraftApp, p: Value) -> Result<Value, String> {
     let r = app.run("file.export.quickExport", p)?;
-    let template = "Exported {path}";
-    app.ui.status = crate::i18n::fmt(tl!(template), &[("path", r["path"].as_str().unwrap_or_default())]);
+    if r.get("pending").and_then(Value::as_bool) != Some(true) {
+        quick_export_done(app, &r);
+    }
     Ok(r)
+}
+
+/// The status line for a finished Quick Export's result `r`.
+pub(crate) fn quick_export_done(app: &mut PhotocraftApp, r: &Value) {
+    app.ui.status = match r.get("files").and_then(Value::as_array) {
+        // One file per artboard (#12902).
+        Some(files) => {
+            let template = "Exported {n} files";
+            crate::i18n::fmt(tl!(template), &[("n", &files.len().to_string())])
+        }
+        None => {
+            let template = "Exported {path}";
+            crate::i18n::fmt(tl!(template), &[("path", r["path"].as_str().unwrap_or_default())])
+        }
+    };
 }
 
 #[cfg(test)]
