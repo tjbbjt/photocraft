@@ -584,6 +584,16 @@ pub fn try_cancel(app: &mut PhotocraftApp, id: JobId) -> Result<(), CancelRefuse
 fn on_event(app: &mut PhotocraftApp, ctx: &egui::Context, e: JobEvent) {
     let cancelled_batch =
         e.command == "file.automate.batch" && matches!(&e.outcome, JobOutcome::Done(result) if result.get("cancelled").and_then(Value::as_bool) == Some(true));
+    // Every finished job in the log, with how long it ran, so a log shows what took the time
+    // (Edit ▸ Fill's Content-Aware too, which logs nothing of its own).
+    let ran =
+        app.session.jobs_with_recent().into_iter().rev().find(|j| j.id == e.id).map(|j| format!(" after {:.1} s", j.elapsed_ms / 1000.0)).unwrap_or_default();
+    let how = match &e.outcome {
+        JobOutcome::Done(_) => "done".to_string(),
+        JobOutcome::Failed(err) => format!("failed: {err}"),
+        JobOutcome::Cancelled => "cancelled".to_string(),
+    };
+    log::info!("job {} ({}): {how}{ran}", e.command, e.label);
     // Preferences ▸ General ▸ Beep When Done (off by default): a finished operation beeps, like
     // Photoshop's cue. Cancelling is the user's own action and stays silent.
     if matches!(e.outcome, JobOutcome::Done(_))

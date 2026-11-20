@@ -75,6 +75,28 @@ pub struct CafPlan {
     pub source: Vec<bool>,
     pub opts: photocraft_algo::content_aware::FillOptions,
     pub output: String,
+    /// The fill model, when one fills (`method` other than `classic`).
+    pub model: Option<FillModel>,
+}
+
+/// Content-Aware Fill's model: `lama`, `migan` or `mix` (both, block by block), and whether the
+/// fill rebuilds the detail from the picture (the model's fill guiding PatchMatch, which copies
+/// pieces of the sampling area into its layout at full sharpness) or keeps the model's own fill.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FillModel {
+    pub method: String,
+    pub detail: bool,
+}
+
+/// The longest side a window is shrunk to before a model fills it.
+pub const MODEL_SIDE: usize = 2048;
+
+/// A model's fill of a window at its working size (RGB bytes, `w × h`).
+#[derive(Clone, Debug)]
+pub struct ModelGuide {
+    pub w: usize,
+    pub h: usize,
+    pub rgb: Vec<u8>,
 }
 
 impl CafPlan {
@@ -191,7 +213,74 @@ struct CafParams<'a> {
     custom_rect: Option<Rect>,
     opts: photocraft_algo::content_aware::FillOptions,
     output: String,
+    model: Option<FillModel>,
+    edge: Edge,
     surf: &'a Surface,
+}
+
+/// The band around the fill area that blends the fill into the picture: `grow` px filled
+/// outright, then `feather` px where the fill fades out into the original, so its edge leaves no
+/// line. Both 0 (the default, and Photoshop's fill) change nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Edge {
+    pub grow: u32,
+    pub feather: u32,
+}
+
+impl Edge {
+    /// The most either may be, in px.
+    pub const MAX: u32 = 256;
+
+    fn reach(self) -> u32 {
+        self.grow + self.feather
+    }
+
+    /// How much of the fill a pixel `d` px outside the fill area takes (1 inside it, 0 past the
+    /// band): 1 over the grown band, then a smooth fall over the feather.
+    pub fn cover(self, d: f32) -> f32 {
+        if d <= self.grow as f32 {
+            return 1.0;
+        }
+        let t = 1.0 - (d - self.grow as f32) / (self.feather as f32 + 1.0);
+        if t <= 0.0 { 0.0 } else { t * t * (3.0 - 2.0 * t) }
+    }
+}
+
+/// `edgeGrow` and `edgeFeather`, each 0..[`Edge::MAX`] px.
+fn edge_param(p: &Value, cmd: &str) -> Result<Edge> {
+    let px = |k: &str| -> Result<u32> {
+        match p.get(k) {
+            None | Some(Value::Null) => Ok(0),
+            Some(v) => v
+                .as_f64()
+                .filter(|v| v.is_finite() && (0.0..=f64::from(Edge::MAX)).contains(v))
+                .map(|v| v.round() as u32)
+                .ok_or_else(|| bad(cmd, format!("`{k}` must be 0..{} px", Edge::MAX))),
+        }
+    };
+    Ok(Edge { grow: px("edgeGrow")?, feather: px("edgeFeather")? })
+}
+
+/// Widens the fill area by `edge`: pixels within its band join the fill area, with the share of
+/// the fill [`Edge::cover`] gives them as their coverage (they keep any larger one they had).
+fn widen_by_edge(hole: &mut [bool], cover: &mut [f32], w: usize, h: usize, edge: Edge) {
+    use rayon::prelude::*;
+    if edge.reach() == 0 {
+        return;
+    }
+    let d = photocraft_algo::selection::edt(hole, w, h);
+    if d.len() != hole.len() {
+        return;
+    }
+    hole.par_iter_mut().zip(cover.par_iter_mut()).zip(d.par_iter()).for_each(|((hl, c), d)| {
+        if !*hl {
+            let k = edge.cover(*d);
+            if k > 0.0 {
+                *hl = true;
+                *c = c.max(k);
+            }
+        }
+    });
 }
 
 fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Result<CafParams<'a>> {
@@ -214,20 +303,52 @@ fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Resul
         "custom" => return Err(bad(cmd, "custom sampling needs `area` [x,y,w,h], `channel` (alpha channel index or name) or `samplingStrokes`")),
         other => return Err(bad(cmd, format!("unknown sampling `{other}` (auto|rectangular|custom)"))),
     }
-    let opts = FillOptions {
+    let mut opts = FillOptions {
         color_adaptation: color_level(str_or(p, "colorAdaptation", "default")),
         rotations: rotation_level(str_or(p, "rotationAdaptation", "none")),
         scale: bool_or(p, "scale", false),
         mirror: bool_or(p, "mirror", false),
         seed: p.get("seed").and_then(Value::as_u64).unwrap_or(1),
+        ..FillOptions::default()
     };
     let output = str_or(p, "output", "current").to_string();
     if !matches!(output.as_str(), "current" | "new" | "duplicate") {
         return Err(bad(cmd, "`output` must be current|new|duplicate"));
     }
+    let model = match str_or(p, "method", "classic") {
+        "classic" => None,
+        // Classic + Depth: Classic, copying only from near each hole pixel and from about its
+        // rows (Match Depth), with no model.
+        "classicDepth" => {
+            opts.nearby = true;
+            opts.same_depth = true;
+            None
+        }
+        m @ ("lama" | "migan" | "mix") => {
+            // Stamp: Classic fills, copying only from near each hole pixel, started from the
+            // model's layout; the model's fill decides where things go, the photo's pieces fill.
+            // Match depth: from about the same rows, as ground the same distance away.
+            let stamp = bool_or(p, "stamp", false);
+            opts.nearby = stamp;
+            opts.layout_only = stamp;
+            opts.same_depth = stamp && bool_or(p, "matchDepth", false);
+            Some(FillModel { method: m.to_string(), detail: stamp || bool_or(p, "detail", true) })
+        }
+        other => return Err(bad(cmd, format!("unknown method `{other}` (classic|classicDepth|lama|migan|mix)"))),
+    };
+    // A nearby fill copies from close by at about its depth, so its pieces already fit; a
+    // gain and bias per patch only pushed smooth sky apart into coloured specks and pale blocks.
+    if opts.nearby {
+        opts.color_adaptation = color_level("none");
+    }
+    let edge = edge_param(p, cmd)?;
     let surf = doc.layer(id).and_then(|l| l.surface()).ok_or(EngineError::NoLayer(id))?;
-    Ok(CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, surf })
+    Ok(CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, model, edge, surf })
 }
+
+/// How far from a not-quite-opaque pixel a nearby fill's sources start, px
+/// ([`photocraft_algo::inpaint::drop_fringe`]).
+const CAF_FRINGE: usize = 4;
 
 /// Work out a Content-Aware Fill (see [`CafPlan`]) on layer `id` of `doc`.
 pub fn content_aware_plan(doc: &Document, id: LayerId, p: &Value, cmd: &str) -> Result<CafPlan> {
@@ -240,7 +361,7 @@ pub fn content_aware_plan_with(doc: &Document, id: LayerId, p: &Value, cmd: &str
     use rayon::prelude::*;
 
     use crate::fill_cmds::{read_window, read_window_mask};
-    let CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, surf } = caf_params(doc, id, p, cmd)?;
+    let CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, model, edge, surf } = caf_params(doc, id, p, cmd)?;
     let canvas = doc.bounds();
     let cancel = || ctl.cancelled();
     let stop = || if ctl.cancelled() { Err(EngineError::Cancelled) } else { Ok(()) };
@@ -252,9 +373,9 @@ pub fn content_aware_plan_with(doc: &Document, id: LayerId, p: &Value, cmd: &str
         }
         FillEdit::Grow(_) => r,
     });
-    let er = reach.inflate(grow.saturating_add(1)).intersect(&canvas);
+    let er = reach.inflate(grow.saturating_add(edge.reach() as i32).saturating_add(1)).intersect(&canvas);
     let (ew, eh) = crate::fill_cmds::window_size(er)?;
-    let ecover = read_window_mask(sel, er, &cancel).ok_or(EngineError::Cancelled)?;
+    let mut ecover = read_window_mask(sel, er, &cancel).ok_or(EngineError::Cancelled)?;
     let mut ehole: Vec<bool> = ecover.par_iter().map(|c| *c > 0.0).collect();
     for e in &edits {
         stop()?;
@@ -272,6 +393,17 @@ pub fn content_aware_plan_with(doc: &Document, id: LayerId, p: &Value, cmd: &str
             }
             FillEdit::Grow(by) => ehole = grow_mask(&ehole, ew, eh, *by),
         }
+    }
+    // The edge band last, around the fill area as edited. Its pixels have no coverage from the
+    // selection, so they take the band's.
+    if edge.reach() > 0 {
+        stop()?;
+        ecover.par_iter_mut().zip(&ehole).for_each(|(c, h)| {
+            if !*h {
+                *c = 0.0;
+            }
+        });
+        widen_by_edge(&mut ehole, &mut ecover, ew, eh, edge);
     }
     let (bx0, by0, bx1, by1) = mask_bounds(ew, eh, &ehole);
     if bx1 <= bx0 {
@@ -376,11 +508,16 @@ pub fn content_aware_plan_with(doc: &Document, id: LayerId, p: &Value, cmd: &str
     let mut source = base.clone();
     paint_strokes(&mut source, rect, &strokes);
     source.par_iter_mut().zip(&hole).for_each(|(s, h)| *s &= !*h);
-    Ok(CafPlan { layer: id, rect, window, fmt, img, layer_px, cover, hole, base, source, opts, output })
+    // Nearby fills (Classic + Depth, Stamp) copy from right by the hole, where a transparent
+    // edge's fringe is: keep it out (Classic as it was).
+    if opts.nearby && fmt.alpha {
+        stop()?;
+        photocraft_algo::inpaint::drop_fringe(&mut source, &img, w, h, n, CAF_FRINGE);
+    }
+    Ok(CafPlan { layer: id, rect, window, fmt, img, layer_px, cover, hole, base, source, opts, output, model })
 }
 
 fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &'static str) -> Result<Value> {
-    use photocraft_algo::content_aware::fill_owned;
     // The workspace names the layer it opened on: after an Apply to a new layer that one is
     // active, but the fill still samples the original.
     let id = match crate::commands::explicit_layer(s, p)? {
@@ -406,7 +543,10 @@ fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &
             let started = web_time::Instant::now();
             let cancel = || ctx.cancelled();
             let plan = content_aware_plan_with(&doc, id, &p, cmd, &photocraft_raster::Interrupt::cancel_only(&cancel))?;
-            let CafPlan { layer, rect, fmt, img, layer_px, cover, hole, source, opts, output, .. } = plan;
+            // A fill model works first, on the window shrunk to its working size.
+            let model_share = if plan.model.is_some() && plan.source.iter().any(|s| *s) { 0.7 } else { 0.05 };
+            let guide = ctx.stage(0.0, model_share, label, |ctl| model_guide(&plan, ctl))?;
+            let CafPlan { layer, rect, fmt, img, layer_px, cover, hole, source, opts, output, model, .. } = plan;
             // Patches come only from the sampling area outside the fill area. With none (a
             // Rectangular `margin` of 0, a Custom area inside the selection or off the canvas)
             // the fill would be black (#6532), so refuse instead. The workspace's preview builds
@@ -427,7 +567,9 @@ fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &
             let own = layer_px.as_deref().unwrap_or(&img);
             let original: Vec<f32> = selected.iter().flat_map(|&(i, _)| own[i * n..(i + 1) * n].iter().copied()).collect();
             ctx.check()?;
-            let mut filled = ctx.stage(0.05, 1.0, label, |ctl| fill_owned(w, h, n, img, &hole, &source, &opts, ctl)).map_err(|_| EngineError::Cancelled)?;
+            let with = model.as_ref().zip(guide.as_ref());
+            let mut filled =
+                ctx.stage(model_share, 1.0, label, |ctl| caf_fill(w, h, &fmt, img, &hole, &source, &opts, with, ctl)).map_err(|_| EngineError::Cancelled)?;
             // Sampled from all layers: outside the fill area the window keeps the layer's pixels.
             if let Some(own) = layer_px {
                 filled.par_chunks_mut(n.max(1)).zip(own.par_chunks(n.max(1))).zip(hole.par_iter()).for_each(|((f, o), h)| {
@@ -441,6 +583,153 @@ fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &
         },
         move |s, (layer, rect, fmt, output, done)| apply_content_aware_fill(s, label, layer, &output, fmt, rect, done),
     )
+}
+
+/// The fill model's fill of `plan`'s window, `None` for Classic (or when there is nothing to
+/// sample from: the fill refuses that first). The window is shrunk by whole blocks to at most
+/// [`MODEL_SIDE`] on its long side: each block the mean of its colours, to be filled where any of
+/// it is. The same plan gives the same guide, so a preview and the fill after it run the model
+/// once (the model crate keeps its last fill).
+pub fn model_guide(plan: &CafPlan, ctl: &photocraft_raster::Interrupt) -> Result<Option<ModelGuide>> {
+    use rayon::prelude::*;
+    let Some(model) = &plan.model else { return Ok(None) };
+    if !plan.source.iter().any(|s| *s) {
+        return Ok(None);
+    }
+    let (w, h) = (plan.rect.width() as usize, plan.rect.height() as usize);
+    let n = plan.fmt.channels();
+    let f = w.max(h).div_ceil(MODEL_SIDE).max(1);
+    let (gw, gh) = (w.div_ceil(f), h.div_ceil(f));
+    let blocks: Vec<([u8; 3], bool)> = (0..gw * gh)
+        .into_par_iter()
+        .map(|j| {
+            let (bx, by) = (j % gw, j / gw);
+            let (mut sum, mut count, mut hole) = ([0.0f32; 3], 0.0f32, false);
+            for y in by * f..((by + 1) * f).min(h) {
+                for x in bx * f..((bx + 1) * f).min(w) {
+                    let i = y * w + x;
+                    let c = to_rgba(&plan.fmt, &plan.img[i * n..(i + 1) * n]);
+                    for (s, v) in sum.iter_mut().zip(c) {
+                        *s += v;
+                    }
+                    count += 1.0;
+                    hole |= plan.hole[i];
+                }
+            }
+            (sum.map(|s| ((s / count.max(1.0)).clamp(0.0, 1.0) * 255.0).round() as u8), hole)
+        })
+        .collect();
+    if ctl.cancelled() {
+        return Err(EngineError::Cancelled);
+    }
+    let rgb: Vec<u8> = blocks.iter().flat_map(|(c, _)| *c).collect();
+    let hole: Vec<bool> = blocks.iter().map(|(_, h)| *h).collect();
+    let filled = run_model(&model.method, gw, gh, &rgb, &hole, ctl)?;
+    Ok(Some(ModelGuide { w: gw, h: gh, rgb: filled }))
+}
+
+/// A model's name for messages.
+fn model_label(method: &str) -> &'static str {
+    match method {
+        "migan" => "MI-GAN",
+        "mix" => "LaMa + MI-GAN",
+        _ => "LaMa",
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn run_model(method: &str, w: usize, h: usize, rgb: &[u8], hole: &[bool], ctl: &photocraft_raster::Interrupt) -> Result<Vec<u8>> {
+    use photocraft_inpaint_models::{Error, Model, Picture, fill};
+    let model = Model::parse(method).ok_or_else(|| EngineError::Other(format!("unknown fill model `{method}`")))?;
+    fill(model, &Picture { w, h, rgb, hole }, ctl).map_err(|e| match e {
+        Error::Cancelled => EngineError::Cancelled,
+        e => EngineError::Other(format!("{}: {e}", model_label(method))),
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn run_model(method: &str, _: usize, _: usize, _: &[u8], _: &[bool], _: &photocraft_raster::Interrupt) -> Result<Vec<u8>> {
+    Err(EngineError::Other(format!("{}: fill models are not available in the browser", model_label(method))))
+}
+
+/// `img` (`w × h` in `fmt`) filled where `hole` from `source`: Classic (PatchMatch), or with a
+/// model's fill (`guide`, at its working size, scaled up), either guiding PatchMatch
+/// (`FillModel::detail`) or taken as it is.
+#[allow(clippy::too_many_arguments)]
+pub fn caf_fill(
+    w: usize,
+    h: usize,
+    fmt: &PixelFormat,
+    img: Vec<f32>,
+    hole: &[bool],
+    source: &[bool],
+    opts: &photocraft_algo::content_aware::FillOptions,
+    model: Option<(&FillModel, &ModelGuide)>,
+    ctl: &photocraft_raster::Interrupt,
+) -> std::result::Result<Vec<f32>, photocraft_raster::Cancelled> {
+    let n = fmt.channels();
+    let cc = fmt.mode.color_channels();
+    // A nearby fill's levels meet the picture's all round (a panorama's drift, vignetting).
+    let levels = |mut out: Vec<f32>| {
+        if opts.nearby {
+            photocraft_algo::inpaint::seamless_levels(&mut out, hole, w, h, n, cc);
+        }
+        out
+    };
+    let Some((model, guide)) = model else {
+        // A nearby fill (Classic + Depth) goes a piece at a time, each from around itself, with
+        // PHOTOCRAFT_CAF_PIECES set (to compare against the fill of the whole hole at once).
+        if opts.nearby && std::env::var_os("PHOTOCRAFT_CAF_PIECES").is_some() {
+            return photocraft_algo::content_aware::fill_in_pieces(w, h, n, img, hole, source, opts, ctl).map(levels);
+        }
+        return photocraft_algo::content_aware::fill_owned(w, h, n, img, hole, source, opts, ctl).map(levels);
+    };
+    let mut g = guide_at(fmt, &img, (w, h), hole, guide);
+    // The model's fill in the photo's tones around it, region by region (32 of the model's px):
+    // a lighter, flatter fill guided the matching to light, smooth pieces and came out hazy.
+    let scale = w as f32 / guide.w.max(1) as f32;
+    photocraft_algo::inpaint::match_guide_tones(w, h, n, fmt.mode.color_channels(), &mut g, hole, (32.0 * scale).round() as usize);
+    ctl.check()?;
+    if model.detail {
+        let out = photocraft_algo::content_aware::fill_guided_owned(w, h, n, img, hole, source, &g, scale, opts, ctl)?;
+        ctl.check()?;
+        return Ok(levels(out));
+    }
+    let mut img = img;
+    for (i, hh) in hole.iter().enumerate() {
+        if *hh {
+            img[i * n..(i + 1) * n].copy_from_slice(&g[i * n..(i + 1) * n]);
+        }
+    }
+    ctl.check()?;
+    Ok(img)
+}
+
+/// `guide` scaled to `w × h` (bilinear) in `fmt`, opaque, over the hole; `img` elsewhere.
+fn guide_at(fmt: &PixelFormat, img: &[f32], (w, h): (usize, usize), hole: &[bool], guide: &ModelGuide) -> Vec<f32> {
+    use rayon::prelude::*;
+    let n = fmt.channels();
+    let (gw, gh) = (guide.w.max(1), guide.h.max(1));
+    let at = |x: usize, y: usize, c: usize| f32::from(guide.rgb[(y * gw + x) * 3 + c]) / 255.0;
+    let mut out = img.to_vec();
+    out.par_chunks_mut((w * n).max(1)).enumerate().for_each(|(y, row)| {
+        let fy = ((y as f32 + 0.5) * gh as f32 / h as f32 - 0.5).clamp(0.0, (gh - 1) as f32);
+        let (y0, ty) = (fy.floor() as usize, fy - fy.floor());
+        let y1 = (y0 + 1).min(gh - 1);
+        for x in 0..w {
+            if !hole[y * w + x] {
+                continue;
+            }
+            let fx = ((x as f32 + 0.5) * gw as f32 / w as f32 - 0.5).clamp(0.0, (gw - 1) as f32);
+            let (x0, tx) = (fx.floor() as usize, fx - fx.floor());
+            let x1 = (x0 + 1).min(gw - 1);
+            let c = |c: usize| (at(x0, y0, c) * (1.0 - tx) + at(x1, y0, c) * tx) * (1.0 - ty) + (at(x0, y1, c) * (1.0 - tx) + at(x1, y1, c) * tx) * ty;
+            let mut enc = [0.0f32; 8];
+            from_rgba_into(fmt, [c(0), c(1), c(2), 1.0], &mut enc);
+            row[x * n..(x + 1) * n].copy_from_slice(&enc[..n]);
+        }
+    });
+    out
 }
 
 /// A Content-Aware Fill's result for its apply step: the filled window (the same as the

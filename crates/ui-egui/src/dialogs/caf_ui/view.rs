@@ -2,8 +2,8 @@ use super::controls::{pointer, tool_icon, tool_tip};
 use super::lifecycle::{apply, bounds, cancel, commit, fill_edit, report, reset, set_sampling};
 use super::preview::{drive_preview, rebase, refresh};
 use super::{
-    Align2, BAR_H, CafTool, CafWorkspace, Color32, ERect, FontId, LEFT_W, PANEL_W, PREVIEW_W, PhotocraftApp, Pos2, Rect, Sense, Stroke, Tokens, ToolEvent,
-    Value, json, pos2, vec2, widgets,
+    Align2, BAR_H, CafOpts, CafTool, CafWorkspace, Color32, EDGE_MAX, ERect, FontId, LEFT_W, PANEL_W, PREVIEW_MIN_W, PREVIEW_W, PhotocraftApp, Pos2, Rect,
+    Sense, Stroke, Tokens, ToolEvent, Value, json, pos2, vec2, widgets,
 };
 
 /// A view: screen px per document px and the document point at the centre of `area`.
@@ -170,6 +170,46 @@ fn caf_props_panel(
             }
         });
     });
+    if w.opts.photocraft {
+        ui.horizontal(|ui| {
+            ui.label(tl!("Method"));
+            let o = [
+                ("classic".to_string(), tl!("Classic")),
+                ("classicDepth".to_string(), tl!("Classic + Depth")),
+                ("lama".to_string(), tl!("LaMa")),
+                ("migan".to_string(), tl!("MI-GAN")),
+                ("mix".to_string(), tl!("Mix (LaMa + MI-GAN)")),
+            ];
+            widgets::dropdown(ui, "caf-method", tl!("Method"), &mut w.opts.method, &o, 150.0);
+        });
+        // Stamping always rebuilds the detail: Classic fills around the model's layout.
+        let model = !matches!(w.opts.method.as_str(), "classic" | "classicDepth");
+        ui.add_enabled_ui(model, |ui| {
+            widgets::checkbox(ui, &mut w.opts.stamp, tl!("Stamp with Classic"))
+                .on_hover_text(tl!("The model only lays the fill out; Classic fills it with pieces of the photo from nearby."));
+        });
+        // Classic + Depth always matches depth: shown ticked (and fixed) whatever the setting.
+        let depth_method = w.opts.method == "classicDepth";
+        let mut always = true;
+        let depth = if depth_method { &mut always } else { &mut w.opts.match_depth };
+        ui.add_enabled_ui(model && w.opts.stamp, |ui| {
+            widgets::checkbox(ui, depth, tl!("Match Depth"))
+                .on_hover_text(tl!("Copy from about the same height in the picture, so ground far off is not copied into ground close by."));
+        });
+        ui.add_enabled_ui(model && !w.opts.stamp, |ui| {
+            widgets::checkbox(ui, &mut w.opts.detail, tl!("Rebuild Detail from the Photo"));
+        });
+        // The band that blends the fill into the picture; dragging changes the fill area, so the
+        // base follows when the drag ends.
+        for (name, v) in [(tl!("Edge Grow"), &mut w.opts.edge_grow), (tl!("Edge Feather"), &mut w.opts.edge_feather)] {
+            let before = *v;
+            let r = widgets::slider_row(ui, name, v, 0.0..=EDGE_MAX, "px", None);
+            *v = v.round();
+            if (*v != before && !r.dragged()) || r.drag_stopped() {
+                *rebase_needed = true;
+            }
+        }
+    }
     ui.horizontal(|ui| {
         ui.label(tl!("Color Adaptation"));
         let o = [
@@ -202,8 +242,19 @@ fn caf_props_panel(
         let o = [("current".to_string(), tl!("Current Layer")), ("new".to_string(), tl!("New Layer")), ("duplicate".to_string(), tl!("Duplicate Layer"))];
         widgets::dropdown(ui, "caf-output", tl!("Output To"), &mut w.opts.output, &o, 140.0);
     });
-    if w.pending_fill.is_some() {
-        ui.label(tl!("Working…"));
+    match &w.pending_fill {
+        Some(p) if w.opts.photocraft => {
+            ui.label(format!("{} {:.0} s", tl!("Working…"), p.started.elapsed().as_secs_f32()));
+        }
+        Some(_) => {
+            ui.label(tl!("Working…"));
+        }
+        None => {}
+    }
+    let took = |what: &str, secs: Option<f32>| secs.map(|s| format!("{what}: {s:.1} s"));
+    let times: Vec<String> = [took(tl!("Last preview"), w.preview.last_secs), took(tl!("Last fill"), w.preview.last_fill_secs)].into_iter().flatten().collect();
+    if w.opts.photocraft && !times.is_empty() {
+        ui.label(egui::RichText::new(times.join("   ")).color(t.text_dim).size(11.0));
     }
     if let Some(e) = w.error.as_ref().or(w.preview.error.as_ref()) {
         ui.label(egui::RichText::new(e.as_str()).color(t.danger).size(11.0));
@@ -237,9 +288,18 @@ fn caf_preview_panel(ui: &mut egui::Ui, painter: &egui::Painter, t: &Tokens, w: 
         pclip.image(tex.id(), pv.rect(*r), uv, Color32::WHITE);
     }
     if w.preview.shown != w.preview.want {
-        // Being recomputed: a spinner in the corner.
+        // Being recomputed: a spinner in the corner, and how long it has run.
         let sp = ERect::from_min_size(pv_area.right_bottom() - vec2(26.0, 26.0), vec2(18.0, 18.0));
         ui.put(sp, egui::Spinner::new().size(16.0));
+        if let Some(t0) = w.preview.started.filter(|_| w.opts.photocraft) {
+            painter.text(
+                sp.left_center() - vec2(6.0, 0.0),
+                Align2::RIGHT_CENTER,
+                format!("{:.1} s", t0.elapsed().as_secs_f32()),
+                FontId::proportional(12.0),
+                t.text,
+            );
+        }
     }
     let presp = ui.interact(pv_area, egui::Id::unique("caf-preview-view"), Sense::click_and_drag());
     if w.pending_fill.is_none() && presp.dragged() {
@@ -252,7 +312,7 @@ fn caf_preview_panel(ui: &mut egui::Ui, painter: &egui::Painter, t: &Tokens, w: 
             w.preview.zoom = (w.preview.zoom * (scroll / 200.0).exp()).clamp(0.01, 32.0);
         }
     }
-    let zrow = ERect::from_min_size(pos2(pv_rect.left() + 10.0, pv_rect.bottom() - 38.0), vec2(PREVIEW_W - 20.0, 30.0));
+    let zrow = ERect::from_min_size(pos2(pv_rect.left() + 10.0, pv_rect.bottom() - 38.0), vec2(pv_rect.width() - 20.0, 30.0));
     let mut zr = ui.new_child(egui::UiBuilder::new().max_rect(zrow).layout(egui::Layout::left_to_right(egui::Align::Center)));
     let mut pct = (w.preview.zoom * 100.0).round();
     if widgets::value_field(&mut zr, &mut pct, 1.0..=3200.0, "%", 64.0).accessible_name(tl!("Zoom")).changed() {
@@ -333,7 +393,7 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         painter.rect_filled(right, 0.0, t.dock);
         painter.line_segment([right.left_top(), right.left_bottom()], Stroke::new(1.0, t.separator));
         let mut props =
-            ui.new_child(egui::UiBuilder::new().max_rect(ERect::from_min_max(right.min + vec2(14.0, 12.0), pos2(right.right() - 14.0, right.bottom() - 60.0))));
+            ui.new_child(egui::UiBuilder::new().max_rect(ERect::from_min_max(right.min + vec2(14.0, 12.0), pos2(right.right() - 14.0, right.bottom() - 96.0))));
         egui::ScrollArea::vertical()
             .id_salt("caf-props")
             .show(&mut props, |ui| caf_props_panel(ui, w, &t, &mut reset_what, &mut new_sampling, &mut rebase_needed));
@@ -354,8 +414,13 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
         if crate::icons::button(&mut fb, "undo-2", 24.0, false, tl!("Reset")).clicked() {
             reset_what = Some("all");
         }
-        // The Preview panel.
-        let pv_rect = ERect::from_min_size(pos2(right.left() - PREVIEW_W, body.top()), vec2(PREVIEW_W, body.height()));
+        // The Preview panel, as wide as dragged at its left edge (the document view keeps at
+        // least a quarter of the room).
+        let room = (right.left() - left.right()).max(0.0);
+        let most = (room * 0.75).max(PREVIEW_MIN_W);
+        let pw = if w.opts.photocraft { w.opts.preview_w.clamp(PREVIEW_MIN_W, most) } else { PREVIEW_W };
+        let split = ERect::from_center_size(pos2(right.left() - pw, body.center().y), vec2(8.0, body.height()));
+        let pv_rect = ERect::from_min_size(pos2(right.left() - pw, body.top()), vec2(pw, body.height()));
         let uv = ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
         caf_preview_panel(ui, &painter, &t, w, pv_rect);
         // The document view.
@@ -448,8 +513,29 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
             events.push(ToolEvent::Up { x: q[0], y: q[1] });
             dragging = false;
         }
-        // Settings changed in the panel: the overlay and the preview follow.
-        if w.opts != before {
+        // Above OK and Apply: PhotoCraft's additions, or the workspace as Photoshop has it.
+        let sw = ERect::from_min_size(pos2(full.right() - PANEL_W + 14.0, full.bottom() - 84.0), vec2(PANEL_W - 28.0, 30.0));
+        painter.line_segment([sw.left_top() - vec2(0.0, 4.0), sw.right_top() - vec2(0.0, 4.0)], Stroke::new(1.0, t.separator));
+        let mut sui = ui.new_child(egui::UiBuilder::new().max_rect(sw).layout(egui::Layout::left_to_right(egui::Align::Center)));
+        crate::fill_ui::behavior_switch(&mut sui, &mut w.opts.photocraft)
+            .on_hover_text(tl!("PhotoCraft: fill methods, the edge band, timers and a resizable preview. Parity: Content-Aware Fill as in Photoshop."));
+        // The split between the view and the Preview panel, last so it is above both.
+        if w.opts.photocraft {
+            let grip = ui.interact(split, egui::Id::unique("caf-preview-split"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+            if grip.hovered() || grip.dragged() {
+                painter.line_segment([split.center_top(), split.center_bottom()], Stroke::new(3.0, t.accent));
+            }
+            if grip.dragged() {
+                w.opts.preview_w = (pw - grip.drag_delta().x).clamp(PREVIEW_MIN_W, most);
+            }
+        }
+        // Settings changed in the panel: the overlay and the preview follow (not for the Preview
+        // panel's width).
+        // The switch changes the edge band, and so the fill area: the base follows.
+        if w.opts.edge() != before.edge() {
+            rebase_needed = true;
+        }
+        if (CafOpts { preview_w: before.preview_w, ..w.opts.clone() }) != before {
             w.overlay_dirty = true;
             w.stale();
         }

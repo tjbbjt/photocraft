@@ -117,7 +117,34 @@ pub struct CafOpts {
     pub mirror: bool,
     /// current | new | duplicate (Photoshop opens on New Layer)
     pub output: String,
+    /// What fills: classic (PatchMatch) | lama | migan | mix (LaMa and MI-GAN, block by block).
+    pub method: String,
+    /// With a model: rebuild the detail from the picture (the model's fill guiding PatchMatch)
+    /// rather than keep the model's own fill.
+    pub detail: bool,
+    /// With a model: Classic fills, copying from near the hole, around the model's layout (the
+    /// engine's `stamp`). Detail is then always rebuilt.
+    pub stamp: bool,
+    /// Stamping: copy from about the same rows, as ground the same distance away (the engine's
+    /// `matchDepth`).
+    pub match_depth: bool,
+    /// The PhotoCraft features switch: on, the method, the edge band, timers and the resizable
+    /// preview; off (parity), Photoshop's panel and fill (Classic, no band), whatever the method
+    /// and band are set to.
+    pub photocraft: bool,
+    /// The edge band, px: grown outright, then feathered into the picture (the engine's `Edge`).
+    pub edge_grow: f32,
+    pub edge_feather: f32,
+    /// The Preview panel's width, px (dragged at its left edge).
+    pub preview_w: f32,
 }
+
+/// The edge band PhotoCraft starts with (Edit › Fill's too).
+pub const EDGE_GROW: f32 = crate::fill_ui::EDGE_GROW as f32;
+pub const EDGE_FEATHER: f32 = crate::fill_ui::EDGE_FEATHER as f32;
+pub const EDGE_MAX: f32 = crate::fill_ui::EDGE_MAX as f32;
+/// The narrowest the Preview panel gets, px.
+pub const PREVIEW_MIN_W: f32 = 200.0;
 
 impl Default for CafOpts {
     fn default() -> Self {
@@ -133,6 +160,14 @@ impl Default for CafOpts {
             scale: false,
             mirror: false,
             output: "new".into(),
+            method: "classic".into(),
+            detail: true,
+            stamp: true,
+            match_depth: true,
+            photocraft: true,
+            edge_grow: EDGE_GROW,
+            edge_feather: EDGE_FEATHER,
+            preview_w: PREVIEW_W,
         }
     }
 }
@@ -148,6 +183,9 @@ impl CafOpts {
             ("sampleAllLayers", &mut self.sample_all),
             ("scale", &mut self.scale),
             ("mirror", &mut self.mirror),
+            ("detail", &mut self.detail),
+            ("stamp", &mut self.stamp),
+            ("matchDepth", &mut self.match_depth),
         ] {
             if let Some(b) = flag(k) {
                 *slot = b;
@@ -155,6 +193,14 @@ impl CafOpts {
         }
         if let Some(n) = v.get("opacity").and_then(Value::as_f64).filter(|n| n.is_finite()) {
             self.opacity = (n as f32).clamp(0.0, 100.0);
+        }
+        for (k, slot) in [("edgeGrow", &mut self.edge_grow), ("edgeFeather", &mut self.edge_feather)] {
+            if let Some(n) = v.get(k).and_then(Value::as_f64).filter(|n| n.is_finite()) {
+                *slot = (n as f32).clamp(0.0, EDGE_MAX).round();
+            }
+        }
+        if let Some(n) = v.get("previewWidth").and_then(Value::as_f64).filter(|n| n.is_finite()) {
+            self.preview_w = (n as f32).clamp(PREVIEW_MIN_W, 4000.0);
         }
         if let Some(c) = v.get("color").and_then(Value::as_array).filter(|c| c.len() == 3) {
             let ch = |i: usize| c[i].as_u64().map(|v| v.min(255) as u8);
@@ -181,6 +227,12 @@ impl CafOpts {
         if let Some(s) = pick("output", &["current", "new", "duplicate"])? {
             self.output = s;
         }
+        if let Some(s) = pick("method", &["classic", "classicDepth", "lama", "migan", "mix"])? {
+            self.method = s;
+        }
+        if let Some(s) = pick("fillMode", &["parity", "photocraft"])? {
+            self.photocraft = s == "photocraft";
+        }
         Ok(())
     }
 
@@ -198,7 +250,25 @@ impl CafOpts {
             "scale": self.scale,
             "mirror": self.mirror,
             "output": self.output,
+            "method": self.method,
+            "detail": self.detail,
+            "stamp": self.stamp,
+            "matchDepth": self.match_depth,
+            "fillMode": if self.photocraft { "photocraft" } else { "parity" },
+            "edgeGrow": self.edge_grow,
+            "edgeFeather": self.edge_feather,
+            "previewWidth": self.preview_w,
         })
+    }
+
+    /// The method the fill runs: Parity is always Classic.
+    pub fn fill_method(&self) -> &str {
+        if self.photocraft { &self.method } else { "classic" }
+    }
+
+    /// The edge band the fill runs with: none for Parity.
+    pub fn edge(&self) -> (f32, f32) {
+        if self.photocraft { (self.edge_grow, self.edge_feather) } else { (0.0, 0.0) }
     }
 }
 
@@ -272,6 +342,8 @@ pub struct CafWorkspace {
 struct PendingFill {
     job: JobId,
     close_on_success: bool,
+    /// When it started, for the panel's timer.
+    started: web_time::Instant,
 }
 
 impl CafWorkspace {

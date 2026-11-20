@@ -53,6 +53,7 @@ use proximity_integral::HoleIntegral;
 
 mod cells;
 mod common;
+mod levels;
 mod solver;
 mod sources;
 mod synthesis;
@@ -63,15 +64,32 @@ use common::Bounds;
 pub(crate) use common::Rng;
 pub use common::{Adapt, Px};
 use common::{Level, SOURCE_MOMENTS_MAX};
-use solver::Solver;
+pub use levels::{dilate_mask, drop_fringe, horizon_line, seamless_levels};
 pub(crate) use solver::fit;
 #[cfg(test)]
 use solver::least_sum;
+use solver::{Depth, Solver, Uses};
 use sources::{Coarser, Sources, THIN_RATIO, downsample, hole_bounds, hole_thickness, peel_affordable, valid_sources, window_count};
 #[cfg(test)]
 use sources::{hole_bbox, integral};
 use synthesis::onion_peel;
 pub use synthesis::{best_offset, synthesize};
+
+/// How strongly a guided fill favours coherent matches ([`Solver::coherence`]).
+const GUIDED_COHERENCE: f32 = 6.0;
+/// The least distance a nearby fill copies from ([`CompleteParams::nearby`]), full-size px.
+const NEARBY_MIN: usize = 64;
+/// The rows up or down a fill at the same depth copies from ([`CompleteParams::same_depth`]),
+/// as a share of the target's distance from the horizon: rows near it are far off, and each
+/// spans more ground.
+const SAME_DEPTH_PER_ROW: f32 = 0.2;
+/// What each further copy of a part of the picture costs in a nearby fill, as a share of the
+/// patch distance ([`solver::Uses`]).
+const NEARBY_REUSE: f32 = 2.0;
+/// The finest level a nearby fill counts copies on (0: full size). The coarse levels lay the
+/// fill out, and there a repeat gives way to another part of the picture; on the finer ones it
+/// would only trade a sharp copy for a blend of near misses.
+const NEARBY_REUSE_FROM: usize = 2;
 
 /// Parameters for [`complete`].
 #[derive(Clone, Debug, PartialEq)]
@@ -90,11 +108,43 @@ pub struct CompleteParams {
     /// Colour adaptation of the copies.
     pub adapt: Adapt,
     pub seed: u64,
+    /// Copy only from near each hole pixel: no farther than the hole is thick (at least 64 px).
+    /// Classic copied whatever matched best from anywhere, a far, smaller-scale stretch of
+    /// ground into a near one; nearby, the pieces are from the surroundings and keep their size.
+    pub nearby: bool,
+    /// A guided fill whose guide only lays the hole out: the hole starts as the guide, and from
+    /// then on the fill matches, votes and keeps Classic's way. The guide's colours never steer a
+    /// match, so the pieces are chosen and blended as Classic chooses them, only around a start
+    /// that already has the rocks low and the grass high.
+    pub layout_only: bool,
+    /// A nearby fill copies at the same depth: from about the same rows as each hole pixel (up
+    /// or down a fifth of its distance from the horizon, or from the top of the picture without
+    /// one), so ground far off, finer and smoother, is not copied into ground close by, where it
+    /// reads as a road; near the horizon, from its own rows only, so its line runs on. The horizon
+    /// is found per column ([`solver::horizon_line`]), and the sky is measured from it upwards as
+    /// the ground downwards. Only with [`Self::nearby`].
+    pub same_depth: bool,
+    /// The horizon to measure [`Self::same_depth`] from, a row per column of the image (found in
+    /// it per level when `None`): a fill in pieces measures every piece from the whole picture's
+    /// horizon, which a piece of sky alone doesn't show.
+    pub horizon: Option<Vec<f32>>,
 }
 
 impl Default for CompleteParams {
     fn default() -> Self {
-        Self { patch_radius: 3, em_iters: 10, min_em_iters: 3, pm_iters: 2, refine_extent: 192, adapt: Adapt::NONE, seed: 1 }
+        Self {
+            patch_radius: 3,
+            em_iters: 10,
+            min_em_iters: 3,
+            pm_iters: 2,
+            refine_extent: 192,
+            adapt: Adapt::NONE,
+            seed: 1,
+            nearby: false,
+            layout_only: false,
+            same_depth: false,
+            horizon: None,
+        }
     }
 }
 
@@ -133,7 +183,7 @@ pub fn complete_masked(
     p: &CompleteParams,
     ctl: &photocraft_raster::Interrupt,
 ) -> Result<Option<Vec<f32>>, photocraft_raster::Cancelled> {
-    Ok(complete_cow(w, h, ch, Cow::Borrowed(img), px, p, ctl)?.ok())
+    Ok(complete_cow(w, h, ch, Cow::Borrowed(img), px, None, p, ctl)?.ok())
 }
 
 /// [`complete_masked`] that fills `img` itself instead of a copy of it (only the hole changes):
@@ -147,17 +197,126 @@ pub fn complete_masked_owned(
     p: &CompleteParams,
     ctl: &photocraft_raster::Interrupt,
 ) -> Result<Result<Vec<f32>, Vec<f32>>, photocraft_raster::Cancelled> {
-    Ok(complete_cow(w, h, ch, Cow::Owned(img), px, p, ctl)?.map_err(Cow::into_owned))
+    Ok(complete_cow(w, h, ch, Cow::Owned(img), px, None, p, ctl)?.map_err(Cow::into_owned))
 }
 
-/// The completion, on the caller's pixels or a copy of them: `Err` gives them back when there is
-/// nothing to copy from.
+/// [`complete_masked_owned`] guided by `guide`, a picture the size of `img` of what the hole
+/// should look like: a model's fill at a reduced size, scaled up `scale` times (1 for a guide at
+/// full sharpness). The guide decides the layout (where the sky ends, which way a ridge runs) and
+/// the picture the detail: at every level the hole's patches are matched as the guide shows them,
+/// against the picture softened the same way, and the fill stamps the matched pieces of the
+/// picture at their full sharpness, neighbours favouring one piece. The guide is never
+/// overwritten, so the matching cannot drift away from it the way a fill that only starts from
+/// it does.
+#[allow(clippy::too_many_arguments)]
+pub fn complete_guided_owned(
+    w: usize,
+    h: usize,
+    ch: usize,
+    img: Vec<f32>,
+    px: &[Px],
+    guide: &[f32],
+    scale: f32,
+    p: &CompleteParams,
+    ctl: &photocraft_raster::Interrupt,
+) -> Result<Result<Vec<f32>, Vec<f32>>, photocraft_raster::Cancelled> {
+    assert_eq!(guide.len(), img.len(), "the guide is the picture's size");
+    Ok(complete_cow(w, h, ch, Cow::Owned(img), px, Some((guide, scale.max(1.0))), p, ctl)?.map_err(Cow::into_owned))
+}
+
+/// A model's fill brought to the tones of the picture around it, before it guides a fill. In
+/// each region of `tile` px (and its eight neighbours), each of the first `colour` channels of
+/// `guide`'s hole pixels gets a gain and an offset so their mean and spread match the known
+/// pixels there; between regions the two are interpolated. A model's fill tends to be lighter
+/// and flatter than the photo deep inside a large hole (it settles on an average); matched
+/// against such a guide, the fill picked light, smooth pieces of the photo and came out hazy.
+/// `guide` holds the picture outside the hole; only its hole pixels change.
+pub fn match_guide_tones(w: usize, h: usize, ch: usize, colour: usize, guide: &mut [f32], hole: &[bool], tile: usize) {
+    let (cc, tile) = (colour.min(ch), tile.max(8));
+    if w == 0 || h == 0 || cc == 0 || guide.len() != w * h * ch || hole.len() != w * h {
+        return;
+    }
+    let (tw, th) = (w.div_ceil(tile), h.div_ceil(tile));
+    // Per region and channel: hole pixels' count, sum and sum of squares, then the known ones'.
+    let rows: Vec<Vec<[f64; 6]>> = par::map(th, w * h >= common::PAR_MIN, |ty| {
+        let mut out = vec![[0.0f64; 6]; tw * cc];
+        for y in ty * tile..((ty + 1) * tile).min(h) {
+            for x in 0..w {
+                let i = y * w + x;
+                let k = if hole[i] { 0 } else { 3 };
+                for c in 0..cc {
+                    let v = f64::from(guide[i * ch + c]);
+                    let s = &mut out[(x / tile) * cc + c];
+                    s[k] += 1.0;
+                    s[k + 1] += v;
+                    s[k + 2] += v * v;
+                }
+            }
+        }
+        out
+    });
+    let at = |tx: usize, ty: usize, c: usize| rows[ty][tx * cc + c];
+    let add = |a: [f64; 6], b: [f64; 6]| std::array::from_fn::<f64, 6, _>(|i| a[i] + b[i]);
+    let least = (tile * tile / 16).max(16) as f64;
+    let fit = |s: [f64; 6]| -> Option<(f32, f32)> {
+        if s[0] < least || s[3] < least {
+            return None;
+        }
+        let (mh, mk) = (s[1] / s[0], s[4] / s[3]);
+        let (sh, sk) = ((s[2] / s[0] - mh * mh).max(0.0).sqrt(), (s[5] / s[3] - mk * mk).max(0.0).sqrt());
+        let gain = ((sk + 1e-3) / (sh + 1e-3)).clamp(0.67, 1.5);
+        Some((gain as f32, (mk - gain * mh) as f32))
+    };
+    let global: Vec<(f32, f32)> = (0..cc)
+        .map(|c| fit((0..th).flat_map(|ty| (0..tw).map(move |tx| (tx, ty))).fold([0.0; 6], |a, (tx, ty)| add(a, at(tx, ty, c)))).unwrap_or((1.0, 0.0)))
+        .collect();
+    let params: Vec<(f32, f32)> = (0..th)
+        .flat_map(|ty| (0..tw).map(move |tx| (tx, ty)))
+        .flat_map(|(tx, ty)| {
+            (0..cc).map(move |c| {
+                let mut s = [0.0f64; 6];
+                for ny in ty.saturating_sub(1)..(ty + 2).min(th) {
+                    for nx in tx.saturating_sub(1)..(tx + 2).min(tw) {
+                        s = add(s, at(nx, ny, c));
+                    }
+                }
+                (s, c)
+            })
+        })
+        .map(|(s, c)| fit(s).unwrap_or(global[c]))
+        .collect();
+    let ps = |tx: usize, ty: usize, c: usize| params[(ty * tw + tx) * cc + c];
+    par::chunks_mut(guide, w * ch, w * h >= common::PAR_MIN, |y, row| {
+        let fy = ((y as f32 + 0.5) / tile as f32 - 0.5).clamp(0.0, (th - 1) as f32);
+        let (y0, ay) = (fy.floor() as usize, fy - fy.floor());
+        let y1 = (y0 + 1).min(th - 1);
+        for x in 0..w {
+            if !hole[y * w + x] {
+                continue;
+            }
+            let fx = ((x as f32 + 0.5) / tile as f32 - 0.5).clamp(0.0, (tw - 1) as f32);
+            let (x0, ax) = (fx.floor() as usize, fx - fx.floor());
+            let x1 = (x0 + 1).min(tw - 1);
+            for c in 0..cc {
+                let lerp = |a: (f32, f32), b: (f32, f32), t: f32| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+                let (g, b) = lerp(lerp(ps(x0, y0, c), ps(x1, y0, c), ax), lerp(ps(x0, y1, c), ps(x1, y1, c), ax), ay);
+                let v = &mut row[x * ch + c];
+                *v = *v * g + b;
+            }
+        }
+    });
+}
+
+/// The completion, on the caller's pixels or a copy of them, guided or not: `Err` gives them
+/// back when there is nothing to copy from.
+#[allow(clippy::too_many_arguments)]
 fn complete_cow<'a>(
     w: usize,
     h: usize,
     ch: usize,
     img: Cow<'a, [f32]>,
     px: &'a [Px],
+    guide: Option<(&[f32], f32)>,
     p: &CompleteParams,
     ctl: &photocraft_raster::Interrupt,
 ) -> Result<Result<Vec<f32>, Cow<'a, [f32]>>, photocraft_raster::Cancelled> {
@@ -174,8 +333,10 @@ fn complete_cow<'a>(
     }
     let r = p.patch_radius.max(1);
     let psz = 2 * r + 1;
-    let Pyramid { mut levels, boxes, exts, thin } = build_pyramid(Level { w, h, img, px: Cow::Borrowed(px) }, ch, hb0, psz, ctl)?;
+    let Pyramid { mut levels, boxes, exts, thin, thickness } = build_pyramid(Level { w, h, img, px: Cow::Borrowed(px) }, ch, hb0, psz, ctl)?;
     let nlev = levels.len();
+    // The guide at each level's size, finest first, and how much softer than that level it is.
+    let guides: Option<(Vec<Vec<f32>>, f32)> = guide.map(|(g, scale)| (guide_pyramid(g, w, h, ch, nlev), scale));
     // The coarser level's result.
     let mut prev: Option<Coarser> = None;
     let total_px: usize = levels.iter().map(|l| l.w * l.h).sum();
@@ -203,6 +364,15 @@ fn complete_cow<'a>(
         let coarser = prev.take();
         match &coarser {
             Some(c) => copy_up_coarser(&mut limg, &lpx, lw, ch, hb, c),
+            // Guided: the hole starts as the guide.
+            None if guides.as_ref().is_some_and(|(g, _)| g[li].len() == limg.len()) => {
+                let g = guides.as_ref().map_or(&[][..], |(g, _)| &g[li][..]);
+                for (i, k) in lpx.iter().enumerate() {
+                    if *k == Px::Hole {
+                        limg[i * ch..(i + 1) * ch].copy_from_slice(&g[i * ch..(i + 1) * ch]);
+                    }
+                }
+            }
             // A thin hole, when peeling it would take too long, takes the membrane below: a few
             // patches thick here, a membrane across it is its surroundings.
             None if sources.len() > 0 && (!thin || peel_affordable(lw, &lpx, hb, sources.len())) => {
@@ -210,6 +380,13 @@ fn complete_cow<'a>(
             }
             None => fill_hole_with_membrane(&mut limg, &lpx, (lw, lh, ch), r, thin),
         }
+        // A guided fill's guide at this level, and how many of this level's pixels soft it is.
+        let steer = guides.is_some() && !p.layout_only;
+        let guide_here: Option<(&[f32], usize)> = guides
+            .as_ref()
+            .filter(|_| steer)
+            .filter(|(g, _)| g[li].len() == limg.len())
+            .map(|(g, scale)| (&g[li][..], (scale / (1u64 << li.min(63)) as f32).ceil().max(1.0) as usize));
         if sources.len() == 0 {
             prev = Some(Coarser { w: lw, h: lh, img: limg, field: Vec::new(), cells });
             continue;
@@ -218,12 +395,47 @@ fn complete_cow<'a>(
         let n_targets = cells.len();
         // Source moments are worth keeping when there are few sources for the matches tried.
         let keep_source_moments = lw * lh <= SOURCE_MOMENTS_MAX && sources.len() <= n_targets.saturating_mul(if refine_only { 4 } else { 64 });
+        let reach = if p.nearby { (thickness.max(NEARBY_MIN) >> li).max(2 * psz) } else { 0 };
+        // A nearby fill's rows, and a fallback source for each block; at the same depth, rows
+        // from the horizon (the picture's top without one).
+        let depth = p.nearby.then(|| {
+            if p.same_depth {
+                let horizon = match &p.horizon {
+                    // The given horizon at this level's size.
+                    Some(hz) if hz.len() == w => (0..lw)
+                        .map(|x| {
+                            let sx = ((x as f32 + 0.5) * w as f32 / lw as f32) as usize;
+                            hz[sx.min(w - 1)] * lh as f32 / h as f32
+                        })
+                        .collect(),
+                    _ => solver::horizon_line(&limg, &lpx, lw, lh, ch).unwrap_or_default(),
+                };
+                let mut d = Depth::new(&valid, lw, lh, reach, p.patch_radius as i32, SAME_DEPTH_PER_ROW, &horizon);
+                if !horizon.is_empty() {
+                    d.sky = solver::SkyRule::new(&limg, &lpx, lw, lh, ch, |x| d.horizon_at(x), p.patch_radius, reach);
+                }
+                d
+            } else {
+                Depth::new(&valid, lw, lh, reach, reach as i32, 0.0, &[])
+            }
+        });
+        ctl.check()?;
         let mut solver = Solver {
             w: lw,
             h: lh,
             ch,
             r: ri,
             img: &mut limg,
+            guide: guide_here,
+            mimg: None,
+            coherence: if steer { GUIDED_COHERENCE } else { 0.0 },
+            // Nearby, too: the pieces stay sharp, not a blend of near misses that greys their
+            // colours (green sage turned brown); blended only against the picture.
+            stamp: steer || p.nearby,
+            blend_edge: p.nearby && !steer,
+            reach: reach as i32,
+            depth,
+            uses: (p.nearby && li >= NEARBY_REUSE_FROM).then(|| Uses::new(lw, lh, psz, NEARBY_REUSE)),
             px: &lpx,
             valid,
             cells,
@@ -233,6 +445,7 @@ fn complete_cow<'a>(
             adapt: p.adapt,
             ctl: *ctl,
         };
+        solver.refresh_match();
         solver.prepare(keep_source_moments);
         ctl.check()?;
         // NNF init: the coarser level's matches scaled up where they land on a valid source,
@@ -244,6 +457,7 @@ fn complete_cow<'a>(
         let mut cost = vec![f32::INFINITY; n_targets];
         // A finer level starts from the coarse matches voted with its own (sharp) pixels.
         if upsampled {
+            solver.count_uses(&nnf);
             solver.costs(&nnf, &mut cost)?;
             solver.vote(&nnf, &cost);
         }
@@ -257,7 +471,7 @@ fn complete_cow<'a>(
         let pm_iters = if refine_only { 1 } else { p.pm_iters };
         let full_search = (lw.max(lh)) as i32;
         for it in 0..em {
-            // Costs change as hole pixels are re-estimated: refresh before each PatchMatch.
+            solver.count_uses(&nnf);
             solver.costs(&nnf, &mut cost)?;
             // Wide random search on the coarsest level and on each level's first iteration,
             // local refinement afterwards.
@@ -268,8 +482,13 @@ fn complete_cow<'a>(
             } else {
                 (4 * psz as i32).min(full_search)
             };
+            // Nearby: nothing farther is taken, so nothing farther is searched.
+            let radius = if solver.reach > 0 { radius.min(solver.reach) } else { radius };
             for pass in 0..pm_iters {
                 ctl.check()?;
+                if pass > 0 {
+                    solver.count_uses(&nnf);
+                }
                 solver.patchmatch(&mut nnf, &mut cost, pass + it * pm_iters, p.seed.wrapping_add((li * 1000 + it) as u64), radius);
             }
             ctl.check()?;
@@ -297,6 +516,8 @@ struct Pyramid<'a> {
     exts: Vec<usize>,
     /// The hole is a thin one: its thickness, not its length, decides how deep to go.
     thin: bool,
+    /// The hole's thickness at full size.
+    thickness: usize,
 }
 
 /// Shrinks the image until the hole is about four patches across (a deeper pyramid decides the
@@ -329,7 +550,39 @@ fn build_pyramid<'a>(
         ext = ext.div_ceil(2);
         exts.push(ext);
     }
-    Ok(Pyramid { levels, boxes, exts, thin })
+    Ok(Pyramid { levels, boxes, exts, thin, thickness })
+}
+
+/// A `w × h × ch` guide at each of `levels` pyramid levels, finest first: halved as the pyramid
+/// halves the picture (each cell the mean of its 2 × 2 pixels within the grid).
+fn guide_pyramid(g: &[f32], w: usize, h: usize, ch: usize, levels: usize) -> Vec<Vec<f32>> {
+    let mut out = vec![g.to_vec()];
+    let (mut cw, mut chh) = (w, h);
+    while out.len() < levels {
+        let cur = &out[out.len() - 1];
+        let (nw, nh) = (cw.div_ceil(2), chh.div_ceil(2));
+        let mut next = vec![0.0f32; nw * nh * ch];
+        par::chunks_mut(&mut next, nw * ch, nw * nh >= common::PAR_MIN, |y, row| {
+            for x in 0..nw {
+                let mut n = 0.0f32;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (sx, sy) = (2 * x + dx, 2 * y + dy);
+                    if sx < cw && sy < chh {
+                        for c in 0..ch {
+                            row[x * ch + c] += cur[(sy * cw + sx) * ch + c];
+                        }
+                        n += 1.0;
+                    }
+                }
+                for v in &mut row[x * ch..(x + 1) * ch] {
+                    *v /= n;
+                }
+            }
+        });
+        out.push(next);
+        (cw, chh) = (nw, nh);
+    }
+    out
 }
 
 /// The level's own pixels to fill: the caller's, or a copy made in parallel.

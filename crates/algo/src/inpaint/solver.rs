@@ -12,6 +12,32 @@ pub(super) struct Solver<'a> {
     pub(super) ch: usize,
     pub(super) r: i32,
     pub(super) img: &'a mut Vec<f32>,
+    /// A guided fill's guide at this level and how many pixels soft it is here
+    /// ([`Solver::refresh_match`]); `None` unguided.
+    pub(super) guide: Option<(&'a [f32], usize)>,
+    /// What patches are compared on when guided ([`Solver::m`]): the picture with the guide in
+    /// the hole, softened ([`Solver::refresh_match`]).
+    pub(super) mimg: Option<Vec<f32>>,
+    /// How much PatchMatch favours coherent matches: a match its left or upper neighbour's
+    /// shifted by one is taken over a better one unless that is better by this share (0: the best
+    /// wins). A guided fill sets it, so neighbouring pixels copy one piece of the picture and the
+    /// vote stamps it rather than averaging many pieces that match a soft guide about equally.
+    pub(super) coherence: f32,
+    /// A guided fill's vote stamps: each pixel takes the best match covering it (the highest
+    /// weight) rather than the mean of all of them, so the copies stay sharp. Off unguided.
+    pub(super) stamp: bool,
+    /// With [`Self::stamp`]: a pixel within a patch of the picture around the hole is still the
+    /// mean, so a stamped fill blends into the picture rather than meeting it at a hard edge.
+    pub(super) blend_edge: bool,
+    /// A nearby fill's reach at this level ([`CompleteParams::nearby`]): sources at most this
+    /// many pixels from their target across and down; 0 anywhere.
+    pub(super) reach: i32,
+    /// A nearby fill at the same depth ([`CompleteParams::same_depth`]): how far up or down
+    /// each target may copy from.
+    pub(super) depth: Option<Depth>,
+    /// A nearby fill's count of how often each part of the picture is copied: a part copied
+    /// more than once costs more for the next target ([`Uses`]).
+    pub(super) uses: Option<Uses>,
     pub(super) px: &'a [Px],
     /// Valid source centres: the whole patch is inside the grid and may be copied from.
     pub(super) valid: Vec<bool>,
@@ -63,6 +89,120 @@ pub(crate) fn fit(a: Adapt, n: f32, st: f32, stt: f32, ss: f32, sss: f32) -> (f3
 }
 
 impl Solver<'_> {
+    /// The pixels patches are compared on: the match image of a guided fill, else the picture.
+    #[inline]
+    pub(super) fn m(&self) -> &[f32] {
+        self.mimg.as_deref().unwrap_or(&self.img[..])
+    }
+
+    /// A guided fill's match image: the picture with the guide in the hole, softened by a box
+    /// reaching twice the guide's softness (at least 2 px), so a match agrees with the guide in
+    /// the large and is free in the small. Softened less, a shrub in a source patch still showed
+    /// as a dark spot the guide's flat ground lacks, so sources without shrubs won and the fill
+    /// had half the photo's structure; at twice, the fill is as textured as the photo. Compared sharp, a soft guide matched smooth sources best (a
+    /// road, a haze) and the fill came out smeared; softened on both sides, a ground of shrubs
+    /// matches the guide's soft ground as well as a road does, and the fill copies shrubs. The
+    /// picture outside the hole never changes and the guide is fixed, so it is worked out once
+    /// per level. Nothing unguided.
+    pub(super) fn refresh_match(&mut self) {
+        let Some((guide, soft)) = self.guide else { return };
+        if self.mimg.is_some() {
+            return;
+        }
+        let (w, h, ch, px) = (self.w, self.h, self.ch, self.px);
+        let img = &self.img[..];
+        let r = (2 * soft).max(2);
+        let row = w * ch;
+        let mut m = vec![0.0f32; img.len()];
+        par::chunks_mut(&mut m, row.max(1), w * h >= PAR_MIN_PATCHES, |y, out| {
+            // Column sums over the rows in reach, then the mean along the row.
+            let (y0, y1) = (y.saturating_sub(r), (y + r + 1).min(h));
+            let mut cols = vec![0.0f32; row];
+            for yy in y0..y1 {
+                for x in 0..w {
+                    let i = yy * w + x;
+                    let from = if px[i] == Px::Hole { guide } else { img };
+                    for (c, v) in cols[x * ch..(x + 1) * ch].iter_mut().zip(&from[i * ch..(i + 1) * ch]) {
+                        *c += *v;
+                    }
+                }
+            }
+            let rows = (y1 - y0) as f32;
+            for x in 0..w {
+                let (x0, x1) = (x.saturating_sub(r), (x + r + 1).min(w));
+                let k = 1.0 / ((x1 - x0) as f32 * rows);
+                for c in 0..ch {
+                    out[x * ch + c] = (x0..x1).map(|xx| cols[xx * ch + c]).sum::<f32>() * k;
+                }
+            }
+        });
+        self.mimg = Some(m);
+    }
+
+    /// Whether target `t` may copy source `s`: within reach of it, for a nearby fill, and at
+    /// about its depth, for one at the same depth.
+    #[inline]
+    pub(super) fn allowed(&self, t: (i32, i32), s: (i32, i32)) -> bool {
+        self.reach <= 0
+            || ((s.0 - t.0).abs() <= self.reach
+                && self.depth_step(t, s).abs() <= self.rows_of(t)
+                && self.depth.as_ref().and_then(|d| d.sky.as_ref()).is_none_or(|k| k.allows(t, s, self.w)))
+    }
+
+    /// What copying `s` costs on top of the patch distance: [`Uses::factor`], 1 without.
+    #[inline]
+    fn uses_factor(&self, s: (i32, i32)) -> f32 {
+        self.uses.as_ref().map_or(1.0, |u| u.factor(s))
+    }
+
+    /// The patch distance of copying `s` to target `t`, times what copying `s` costs
+    /// ([`Self::uses_factor`]); past `limit` it may stop early, returning more than `limit`.
+    #[inline]
+    fn cost_of(&self, t: (i32, i32), k: usize, s: (i32, i32), limit: f32) -> f32 {
+        let f = self.uses_factor(s);
+        if f == 1.0 { self.dist(t, k, s, limit) } else { self.dist(t, k, s, limit / f) * f }
+    }
+
+    /// Counts how often each part of the picture is copied by `nnf` (with [`Self::uses`]).
+    pub(super) fn count_uses(&mut self, nnf: &[(i32, i32)]) {
+        if let Some(u) = &mut self.uses {
+            u.count(nnf.get(..self.cells.len()).unwrap_or(nnf));
+        }
+    }
+
+    /// How far source `s` is from target `t` in depth, in rows: at the same depth, how much
+    /// farther from the horizon (along a tilted or curved one, at each's own column); else rows.
+    #[inline]
+    fn depth_step(&self, t: (i32, i32), s: (i32, i32)) -> i32 {
+        self.depth.as_ref().map_or(s.1 - t.1, |d| (s.1 - d.horizon_at(s.0)) - (t.1 - d.horizon_at(t.0)))
+    }
+
+    /// How many rows up or down target `t` may copy from (a nearby fill's).
+    #[inline]
+    fn rows_of(&self, t: (i32, i32)) -> i32 {
+        self.depth.as_ref().map_or(self.reach, |d| d.rows(t).min(self.reach))
+    }
+
+    /// A source `t` may copy ([`Self::allowed`]): one of 8 random tries, else the one found
+    /// ahead for its block ([`Depth::fallback`]).
+    fn within_reach(&self, t: (i32, i32), rng: &mut Rng) -> Option<(i32, i32)> {
+        let (r, rows) = (self.reach, self.rows_of(t));
+        for _ in 0..8 {
+            let x = t.0 + rng.range(-r, r);
+            let along = self.depth.as_ref().map_or(0, |d| d.horizon_at(x) - d.horizon_at(t.0));
+            let cand = (x, t.1 + along + rng.range(-rows, rows));
+            if self.is_valid(cand.0, cand.1) && self.allowed(t, cand) {
+                return Some(cand);
+            }
+        }
+        // The block's fallback, shifted with the target in the block, so a block of targets left
+        // on it copies a block of texture rather than one pixel, flat.
+        let s = self.depth.as_ref().and_then(|d| d.fallback(t))?;
+        let b = DEPTH_BLOCK as i32;
+        let shifted = (s.0 + t.0.rem_euclid(b) - b / 2, s.1 + t.1.rem_euclid(b) - b / 2);
+        Some(if self.is_valid(shifted.0, shifted.1) { shifted } else { s })
+    }
+
     #[inline]
     pub(super) fn is_valid(&self, x: i32, y: i32) -> bool {
         x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h && self.valid[y as usize * self.w + x as usize]
@@ -95,7 +235,7 @@ impl Solver<'_> {
         if !keep_source_moments {
             return;
         }
-        let (ch, img, valid, ctl) = (self.ch, &*self.img, &self.valid, &self.ctl);
+        let (ch, img, valid, ctl) = (self.ch, self.m(), &self.valid, &self.ctl);
         let mut smom = vec![[0.0f32; 2]; w * h * c8];
         par::chunks_mut(&mut smom, w * c8, w * h >= PAR_MIN_PATCHES, |y, out| {
             if ctl.cancelled() {
@@ -124,6 +264,7 @@ impl Solver<'_> {
 
     /// [`Solver::dist`] without adaptation, of a patch that may be clipped.
     pub(super) fn dist_clipped(&self, t: (i32, i32), s: (i32, i32), cutoff: f32) -> f32 {
+        let img = self.m();
         let (w, h, ch, r) = (self.w as i32, self.h as i32, self.ch, self.r);
         let full = ((2 * r + 1) * (2 * r + 1)) as f32 * ch as f32;
         let mut sum = 0.0f32;
@@ -142,7 +283,7 @@ impl Solver<'_> {
                 let ti = (ty as usize * self.w + tx as usize) * ch;
                 let si = (sy as usize * self.w + (s.0 + dx) as usize) * ch;
                 for c in 0..ch {
-                    let d = self.img[ti + c] - self.img[si + c];
+                    let d = img[ti + c] - img[si + c];
                     sum += d * d;
                 }
                 n += ch;
@@ -159,6 +300,7 @@ impl Solver<'_> {
     /// (infinity) as soon as the sum shows the patch is worse than `cutoff`, which the sum, only
     /// growing, can show after any pixel: the caller only asks whether it is better.
     pub(super) fn dist_full(&self, t: (i32, i32), s: (i32, i32), cutoff: f32) -> f32 {
+        let img = self.m();
         let (w, ch, r) = (self.w, self.ch, self.r);
         let side = (2 * r + 1) as usize;
         let full = ((2 * r + 1) * (2 * r + 1)) as f32 * ch as f32;
@@ -167,7 +309,7 @@ impl Solver<'_> {
         for dy in -r..=r {
             let ti = ((t.1 + dy) as usize * w + (t.0 - r) as usize) * ch;
             let si = ((s.1 + dy) as usize * w + (s.0 - r) as usize) * ch;
-            for (tp, sp) in self.img[ti..ti + span].chunks_exact(ch).zip(self.img[si..si + span].chunks_exact(ch)) {
+            for (tp, sp) in img[ti..ti + span].chunks_exact(ch).zip(img[si..si + span].chunks_exact(ch)) {
                 for (a, b) in tp.iter().zip(sp) {
                     let d = a - b;
                     sum += d * d;
@@ -183,6 +325,7 @@ impl Solver<'_> {
     /// Moments of the target patch at `t` and the source patch at `s` per channel:
     /// `[Σt, Σt², Σs, Σs², Σts]`, and the sample count.
     pub(super) fn moments(&self, t: (i32, i32), s: (i32, i32), m: &mut [[f32; 5]]) -> usize {
+        let img = self.m();
         let (w, h, ch, r) = (self.w as i32, self.h as i32, self.ch, self.r);
         m.iter_mut().for_each(|v| *v = [0.0; 5]);
         let mut n = 0usize;
@@ -200,7 +343,7 @@ impl Solver<'_> {
                 let ti = (ty as usize * self.w + tx as usize) * ch;
                 let si = (sy as usize * self.w + (s.0 + dx) as usize) * ch;
                 for (c, mc) in m.iter_mut().enumerate().take(ch) {
-                    let (a, b) = (self.img[ti + c], self.img[si + c]);
+                    let (a, b) = (img[ti + c], img[si + c]);
                     mc[0] += a;
                     mc[1] += a * a;
                     mc[2] += b;
@@ -217,6 +360,7 @@ impl Solver<'_> {
     /// sums kept from [`Solver::costs`], the source's from [`Solver::prepare`] when kept, each
     /// summed in the same order as there.
     pub(super) fn moments_full(&self, k: usize, t: (i32, i32), s: (i32, i32), m: &mut [[f32; 5]]) {
+        let img = self.m();
         let (w, ch, r) = (self.w, self.ch, self.r);
         let c8 = m.len();
         let side = (2 * r + 1) as usize;
@@ -226,7 +370,7 @@ impl Solver<'_> {
         for dy in -r..=r {
             let ti = ((t.1 + dy) as usize * w + (t.0 - r) as usize) * ch;
             let si = ((s.1 + dy) as usize * w + (s.0 - r) as usize) * ch;
-            let (trow, srow) = (&self.img[ti..ti + side * ch], &self.img[si..si + side * ch]);
+            let (trow, srow) = (&img[ti..ti + side * ch], &img[si..si + side * ch]);
             if sm.is_some() {
                 for (tp, sp) in trow.chunks_exact(ch).zip(srow.chunks_exact(ch)) {
                     for c in 0..c8 {
@@ -297,7 +441,7 @@ impl Solver<'_> {
     /// windows around the best (two numbers from `rng` per window).
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    fn pm_step(
+    pub(super) fn pm_step(
         &self,
         t: (i32, i32),
         k: usize,
@@ -309,31 +453,45 @@ impl Solver<'_> {
         search_radius: i32,
     ) -> ((i32, i32), f32) {
         let (mut best, mut bc) = cur;
+        // Nearby: a match out of reach (a random start, a coarser level's) is replaced by one
+        // within it: a random one, or the nearest when the hole leaves few to pick from.
+        if !self.allowed(t, best)
+            && let Some(cand) = self.within_reach(t, rng)
+        {
+            (best, bc) = (cand, self.cost_of(t, k, cand, f32::INFINITY));
+        }
+        // A coherent match (a neighbour's, shifted) counts as `favour` times better than it is.
+        let favour = 1.0 + self.coherence;
+        let mut coherent = false;
         if let Some(c) = left {
             let cand = (c.0 + step, c.1);
-            if self.is_valid(cand.0, cand.1) && cand != best {
-                let d = self.dist(t, k, cand, bc);
-                if d < bc {
-                    (best, bc) = (cand, d);
+            coherent |= cand == best;
+            if self.is_valid(cand.0, cand.1) && cand != best && self.allowed(t, cand) {
+                let d = self.cost_of(t, k, cand, bc * favour);
+                if d < bc * favour {
+                    (best, bc, coherent) = (cand, d, true);
                 }
             }
         }
         if let Some(c) = up {
             let cand = (c.0, c.1 + step);
-            if self.is_valid(cand.0, cand.1) && cand != best {
-                let d = self.dist(t, k, cand, bc);
-                if d < bc {
-                    (best, bc) = (cand, d);
+            coherent |= cand == best;
+            if self.is_valid(cand.0, cand.1) && cand != best && self.allowed(t, cand) {
+                let lim = if coherent { bc } else { bc * favour };
+                let d = self.cost_of(t, k, cand, lim);
+                if d < lim {
+                    (best, bc, coherent) = (cand, d, true);
                 }
             }
         }
         let mut rad = search_radius;
         while rad >= 1 {
             let cand = (best.0 + rng.range(-rad, rad), best.1 + rng.range(-rad, rad));
-            if self.is_valid(cand.0, cand.1) && cand != best {
-                let d = self.dist(t, k, cand, bc);
-                if d < bc {
-                    (best, bc) = (cand, d);
+            if self.is_valid(cand.0, cand.1) && cand != best && self.allowed(t, cand) {
+                let lim = if coherent { bc / favour } else { bc };
+                let d = self.cost_of(t, k, cand, lim);
+                if d < lim {
+                    (best, bc, coherent) = (cand, d, false);
                 }
             }
             rad /= 2;
@@ -533,7 +691,7 @@ impl Solver<'_> {
             let c8 = ch.min(MOM_CH);
             let side = 2 * r + 1;
             let mut tmom = std::mem::take(&mut self.tmom);
-            let (img, full, ctl) = (&*self.img, &self.full, &self.ctl);
+            let (img, full, ctl) = (self.m(), &self.full, &self.ctl);
             self.cells.rows_mut(&mut tmom, c8, par, |y, runs, out| {
                 if ctl.cancelled() {
                     return;
@@ -554,7 +712,7 @@ impl Solver<'_> {
             }
             let base = runs[0].k;
             for ((i, x), c) in row_cells(runs).enumerate().zip(co.iter_mut()) {
-                *c = this.dist((x as i32, y as i32), base + i, nnf[base + i], f32::INFINITY);
+                *c = this.cost_of((x as i32, y as i32), base + i, nnf[base + i], f32::INFINITY);
             }
         });
         self.ctl.check()
@@ -619,7 +777,19 @@ impl Solver<'_> {
         let per = ch + 1;
         let mut out = vec![0.0f32; n * per];
         {
-            let votes = Votes { w, h, ch, r: r as usize, cells: &self.cells, img: &*self.img, wt: &wt, src: &src, gb: &gb };
+            let votes = Votes {
+                w,
+                h,
+                ch,
+                r: r as usize,
+                cells: &self.cells,
+                img: &*self.img,
+                wt: &wt,
+                src: &src,
+                gb: &gb,
+                stamp: self.stamp,
+                blend_edge: self.blend_edge.then_some(self.px),
+            };
             let (px, ctl) = (self.px, &self.ctl);
             self.cells.rows_mut(&mut out, per, par, |y, runs, orow| {
                 if ctl.cancelled() {
@@ -671,6 +841,11 @@ struct Votes<'a> {
     wt: &'a [f32],
     src: &'a [isize],
     gb: &'a [(f32, f32)],
+    /// Each pixel from the best match covering it ([`Solver::stamp`]), not the mean.
+    stamp: bool,
+    /// The pixel roles, when a pixel a patch of the picture covers takes the mean anyway
+    /// ([`Solver::blend_edge`]).
+    blend_edge: Option<&'a [Px]>,
 }
 
 impl Votes<'_> {
@@ -697,6 +872,8 @@ impl Votes<'_> {
         let (w, r) = (self.w, self.r);
         let mut acc = [0.0f32; CH];
         let mut wsum = 0.0f32;
+        let mut best = (0.0f32, [0.0f32; CH]);
+        let mut picture = false;
         for ty in y.saturating_sub(r)..=(y + r).min(self.h - 1) {
             let dy = ty as isize - y as isize;
             self.each_in(ty, x.saturating_sub(r), (x + r).min(w - 1), |k, tx| {
@@ -707,17 +884,26 @@ impl Votes<'_> {
                 // The pixel of the match's patch that lands here.
                 let si = (self.src[k] - dy * w as isize - (tx as isize - x as isize)) as usize * CH;
                 let s = &self.img[si..si + CH];
+                let mut v = [0.0f32; CH];
                 for c in 0..CH {
-                    let v = if ADAPT {
+                    v[c] = if ADAPT {
                         let (g, b) = self.gb[k * CH + c];
                         g * s[c] + b
                     } else {
                         s[c]
                     };
-                    acc[c] += v * wt;
+                    acc[c] += v[c] * wt;
                 }
+                if self.stamp && wt > best.0 {
+                    best = (wt, v);
+                }
+                picture |= self.blend_edge.is_some_and(|px| px[ty * w + tx] != Px::Hole);
                 wsum += wt;
             });
+        }
+        if self.stamp && wsum > 0.0 && !picture {
+            out[..CH].copy_from_slice(&best.1);
+            return true;
         }
         if wsum > 0.0 {
             for (d, a) in out.iter_mut().zip(&acc) {
@@ -733,6 +919,8 @@ impl Votes<'_> {
         let (w, r, ch) = (self.w, self.r, self.ch);
         let mut acc = vec![0.0f32; ch];
         let mut wsum = 0.0f32;
+        let (mut best_wt, mut best) = (0.0f32, vec![0.0f32; ch]);
+        let mut picture = false;
         for ty in y.saturating_sub(r)..=(y + r).min(self.h - 1) {
             let dy = ty as isize - y as isize;
             self.each_in(ty, x.saturating_sub(r), (x + r).min(w - 1), |k, tx| {
@@ -741,6 +929,10 @@ impl Votes<'_> {
                     return;
                 }
                 let si = (self.src[k] - dy * w as isize - (tx as isize - x as isize)) as usize * ch;
+                let stamp = self.stamp && wt > best_wt;
+                if stamp {
+                    best_wt = wt;
+                }
                 for (c, a) in acc.iter_mut().enumerate() {
                     let v = if adapted {
                         let (g, b) = self.gb[k * ch + c];
@@ -749,9 +941,17 @@ impl Votes<'_> {
                         self.img[si + c]
                     };
                     *a += v * wt;
+                    if stamp {
+                        best[c] = v;
+                    }
                 }
+                picture |= self.blend_edge.is_some_and(|px| px[ty * w + tx] != Px::Hole);
                 wsum += wt;
             });
+        }
+        if self.stamp && wsum > 0.0 && !picture {
+            out.copy_from_slice(&best);
+            return true;
         }
         if wsum > 0.0 {
             for (d, a) in out.iter_mut().zip(&acc) {
@@ -880,4 +1080,429 @@ pub(super) fn least_sum(v: f32, n: f32, strict: bool) -> f32 {
         e = e.next_up();
     }
     e
+}
+
+/// Where a nearby fill copies from, up and down ([`CompleteParams::nearby`](super::CompleteParams::nearby)),
+/// and a source it can always fall back on.
+///
+/// At the same depth ([`CompleteParams::same_depth`](super::CompleteParams::same_depth)): in a
+/// landscape the distance goes with the height in the picture, so a target copies from about
+/// its own rows, and a far, finer stretch of ground never lands in a near one. How many rows
+/// grows with the target's distance from the horizon, as in perspective: just below it a row
+/// spans much more ground than at the bottom, close by (and the sky's clouds the same, above).
+/// A target with no source within reach in its own rows (deep in a hole along the bottom) may
+/// go as far again up or down as the nearest rows that have one, twice over.
+pub(super) struct Depth {
+    /// Rows up or down any target may go.
+    least: i32,
+    /// And per row from the horizon: a target `d` rows from it may go `d * per_row` rows.
+    per_row: f32,
+    /// The horizon's row in each column ([`horizon_line`]); none: the picture's top.
+    horizon: Vec<i32>,
+    /// Per block of [`DEPTH_BLOCK`] px: rows to the nearest rows with a source within reach of
+    /// all its pixels, and one such source (x < 0: none in its columns).
+    to_sources: Vec<(u16, (i32, i32))>,
+    /// Blocks across.
+    bw: usize,
+    /// Above the horizon: which targets may take clouds ([`SkyRule`]); none below or without
+    /// a clear sky.
+    pub(super) sky: Option<SkyRule>,
+}
+
+/// The block [`Depth`] measures in, px.
+const DEPTH_BLOCK: usize = 8;
+
+impl Depth {
+    /// `valid`: the level's valid sources, `w` by `h`; `reach`: the fill's reach there; `least`,
+    /// `per_row` and `horizon` (a row per column, or none): the rows up or down a target may go
+    /// ([`Depth`]).
+    pub(super) fn new(valid: &[bool], w: usize, h: usize, reach: usize, least: i32, per_row: f32, horizon: &[f32]) -> Self {
+        let (bw, bh) = (w.div_ceil(DEPTH_BLOCK), h.div_ceil(DEPTH_BLOCK));
+        const NONE: (i32, i32) = (-1, -1);
+        // A fallback lies inside the sources by more than a block's shift where its block's
+        // rows have such a source, so the block copies the picture's texture, not its outermost
+        // pixels (a frayed edge): the first source met going in was the edge's own pixel.
+        let away = super::levels::dilate_mask(&valid.iter().map(|v| !*v).collect::<Vec<_>>(), w, h, DEPTH_BLOCK / 2 + 1);
+        let inner: Vec<bool> = valid.iter().zip(&away).map(|(v, a)| *v && !*a).collect();
+        // A source in each block's rows within reach of all its pixels, if any (and one inside).
+        let mut found = vec![NONE; bw * bh];
+        let mut inside = vec![NONE; bw * bh];
+        let first = |row: &[bool], next: &mut [usize]| {
+            // next[x]: the first valid column at or after x.
+            next[w] = usize::MAX;
+            for x in (0..w).rev() {
+                next[x] = if row[x] { x } else { next[x + 1] };
+            }
+        };
+        let (mut next, mut next_in) = (vec![usize::MAX; w + 1], vec![usize::MAX; w + 1]);
+        for (y, (row, row_in)) in valid.chunks_exact(w).zip(inner.chunks_exact(w)).enumerate().take(h) {
+            first(row, &mut next);
+            first(row_in, &mut next_in);
+            for bx in 0..bw {
+                let k = (y / DEPTH_BLOCK) * bw + bx;
+                let (x0, x1) = (bx * DEPTH_BLOCK, ((bx + 1) * DEPTH_BLOCK).min(w));
+                let (a, b) = ((x1 - 1).saturating_sub(reach), (x0 + reach + 1).min(w));
+                if a >= b {
+                    continue;
+                }
+                if found[k] == NONE && next[a] < b {
+                    found[k] = (next[a] as i32, y as i32);
+                }
+                if inside[k] == NONE && next_in[a] < b {
+                    inside[k] = (next_in[a] as i32, y as i32);
+                }
+            }
+        }
+        for (f, i) in found.iter_mut().zip(&inside) {
+            if *f != NONE && *i != NONE {
+                *f = *i;
+            }
+        }
+        // Blocks to the nearest such block up or down, in rows, with its source.
+        let mut to_sources = vec![(u16::MAX, NONE); bw * bh];
+        for bx in 0..bw {
+            let mut d = (u16::MAX, NONE);
+            for by in 0..bh {
+                d = if found[by * bw + bx] != NONE { (0, found[by * bw + bx]) } else { (d.0.saturating_add(1), d.1) };
+                to_sources[by * bw + bx] = d;
+            }
+            d = (u16::MAX, NONE);
+            for by in (0..bh).rev() {
+                d = if found[by * bw + bx] != NONE { (0, found[by * bw + bx]) } else { (d.0.saturating_add(1), d.1) };
+                let k = &mut to_sources[by * bw + bx];
+                if d.0 < k.0 {
+                    *k = d;
+                }
+            }
+        }
+        for k in &mut to_sources {
+            k.0 = k.0.saturating_mul(DEPTH_BLOCK as u16);
+        }
+        let horizon = horizon.iter().map(|v| v.round() as i32).collect();
+        Self { least: least.max(1), per_row, horizon, to_sources, bw, sky: None }
+    }
+
+    #[inline]
+    fn block(&self, t: (i32, i32)) -> Option<&(u16, (i32, i32))> {
+        self.to_sources.get((t.1.max(0) as usize / DEPTH_BLOCK) * self.bw + t.0.max(0) as usize / DEPTH_BLOCK)
+    }
+
+    /// The horizon's row at column `x` (the nearest column's off the picture; 0 without one).
+    #[inline]
+    pub(super) fn horizon_at(&self, x: i32) -> i32 {
+        self.horizon.get((x.max(0) as usize).min(self.horizon.len().saturating_sub(1))).copied().unwrap_or(0)
+    }
+
+    /// Rows up or down target `t` may copy from: a few at the horizon, so its line runs on
+    /// unbroken, more the farther from it (up into the sky as down over the ground).
+    #[inline]
+    pub(super) fn rows(&self, t: (i32, i32)) -> i32 {
+        let off = ((t.1 - self.horizon_at(t.0)).abs() as f32 * self.per_row) as i32;
+        off.max(self.least) + 2 * i32::from(self.block(t).map_or(0, |b| b.0))
+    }
+
+    /// A valid source within reach of `t` and within its rows, found ahead.
+    #[inline]
+    pub(super) fn fallback(&self, t: (i32, i32)) -> Option<(i32, i32)> {
+        self.block(t).map(|b| b.1).filter(|s| s.0 >= 0)
+    }
+}
+
+/// Sky and cloud are told apart only when their mean blueness (blue less red) is this far
+/// apart.
+const SKY_SPLIT: f32 = 0.025;
+/// The blueness [`SkyRule`] measures, from -this to this.
+const SKY_BLUE_RANGE: f32 = 0.25;
+/// The block [`SkyRule`] counts the hole's edge in, px.
+const SKY_BLOCK: usize = 8;
+
+/// Above the horizon a nearby fill at the same depth goes on with the clouds where the hole's
+/// edge is mostly cloud (a cloud cut by much of its size, a bank of clouds along a border), and
+/// makes no new ones elsewhere: there a target copies only sky, away from any cloud. A cloud's
+/// top grazing the border got a slab of cloud above it, copied up from it; a dome over each cut
+/// was tried and came out as a flat disc of cloud.
+pub(super) struct SkyRule {
+    /// Targets that copy only sky.
+    sky_only: Vec<bool>,
+    /// Sources within a patch of a cloud.
+    near_cloud: Vec<bool>,
+}
+
+impl SkyRule {
+    /// From the known pixels above `horizon_at` (a row per column) in `img` (`w` × `h`, `ch`
+    /// channels, RGB first): sky and cloud split by blueness ([`SKY_SPLIT`]). `r`: the patch
+    /// radius; `reach`: how far a target looks along the hole's edge, each way. `None` without
+    /// a clear split, or with no target held to sky.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(img: &[f32], px: &[Px], w: usize, h: usize, ch: usize, horizon_at: impl Fn(i32) -> i32, r: usize, reach: usize) -> Option<Self> {
+        if ch < 3 || w == 0 || h == 0 {
+            return None;
+        }
+        let top: Vec<usize> = (0..w).map(|x| horizon_at(x as i32).clamp(0, h as i32) as usize).collect();
+        // Blueness, 0..256: clouds are grey or white, the sky blue (brightness doesn't tell a
+        // cloud's shadowed grey from the sky's light low down).
+        let blue = |i: usize| (((img[i * ch + 2] - img[i * ch]) / SKY_BLUE_RANGE + 1.0) * 128.0).clamp(0.0, 255.0);
+        // Otsu's split of the known pixels' blueness above the horizon.
+        let mut hist = [0u64; 256];
+        for (x, &t) in top.iter().enumerate() {
+            for y in 0..t {
+                let i = y * w + x;
+                if matches!(px[i], Px::Source | Px::Known) {
+                    hist[blue(i) as usize] += 1;
+                }
+            }
+        }
+        let total: u64 = hist.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let all: f64 = hist.iter().enumerate().map(|(b, n)| b as f64 * *n as f64).sum();
+        let (mut n0, mut s0, mut best) = (0u64, 0f64, (0usize, -1f64, 0f64, 0f64));
+        for (b, n) in hist.iter().enumerate().take(255) {
+            n0 += n;
+            s0 += b as f64 * *n as f64;
+            let n1 = total - n0;
+            if n0 == 0 || n1 == 0 {
+                continue;
+            }
+            let (m0, m1) = (s0 / n0 as f64, (all - s0) / n1 as f64);
+            let between = n0 as f64 * n1 as f64 * (m1 - m0) * (m1 - m0);
+            if between > best.1 {
+                best = (b, between, m0, m1);
+            }
+        }
+        let (cut, _, m0, m1) = best;
+        if (m1 - m0) / 128.0 * f64::from(SKY_BLUE_RANGE) < f64::from(SKY_SPLIT) {
+            return None;
+        }
+        let cut = cut as f32 + 1.0;
+        let above = |i: usize| i / w < top[i % w];
+        let cloud: Vec<bool> = (0..w * h).map(|i| matches!(px[i], Px::Source | Px::Known) && above(i) && blue(i) < cut).collect();
+        // The hole's edge above the horizon: known pixels beside a hole pixel.
+        let edge = |i: usize| {
+            let (x, y) = (i % w, i / w);
+            matches!(px[i], Px::Source | Px::Known)
+                && above(i)
+                && ((x > 0 && px[i - 1] == Px::Hole)
+                    || (x + 1 < w && px[i + 1] == Px::Hole)
+                    || (y > 0 && px[i - w] == Px::Hole)
+                    || (y + 1 < h && px[i + w] == Px::Hole))
+        };
+        let is_edge: Vec<bool> = (0..w * h).map(edge).collect();
+        // Per block: the edge's pixels and its cloud's, summed (2D prefix sums over blocks).
+        let (bw, bh) = (w.div_ceil(SKY_BLOCK), h.div_ceil(SKY_BLOCK));
+        let mut sum = vec![(0u32, 0u32); (bw + 1) * (bh + 1)];
+        for i in 0..w * h {
+            if is_edge[i] {
+                let k = (i / w / SKY_BLOCK + 1) * (bw + 1) + i % w / SKY_BLOCK + 1;
+                sum[k].0 += 1;
+                sum[k].1 += u32::from(cloud[i]);
+            }
+        }
+        for by in 1..=bh {
+            for bx in 1..=bw {
+                let (l, u, ul) = (sum[by * (bw + 1) + bx - 1], sum[(by - 1) * (bw + 1) + bx], sum[(by - 1) * (bw + 1) + bx - 1]);
+                let k = &mut sum[by * (bw + 1) + bx];
+                k.0 += l.0 + u.0 - ul.0;
+                k.1 += l.1 + u.1 - ul.1;
+            }
+        }
+        let kb = reach / (4 * SKY_BLOCK) + 1;
+        let mostly_cloud = |x: usize, y: usize| {
+            let (bx, by) = (x / SKY_BLOCK, y / SKY_BLOCK);
+            let (x0, y0, x1, y1) = (bx.saturating_sub(kb), by.saturating_sub(kb), (bx + kb + 1).min(bw), (by + kb + 1).min(bh));
+            let at = |x: usize, y: usize| sum[y * (bw + 1) + x];
+            let (a, b, c, d) = (at(x1, y1), at(x0, y1), at(x1, y0), at(x0, y0));
+            let edge = a.0 + d.0 - b.0 - c.0;
+            let cl = a.1 + d.1 - b.1 - c.1;
+            edge > 0 && 2 * cl >= edge
+        };
+        let sky_only: Vec<bool> = (0..w * h).map(|i| px[i] == Px::Hole && above(i) && !mostly_cloud(i % w, i / w)).collect();
+        if !sky_only.iter().any(|s| *s) {
+            return None;
+        }
+        let near_cloud = super::levels::dilate_mask(&cloud, w, h, r + 1);
+        Some(Self { sky_only, near_cloud })
+    }
+
+    /// Whether target `t` may copy source `s` (`w` across).
+    #[inline]
+    pub(super) fn allows(&self, t: (i32, i32), s: (i32, i32), w: usize) -> bool {
+        let at = |p: (i32, i32)| p.1 as usize * w + p.0 as usize;
+        !(self.sky_only.get(at(t)).copied().unwrap_or(false) && self.near_cloud.get(at(s)).copied().unwrap_or(false))
+    }
+}
+
+/// The horizon of a landscape as a row per column, for [`Depth`]: [`horizon`] over the whole
+/// picture, then per strip of columns the row that best splits the known pixels within a
+/// quarter of the picture's height of it; strips with too few known pixels there, or no clear
+/// split, take their neighbours' (in between, a straight line; past the last, the same row).
+/// `None` without a clear horizon over the whole picture.
+pub(super) fn horizon_line(img: &[f32], px: &[Px], w: usize, h: usize, ch: usize) -> Option<Vec<f32>> {
+    let whole = horizon(img, px, w, h, ch)? as usize;
+    let sw = (w / 24).clamp(16.min(w), w.max(1));
+    let (y0, y1) = (whole.saturating_sub(h / 4), (whole + h / 4).min(h));
+    let strips = w.div_ceil(sw);
+    let mut at: Vec<Option<f32>> = vec![None; strips];
+    for (k, a) in at.iter_mut().enumerate() {
+        let (x0, x1) = (k * sw, ((k + 1) * sw).min(w));
+        let mut rows = vec![(0u32, 0u32); y1 - y0];
+        let mut lum = vec![0f32; y1 - y0];
+        for ((r, l), y) in rows.iter_mut().zip(lum.iter_mut()).zip(y0..y1) {
+            for x in x0..x1 {
+                let i = y * w + x;
+                if px[i] != Px::Hole {
+                    let p = &img[i * ch..i * ch + 3];
+                    r.0 += 1;
+                    r.1 += u32::from(p[2] > p[0] * 1.04 + 1e-4);
+                    *l += p[0] + p[1] + p[2];
+                }
+            }
+        }
+        let known: u32 = rows.iter().map(|r| r.0).sum();
+        if (known as usize) * 10 >= (x1 - x0) * (y1 - y0) * 3 {
+            *a = best_split(&rows).map(|y| (y0 + snap_to_edge(&rows, &lum, y)) as f32);
+        }
+    }
+    let known: Vec<(usize, f32)> = at.iter().enumerate().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
+    if known.is_empty() {
+        return Some(vec![whole as f32; w]);
+    }
+    let strip_row = |k: usize| -> f32 {
+        match known.binary_search_by_key(&k, |e| e.0) {
+            Ok(j) => known[j].1,
+            Err(0) => known[0].1,
+            Err(j) if j == known.len() => known[j - 1].1,
+            Err(j) => {
+                let ((ka, a), (kb, b)) = (known[j - 1], known[j]);
+                a + (b - a) * (k - ka) as f32 / (kb - ka) as f32
+            }
+        }
+    };
+    // Strip rows, a median of three against a stray strip; then a straight line between centres.
+    let raw: Vec<f32> = (0..strips).map(strip_row).collect();
+    let rows: Vec<f32> = (0..strips)
+        .map(|k| {
+            let mut t = [raw[k.saturating_sub(1)], raw[k], raw[(k + 1).min(strips - 1)]];
+            t.sort_by(f32::total_cmp);
+            t[1]
+        })
+        .collect();
+    Some(
+        (0..w)
+            .map(|x| {
+                let f = ((x as f32 + 0.5) / sw as f32 - 0.5).clamp(0.0, (strips - 1) as f32);
+                let (k, t) = (f.floor() as usize, f - f.floor());
+                rows[k] * (1.0 - t) + rows[(k + 1).min(strips - 1)] * t
+            })
+            .collect(),
+    )
+}
+
+/// Steps in brightness (the sum of the three channels, per pixel) the horizon snaps to, at least.
+const HORIZON_EDGE: f32 = 0.12;
+
+/// `row` moved to the sharpest drop in brightness (sky above, ground below) within a few percent
+/// of the strip's height of it: a dark ridge of the same grey as the haze above it doesn't split
+/// by colour at its top, and the line came out a hand below it. `lum`: the sum of each row's
+/// known pixels' brightness (`rows`' counts say how many).
+fn snap_to_edge(rows: &[(u32, u32)], lum: &[f32], row: usize) -> usize {
+    let n = rows.len();
+    let (k, reach) = ((n / 40).max(2), (n / 12).max(4));
+    let mean = |a: usize, b: usize| {
+        let (s, c) = (a..b.min(n)).fold((0f32, 0u32), |(s, c), y| (s + lum[y], c + rows[y].0));
+        (c > 0).then(|| s / c as f32)
+    };
+    let drop = |y: usize| match (mean(y.saturating_sub(k), y), mean(y, y + k)) {
+        (Some(up), Some(down)) => up - down,
+        _ => 0.0,
+    };
+    let best = (row.saturating_sub(reach).max(1)..(row + reach).min(n.saturating_sub(1))).max_by(|a, b| drop(*a).total_cmp(&drop(*b)));
+    best.filter(|y| drop(*y) >= HORIZON_EDGE).unwrap_or(row)
+}
+
+/// The row that best splits `rows` (known pixels, and how many look like sky) into sky above and
+/// ground from it on, where that fits at least three in four of them.
+fn best_split(rows: &[(u32, u32)]) -> Option<usize> {
+    let known: u64 = rows.iter().map(|r| u64::from(r.0)).sum();
+    let ground: u64 = rows.iter().map(|r| u64::from(r.0 - r.1)).sum();
+    if known == 0 {
+        return None;
+    }
+    let (mut fit, mut best) = (ground, (ground, 0usize));
+    for (y, r) in rows.iter().enumerate() {
+        fit = fit + u64::from(r.1) - u64::from(r.0 - r.1);
+        if fit > best.0 {
+            best = (fit, y + 1);
+        }
+    }
+    (best.0 * 4 >= known * 3 && best.1 > 0 && best.1 < rows.len()).then_some(best.1)
+}
+
+/// The row of the horizon in a landscape, for [`Depth`]: the row that best splits the known
+/// pixels into sky above (bluer than red, clouds included) and ground below (not). `None` when
+/// that split fits under three in four of them (no clear horizon), or the picture has no colour.
+pub(super) fn horizon(img: &[f32], px: &[Px], w: usize, h: usize, ch: usize) -> Option<f32> {
+    if ch < 3 {
+        return None;
+    }
+    // Per row: known pixels, and how many look like sky.
+    let mut rows = vec![(0u32, 0u32); h];
+    for (i, k) in px.iter().enumerate().take(w * h) {
+        if *k == Px::Hole {
+            continue;
+        }
+        let p = &img[i * ch..i * ch + 3];
+        let r = &mut rows[i / w];
+        r.0 += 1;
+        r.1 += u32::from(p[2] > p[0] * 1.04 + 1e-4);
+    }
+    best_split(&rows).map(|y| y as f32)
+}
+
+/// How often each part of the picture is copied, for a nearby fill: Classic takes whatever
+/// matches best, and in a hole along a border the same few pieces nearby match best again and
+/// again, in rows and streaks. Counted per block of a patch's size, from the matches of the pass
+/// before: a block copied about once (a stretch copied whole, one pixel each) costs nothing more;
+/// past that, each further copy of it costs [`Uses::weight`] times the patch distance more, so
+/// the search takes another part of the picture that matches nearly as well.
+pub(super) struct Uses {
+    /// The block side, px.
+    side: usize,
+    /// Blocks across.
+    bw: usize,
+    /// Targets copying from each block.
+    counts: Vec<u32>,
+    /// The extra cost of each copy past the first, as a share of the patch distance.
+    weight: f32,
+}
+
+impl Uses {
+    pub(super) fn new(w: usize, h: usize, side: usize, weight: f32) -> Self {
+        let side = side.max(1);
+        let bw = w.div_ceil(side);
+        Self { side, bw, counts: vec![0; bw * h.div_ceil(side)], weight }
+    }
+
+    pub(super) fn count(&mut self, nnf: &[(i32, i32)]) {
+        self.counts.fill(0);
+        for s in nnf {
+            if let Some(c) = self.block(*s).and_then(|k| self.counts.get_mut(k)) {
+                *c += 1;
+            }
+        }
+    }
+
+    #[inline]
+    fn block(&self, s: (i32, i32)) -> Option<usize> {
+        (s.0 >= 0 && s.1 >= 0).then(|| (s.1 as usize / self.side) * self.bw + s.0 as usize / self.side)
+    }
+
+    /// What copying `s` costs, times the patch distance: 1 for a block copied once or less.
+    #[inline]
+    pub(super) fn factor(&self, s: (i32, i32)) -> f32 {
+        let n = self.block(s).and_then(|k| self.counts.get(k)).copied().unwrap_or(0) as f32;
+        let once = (self.side * self.side) as f32;
+        1.0 + self.weight * (n / once - 1.0).max(0.0)
+    }
 }

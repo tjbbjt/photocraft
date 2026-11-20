@@ -5,6 +5,11 @@
 //! Transparency. The fields are the command's params, so `ui.dialog.set` / `ui.dialog.confirm`
 //! drive it like any dialog. OK remembers the choices in the preferences (`dialogs["edit.fill"]`),
 //! which are saved to disk, so the dialog opens with them again after a restart.
+//!
+//! A PhotoCraft features switch at the top: off (parity), the dialog and its fill are
+//! Photoshop's (`edit.fill`, on the spot); on, Content-Aware runs the Content-Aware Fill command
+//! in the background with the same sampling, and adds its fill methods (LaMa, MI-GAN, their mix, each optionally stamped with Classic)
+//! and the edge band that blends the fill into the picture.
 
 use serde_json::{Map, Value, json};
 
@@ -28,7 +33,32 @@ pub const CONTENTS: [(&str, &str); 9] = [
 ];
 
 /// Params the dialog edits and remembers.
-const KEYS: [&str; 7] = ["contents", "color", "pattern", "colorAdaptation", "mode", "opacity", "preserveTransparency"];
+const KEYS: [&str; 14] = [
+    "contents",
+    "color",
+    "pattern",
+    "colorAdaptation",
+    "mode",
+    "opacity",
+    "preserveTransparency",
+    "fillMode",
+    "method",
+    "detail",
+    "stamp",
+    "matchDepth",
+    "edgeGrow",
+    "edgeFeather",
+];
+
+/// Content-Aware's methods: (param, label).
+pub const METHODS: [(&str, &str); 5] =
+    [("classic", "Classic"), ("classicDepth", "Classic + Depth"), ("lama", "LaMa"), ("migan", "MI-GAN"), ("mix", "Mix (LaMa + MI-GAN)")];
+
+/// The edge band PhotoCraft starts with, in px: grown outright, then feathered.
+pub const EDGE_GROW: f64 = 2.0;
+pub const EDGE_FEATHER: f64 = 8.0;
+/// The most either may be (the engine's `Edge::MAX`).
+pub const EDGE_MAX: f64 = 256.0;
 
 /// Is this dialog the Fill dialog?
 pub fn owns(fields: &Map<String, Value>) -> bool {
@@ -47,7 +77,10 @@ fn valid(app: &PhotocraftApp, key: &str, v: &Value) -> bool {
         "mode" | "opacity" | "preserveTransparency" => crate::dialog_blend_ui::valid(key, v),
         "color" => v.as_str().is_some_and(|h| h.len() == 7 && h.starts_with('#') && h.get(1..).is_some_and(|d| d.chars().all(|c| c.is_ascii_hexdigit()))),
         "pattern" => v.as_str().is_some_and(|p| app.session.patterns.items.iter().any(|q| q.id == p)),
-        "colorAdaptation" => v.is_boolean(),
+        "colorAdaptation" | "detail" | "stamp" | "matchDepth" => v.is_boolean(),
+        "fillMode" => matches!(v.as_str(), Some("parity" | "photocraft")),
+        "method" => v.as_str().is_some_and(|m| METHODS.iter().any(|(k, _)| *k == m)),
+        "edgeGrow" | "edgeFeather" => v.as_f64().is_some_and(|n| (0.0..=EDGE_MAX).contains(&n)),
         _ => false,
     }
 }
@@ -64,6 +97,13 @@ pub fn default_fields(app: &PhotocraftApp) -> Map<String, Value> {
         f.insert("pattern".into(), json!(p.id));
     }
     f.insert("colorAdaptation".into(), json!(true));
+    f.insert("fillMode".into(), json!("photocraft"));
+    f.insert("method".into(), json!("classic"));
+    f.insert("detail".into(), json!(true));
+    f.insert("stamp".into(), json!(true));
+    f.insert("matchDepth".into(), json!(true));
+    f.insert("edgeGrow".into(), json!(EDGE_GROW));
+    f.insert("edgeFeather".into(), json!(EDGE_FEATHER));
     f.insert("mode".into(), json!("normal"));
     f.insert("opacity".into(), json!(100.0));
     f.insert("preserveTransparency".into(), json!(false));
@@ -138,6 +178,36 @@ pub fn params(f: &Map<String, Value>) -> Value {
     p
 }
 
+/// Content-Aware the PhotoCraft way: the Content-Aware Fill command's params (sampling the whole
+/// window, as Fill does), or `None` when Fill itself runs (Parity, other contents, or a target
+/// that is not layer pixels, which Fill refuses with its own message).
+pub fn photocraft_params(f: &Map<String, Value>) -> Option<Value> {
+    let get = |k: &str| f.get(k).and_then(Value::as_str);
+    if get("contents") != Some("contentAware") || get("fillMode").unwrap_or("photocraft") != "photocraft" {
+        return None;
+    }
+    if f.get("__target").is_some_and(|t| t.as_str() != Some("pixels")) {
+        return None;
+    }
+    let adapt = f.get("colorAdaptation").and_then(Value::as_bool).unwrap_or(true);
+    let px = |k: &str, d: f64| f.get(k).and_then(Value::as_f64).unwrap_or(d).clamp(0.0, EDGE_MAX).round();
+    let mut p = json!({
+        "sampling": "rectangular",
+        "colorAdaptation": if adapt { "default" } else { "none" },
+        "method": get("method").unwrap_or("classic"),
+        "detail": f.get("detail").and_then(Value::as_bool).unwrap_or(true),
+        "stamp": f.get("stamp").and_then(Value::as_bool).unwrap_or(true),
+        "matchDepth": f.get("matchDepth").and_then(Value::as_bool).unwrap_or(true),
+        "edgeGrow": px("edgeGrow", EDGE_GROW),
+        "edgeFeather": px("edgeFeather", EDGE_FEATHER),
+        "output": "current",
+    });
+    if let Some(layer) = f.get("__layer").filter(|l| l.is_u64()) {
+        p["layer"] = layer.clone();
+    }
+    Some(p)
+}
+
 /// OK: remember the choices, then fill.
 pub fn confirm(app: &mut PhotocraftApp, f: &Map<String, Value>) -> Result<Value, String> {
     let st = app.session.active().ok_or(tl!("The document is closed"))?;
@@ -146,7 +216,10 @@ pub fn confirm(app: &mut PhotocraftApp, f: &Map<String, Value>) -> Result<Value,
     }
     let remembered: Map<String, Value> = KEYS.iter().filter_map(|k| f.get(*k).map(|v| (k.to_string(), v.clone()))).collect();
     app.session.prefs.edit(|p| p.dialogs.insert(COMMAND.into(), Value::Object(remembered)));
-    app.run(COMMAND, params(f))
+    match photocraft_params(f) {
+        Some(p) => app.run("edit.contentAwareFill", p),
+        None => app.run(COMMAND, params(f)),
+    }
 }
 
 /// Label column bounds for [`crate::widgets::label_column_width`]: the English labels' width, and a cap.
@@ -172,6 +245,7 @@ pub fn body(app: &PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Value>) 
     let label = |ui: &mut egui::Ui, text: &str| {
         crate::widgets::column_label(ui, text, label_w);
     };
+    let photocraft = get_str(f, "fillMode", "photocraft") == "photocraft";
     let mut contents = get_str(f, "contents", "foreground");
     ui.horizontal(|ui| {
         label(ui, tl!("Contents:"));
@@ -219,10 +293,102 @@ pub fn body(app: &PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Value>) 
                     f.insert("colorAdaptation".into(), json!(on));
                 }
             });
+            if photocraft {
+                content_aware_body(ui, f, &label);
+            }
         }
         _ => {}
     }
-    crate::dialog_blend_ui::body(ui, f, "fill", label_w);
+    // The Content-Aware Fill command fills at full strength into the layer: Blending is Fill's.
+    let blending = photocraft_params(f).is_none();
+    ui.add_enabled_ui(blending, |ui| crate::dialog_blend_ui::body(ui, f, "fill", label_w));
+    if !blending {
+        ui.label(egui::RichText::new(tl!("Blending applies to Parity fills.")).color(Tokens::get(ui.ctx()).text_faint).size(11.0));
+    }
+    // At the bottom left: PhotoCraft's additions, or the dialog as Photoshop has it.
+    ui.add_space(6.0);
+    let mut on = photocraft;
+    if behavior_switch(ui, &mut on)
+        .on_hover_text(tl!("PhotoCraft: Content-Aware gets fill methods and the edge band, and runs in the background. Parity: Fill as in Photoshop."))
+        .changed()
+    {
+        f.insert("fillMode".into(), json!(if on { "photocraft" } else { "parity" }));
+    }
+}
+
+/// PhotoCraft's switch between its own behaviour (left) and Photoshop's (Parity, right); a click
+/// on the switch flips it, a click on a side picks that side. Edit › Fill and the Content-Aware
+/// Fill workspace share it.
+pub fn behavior_switch(ui: &mut egui::Ui, photocraft: &mut bool) -> egui::Response {
+    let t = Tokens::get(ui.ctx());
+    ui.horizontal(|ui| {
+        let side = |ui: &mut egui::Ui, text: &str, on: bool| {
+            ui.add(egui::Label::new(egui::RichText::new(text).color(if on { t.text } else { t.text_dim })).sense(egui::Sense::click()))
+        };
+        let left = side(ui, tl!("PhotoCraft"), *photocraft);
+        let (rect, switch) = ui.allocate_exact_size(egui::vec2(34.0, 18.0), egui::Sense::click());
+        let how = ui.ctx().animate_bool(switch.id, !*photocraft);
+        ui.painter().rect_filled(rect, 9.0, if *photocraft { t.accent } else { t.field_border });
+        let x = egui::lerp((rect.left() + 9.0)..=(rect.right() - 9.0), how);
+        ui.painter().circle_filled(egui::pos2(x, rect.center().y), 7.0, egui::Color32::WHITE);
+        let right = side(ui, tl!("Parity"), !*photocraft);
+        let was = *photocraft;
+        if left.clicked() {
+            *photocraft = true;
+        }
+        if right.clicked() {
+            *photocraft = false;
+        }
+        if switch.clicked() {
+            *photocraft = !was;
+        }
+        let mut r = left.union(switch).union(right);
+        if *photocraft != was {
+            r.mark_changed();
+        }
+        r
+    })
+    .inner
+}
+
+/// PhotoCraft's Content-Aware options: the method and the edge band.
+fn content_aware_body(ui: &mut egui::Ui, f: &mut Map<String, Value>, label: &dyn Fn(&mut egui::Ui, &str)) {
+    let mut method = get_str(f, "method", "classic");
+    ui.horizontal(|ui| {
+        label(ui, tl!("Method:"));
+        let opts: Vec<(String, &str)> = METHODS.iter().map(|(k, l)| (k.to_string(), *l)).collect();
+        if crate::widgets::dropdown(ui, "fill-method", tl!("Method:"), &mut method, &opts, 170.0) {
+            f.insert("method".into(), json!(method));
+        }
+    });
+    // Stamping always rebuilds the detail: Classic fills around the model's layout.
+    let model = !matches!(method.as_str(), "classic" | "classicDepth");
+    let stamp = f.get("stamp").and_then(Value::as_bool).unwrap_or(true);
+    for (key, name, enabled) in [
+        ("stamp", tl!("Stamp with Classic"), model),
+        ("matchDepth", tl!("Match Depth"), model && stamp),
+        ("detail", tl!("Rebuild Detail from the Photo"), model && !stamp),
+    ] {
+        ui.horizontal(|ui| {
+            label(ui, "");
+            // Classic + Depth always matches depth: shown ticked whatever the setting.
+            let mut on = (key == "matchDepth" && method == "classicDepth") || f.get(key).and_then(Value::as_bool).unwrap_or(true);
+            ui.add_enabled_ui(enabled, |ui| {
+                if crate::widgets::checkbox(ui, &mut on, name).changed() {
+                    f.insert(key.into(), json!(on));
+                }
+            });
+        });
+    }
+    for (key, name, default) in [("edgeGrow", tl!("Edge Grow:"), EDGE_GROW), ("edgeFeather", tl!("Edge Feather:"), EDGE_FEATHER)] {
+        ui.horizontal(|ui| {
+            label(ui, name);
+            let mut v = f.get(key).and_then(Value::as_f64).unwrap_or(default) as f32;
+            if crate::widgets::value_field(ui, &mut v, 0.0..=EDGE_MAX as f32, "px", 64.0).accessible_name(name).changed() {
+                f.insert(key.into(), json!(f64::from(v.round())));
+            }
+        });
+    }
 }
 
 #[cfg(test)]

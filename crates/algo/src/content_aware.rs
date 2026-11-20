@@ -50,11 +50,26 @@ pub struct FillOptions {
     /// Add a horizontally mirrored source copy.
     pub mirror: bool,
     pub seed: u64,
+    /// Copy only from near each hole pixel ([`crate::inpaint::CompleteParams::nearby`]).
+    pub nearby: bool,
+    /// A guided fill's guide only lays the hole out ([`crate::inpaint::CompleteParams::layout_only`]).
+    pub layout_only: bool,
+    /// A nearby fill copies at the same depth ([`crate::inpaint::CompleteParams::same_depth`]).
+    pub same_depth: bool,
 }
 
 impl Default for FillOptions {
     fn default() -> Self {
-        Self { color_adaptation: color_level("default"), rotations: Vec::new(), scale: false, mirror: false, seed: 1 }
+        Self {
+            color_adaptation: color_level("default"),
+            rotations: Vec::new(),
+            scale: false,
+            mirror: false,
+            seed: 1,
+            nearby: false,
+            layout_only: false,
+            same_depth: false,
+        }
     }
 }
 
@@ -261,7 +276,14 @@ fn fill_cow(
     if !hole.iter().any(|h| *h) {
         return Ok(img.into_owned());
     }
-    let params = CompleteParams { seed: opts.seed, adapt: opts.color_adaptation, ..Default::default() };
+    let params = CompleteParams {
+        seed: opts.seed,
+        adapt: opts.color_adaptation,
+        nearby: opts.nearby,
+        layout_only: opts.layout_only,
+        same_depth: opts.same_depth,
+        ..Default::default()
+    };
     let gap = 2 * params.patch_radius + 2;
     let ok: Vec<bool> = par::map(w * h, true, |i| !hole[i] && source[i]);
     let src = Src { w, h, ch, img: &img, ok: &ok };
@@ -360,6 +382,183 @@ fn fill_cow(
             }
             None => membrane_fill_with(w, h, ch, &img, hole, ctl)?,
         },
+    };
+    ctl.check()?;
+    ctl.progress(1.0);
+    Ok(out)
+}
+
+/// A fill in pieces is cut into squares this share of the window's longer side ([`fill_in_pieces`]),
+const PIECE_SHARE: usize = 8;
+/// within these sizes, px.
+const PIECE_MIN: usize = 512;
+const PIECE_MAX: usize = 4096;
+/// The margin around a piece filled with it (1 / this of the piece's side).
+const PIECE_MARGIN: usize = 4;
+
+/// [`fill_owned`] a piece at a time, as a fill of the whole border of a panorama is best done by
+/// hand: the hole cut into squares ([`PIECE_SHARE`] of the longer side), each filled from its own
+/// sampling window ([`sampling_window`] of the piece, as a selection of just that piece would
+/// sample), in turn, the pieces already filled kept as they are around the next (not copied
+/// from), the hole not yet filled left out of it. Filled whole, every piece of the border chose
+/// from the whole picture, and a strip of snow, the trees, the far shore or the end of a pier
+/// took what matched best from anywhere, where a fill by pieces takes what is around it. Every
+/// piece measures its depth from the whole picture's horizon. A hole within one square is
+/// filled whole. No rotated, scaled or mirrored copies.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_in_pieces(
+    w: usize,
+    h: usize,
+    ch: usize,
+    mut img: Vec<f32>,
+    hole: &[bool],
+    source: &[bool],
+    opts: &FillOptions,
+    ctl: &photocraft_raster::Interrupt,
+) -> Result<Vec<f32>, photocraft_raster::Cancelled> {
+    assert_eq!(img.len(), w * h * ch);
+    assert_eq!(hole.len(), w * h);
+    assert_eq!(source.len(), w * h);
+    let cell = (w.max(h) / PIECE_SHARE).clamp(PIECE_MIN, PIECE_MAX);
+    let (cw, chh) = (w.div_ceil(cell), h.div_ceil(cell));
+    // Each square's hole pixels: their bounds.
+    let mut bounds: Vec<Option<(usize, usize, usize, usize)>> = vec![None; cw * chh];
+    for (i, _) in hole.iter().enumerate().filter(|(_, h)| **h) {
+        let (x, y) = (i % w, i / w);
+        let b = &mut bounds[(y / cell) * cw + x / cell];
+        *b = Some(match *b {
+            None => (x, y, x + 1, y + 1),
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1)),
+        });
+    }
+    let pieces: Vec<(usize, (usize, usize, usize, usize))> = bounds.iter().enumerate().filter_map(|(k, b)| b.map(|b| (k, b))).collect();
+    if pieces.len() <= 1 {
+        return fill_owned(w, h, ch, img, hole, source, opts, ctl);
+    }
+    let params = CompleteParams {
+        seed: opts.seed,
+        adapt: opts.color_adaptation,
+        nearby: opts.nearby,
+        layout_only: opts.layout_only,
+        same_depth: opts.same_depth,
+        ..Default::default()
+    };
+    let horizon = if opts.same_depth { crate::inpaint::horizon_line(&img, hole, w, h, ch) } else { None };
+    let canvas = Rect::new(0, 0, w as i32, h as i32);
+    let mut filled = vec![false; w * h];
+    let total = pieces.len();
+    for (done, &(k, (bx0, by0, bx1, by1))) in pieces.iter().enumerate() {
+        ctl.check()?;
+        let win = sampling_window(Rect::new(bx0 as i32, by0 as i32, bx1 as i32, by1 as i32), canvas);
+        let (wx, wy, ww, wh) = (win.x0 as usize, win.y0 as usize, win.width() as usize, win.height() as usize);
+        let in_piece = |x: usize, y: usize| (y / cell) * cw + x / cell == k;
+        // The piece's square and a margin: hole there, not filled yet, is filled with the piece
+        // (and dropped after) so that the piece has the picture's context at its seams.
+        let (sx0, sy0) = ((k % cw) * cell, (k / cw) * cell);
+        let margin = cell / PIECE_MARGIN;
+        let near_piece = |x: usize, y: usize| x + margin >= sx0 && x < sx0 + cell + margin && y + margin >= sy0 && y < sy0 + cell + margin;
+        let mut sub = vec![0.0f32; ww * wh * ch];
+        let mut roles = vec![Px::Known; ww * wh];
+        let mut piece = vec![false; ww * wh];
+        for y in 0..wh {
+            let (gy, row) = (wy + y, (wy + y) * w);
+            sub[y * ww * ch..(y + 1) * ww * ch].copy_from_slice(&img[(row + wx) * ch..(row + wx + ww) * ch]);
+            for x in 0..ww {
+                let (gx, g, d) = (wx + x, row + wx + x, y * ww + x);
+                roles[d] = if hole[g] && in_piece(gx, gy) {
+                    piece[d] = true;
+                    Px::Hole
+                } else if hole[g] && !filled[g] && near_piece(gx, gy) {
+                    Px::Hole
+                } else if hole[g] && !filled[g] {
+                    Px::Void
+                } else if !filled[g] && source[g] {
+                    Px::Source
+                } else {
+                    Px::Known
+                };
+            }
+        }
+        let p = CompleteParams { horizon: horizon.as_ref().map(|hz| hz[wx..wx + ww].iter().map(|r| r - wy as f32).collect()), ..params.clone() };
+        let cancel = || ctl.cancelled();
+        let progress = |f: f32| ctl.progress((done as f32 + f) / total as f32);
+        let inner = photocraft_raster::Interrupt::new(&cancel, &progress);
+        let out = match complete_masked_owned(ww, wh, ch, sub, &roles, &p, &inner)? {
+            Ok(out) => out,
+            // Nothing to copy from around this piece: a membrane over it and what isn't filled.
+            Err(sub) => {
+                let open: Vec<bool> = roles.iter().map(|r| matches!(r, Px::Hole | Px::Void)).collect();
+                membrane_fill_with(ww, wh, ch, &sub, &open, ctl)?
+            }
+        };
+        for y in 0..wh {
+            for x in 0..ww {
+                if piece[y * ww + x] {
+                    let (d, g) = (y * ww + x, (wy + y) * w + wx + x);
+                    img[g * ch..(g + 1) * ch].copy_from_slice(&out[d * ch..(d + 1) * ch]);
+                    filled[g] = true;
+                }
+            }
+        }
+    }
+    ctl.progress(1.0);
+    Ok(img)
+}
+
+/// [`fill_owned`] guided by `guide` (the window's size, `ch` channels): a model's fill of the
+/// hole, scaled up `scale` times. The guide decides what goes where; the fill copies pieces of the
+/// sampling area into that layout at full sharpness (see `inpaint::complete_guided_owned`). No
+/// rotated, scaled or mirrored copies. With nothing to sample from, the hole takes the guide.
+#[allow(clippy::too_many_arguments)]
+pub fn fill_guided_owned(
+    w: usize,
+    h: usize,
+    ch: usize,
+    img: Vec<f32>,
+    hole: &[bool],
+    source: &[bool],
+    guide: &[f32],
+    scale: f32,
+    opts: &FillOptions,
+    ctl: &photocraft_raster::Interrupt,
+) -> Result<Vec<f32>, photocraft_raster::Cancelled> {
+    assert_eq!(img.len(), w * h * ch);
+    assert_eq!(guide.len(), img.len());
+    assert_eq!(hole.len(), w * h);
+    assert_eq!(source.len(), w * h);
+    if !hole.iter().any(|h| *h) {
+        return Ok(img);
+    }
+    let params = CompleteParams {
+        seed: opts.seed,
+        adapt: opts.color_adaptation,
+        nearby: opts.nearby,
+        layout_only: opts.layout_only,
+        same_depth: opts.same_depth,
+        ..Default::default()
+    };
+    let roles: Vec<Px> = par::map(w * h, true, |i| {
+        if hole[i] {
+            Px::Hole
+        } else if source[i] {
+            Px::Source
+        } else {
+            Px::Known
+        }
+    });
+    let cancel = || ctl.cancelled();
+    let progress = |f: f32| ctl.progress(f * 0.99);
+    let inner = photocraft_raster::Interrupt::new(&cancel, &progress);
+    let out = match crate::inpaint::complete_guided_owned(w, h, ch, img, &roles, guide, scale, &params, &inner)? {
+        Ok(f) => f,
+        Err(mut img) => {
+            for (i, hh) in hole.iter().enumerate() {
+                if *hh {
+                    img[i * ch..(i + 1) * ch].copy_from_slice(&guide[i * ch..(i + 1) * ch]);
+                }
+            }
+            img
+        }
     };
     ctl.check()?;
     ctl.progress(1.0);

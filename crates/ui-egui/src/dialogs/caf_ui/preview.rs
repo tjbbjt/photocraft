@@ -40,6 +40,11 @@ pub(super) struct Preview {
     /// The base being worked out on a worker ([`start_base`]).
     #[cfg(not(target_arch = "wasm32"))]
     base_running: Option<BaseRun>,
+    /// When the running preview started, for the timer beside the spinner.
+    pub(super) started: Option<web_time::Instant>,
+    /// How long the last preview and the last Apply / OK fill took, s (shown in the panel).
+    pub(super) last_secs: Option<f32>,
+    pub(super) last_fill_secs: Option<f32>,
 }
 
 /// A base being worked out on a worker: its answer, its job (to cancel it), and what to do with it.
@@ -101,6 +106,12 @@ pub(super) fn plan_params(w: &CafWorkspace, strokes: bool) -> Value {
         "scale": o.scale,
         "mirror": o.mirror,
         "output": o.output,
+        "method": o.fill_method(),
+        "detail": o.detail,
+        "stamp": o.stamp,
+        "matchDepth": o.match_depth,
+        "edgeGrow": o.edge().0,
+        "edgeFeather": o.edge().1,
         "layer": w.layer.0,
         "fillEdits": w.fill_edits,
     });
@@ -359,12 +370,24 @@ pub(super) fn compute_preview(
     }
     let (w, h) = (plan.rect.width() as usize, plan.rect.height() as usize);
     let n = plan.fmt.channels();
+    // A fill model works on the whole window first (at its working size), so a preview of any
+    // size and the fill after it get the same model fill.
+    let started = std::time::Instant::now();
+    let guide = photocraft_engine::edit_menu_cmds::model_guide(&plan, ctl).map_err(|e| match e {
+        photocraft_engine::EngineError::Cancelled => "cancelled".to_string(),
+        e => e.to_string(),
+    })?;
+    // How long the model took, apart from the fill after it (near 0 when it kept its last fill).
+    if let Some(m) = &plan.model {
+        log::info!("content-aware preview ({}): model fill in {:.1} s", m.method, started.elapsed().as_secs_f32());
+    }
     let f = crate::filter_preview_ui::texture_factor(w as u32, h as u32, max_side) as usize;
     if f > 1 {
-        return reduced_preview(plan, f, ctl);
+        return reduced_preview(plan, f, guide, ctl);
     }
-    let filled =
-        photocraft_algo::content_aware::fill_with(w, h, n, &plan.img, &plan.hole, &plan.source, &plan.opts, ctl).map_err(|_| "cancelled".to_string())?;
+    let with = plan.model.as_ref().zip(guide.as_ref());
+    let filled = photocraft_engine::edit_menu_cmds::caf_fill(w, h, &plan.fmt, plan.img.clone(), &plan.hole, &plan.source, &plan.opts, with, ctl)
+        .map_err(|_| "cancelled".to_string())?;
     let own = plan.layer_pixels();
     // Pixel `i`: the fill over the fill area (a partly selected pixel by its coverage), the
     // layer's own pixels elsewhere.
@@ -414,13 +437,20 @@ pub(super) fn compute_preview(
 /// layer's own pixels and the fill coverage), the fill area where any of a block is in it, the
 /// sampling area where most of a block is and none of it is to be filled; then the fill at that
 /// size, one texel per block. The full-size plan is freed before the fill.
-fn reduced_preview(plan: photocraft_engine::edit_menu_cmds::CafPlan, f: usize, ctl: &photocraft_raster::Interrupt) -> Result<(Rect, egui::ColorImage), String> {
+fn reduced_preview(
+    plan: photocraft_engine::edit_menu_cmds::CafPlan,
+    f: usize,
+    guide: Option<photocraft_engine::edit_menu_cmds::ModelGuide>,
+    ctl: &photocraft_raster::Interrupt,
+) -> Result<(Rect, egui::ColorImage), String> {
     let (w, h) = (plan.rect.width() as usize, plan.rect.height() as usize);
     let n = plan.fmt.channels();
     let (rw, rh) = (w.div_ceil(f), h.div_ceil(f));
     struct Block {
         img: Vec<f32>,
-        /// The layer's own pixels, premultiplied RGBA.
+        /// The layer's own pixels the fill leaves (each weighted by how little of it is filled),
+        /// straight RGBA: a block on the fill area's edge blends the fill with the pixels beside
+        /// the area, not with the ones under it (black in a hole, which left a dark line).
         own: [f32; 4],
         hole: bool,
         source: bool,
@@ -430,7 +460,7 @@ fn reduced_preview(plan: photocraft_engine::edit_menu_cmds::CafPlan, f: usize, c
     let block = |j: usize| -> Block {
         let (bx, by) = (j % rw, j / rw);
         let mut img = vec![0.0f32; n];
-        let (mut own, mut count, mut sources, mut cover, mut hole) = ([0.0f32; 4], 0.0f32, 0usize, 0.0f32, false);
+        let (mut own, mut count, mut sources, mut cover, mut hole, mut kept) = ([0.0f32; 4], 0.0f32, 0usize, 0.0f32, false, 0.0f32);
         for y in by * f..((by + 1) * f).min(h) {
             for x in bx * f..((bx + 1) * f).min(w) {
                 let i = y * w + x;
@@ -438,10 +468,12 @@ fn reduced_preview(plan: photocraft_engine::edit_menu_cmds::CafPlan, f: usize, c
                     *a += v;
                 }
                 let o = photocraft_raster::to_rgba(&plan.fmt, &own_px[i * n..(i + 1) * n]);
+                let keep = 1.0 - plan.cover[i];
                 for (a, v) in own.iter_mut().zip(&o).take(3) {
-                    *a += v * o[3];
+                    *a += v * o[3] * keep;
                 }
-                own[3] += o[3];
+                own[3] += o[3] * keep;
+                kept += keep;
                 hole |= plan.hole[i];
                 sources += usize::from(plan.source[i]);
                 cover += plan.cover[i];
@@ -451,7 +483,7 @@ fn reduced_preview(plan: photocraft_engine::edit_menu_cmds::CafPlan, f: usize, c
         for a in &mut img {
             *a /= count;
         }
-        let own = if own[3] > 0.0 { [own[0] / own[3], own[1] / own[3], own[2] / own[3], own[3] / count] } else { [0.0; 4] };
+        let own = if own[3] > 0.0 { [own[0] / own[3], own[1] / own[3], own[2] / own[3], own[3] / kept] } else { [0.0; 4] };
         Block { img, own, hole, source: !hole && sources as f32 * 2.0 >= count, cover: cover / count }
     };
     // The web build has no thread pool.
@@ -462,7 +494,7 @@ fn reduced_preview(plan: photocraft_engine::edit_menu_cmds::CafPlan, f: usize, c
     };
     #[cfg(target_arch = "wasm32")]
     let blocks: Vec<Block> = (0..rw * rh).map(block).collect();
-    let (rect, fmt, opts) = (plan.rect, plan.fmt, plan.opts.clone());
+    let (rect, fmt, opts, model) = (plan.rect, plan.fmt, plan.opts.clone(), plan.model.clone());
     drop(plan);
     if ctl.cancelled() {
         return Err("cancelled".into());
@@ -475,7 +507,8 @@ fn reduced_preview(plan: photocraft_engine::edit_menu_cmds::CafPlan, f: usize, c
     if !source.iter().any(|s| *s) {
         return Err(NOTHING_TO_SAMPLE.into());
     }
-    let filled = photocraft_algo::content_aware::fill_owned(rw, rh, n, img, &hole, &source, &opts, ctl).map_err(|_| "cancelled".to_string())?;
+    let with = model.as_ref().zip(guide.as_ref());
+    let filled = photocraft_engine::edit_menu_cmds::caf_fill(rw, rh, &fmt, img, &hole, &source, &opts, with, ctl).map_err(|_| "cancelled".to_string())?;
     let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     let px = blocks
         .iter()
@@ -523,10 +556,18 @@ pub(super) fn drive_preview(app: &mut PhotocraftApp, ctx: &egui::Context, draggi
             Ok(r) => {
                 let generation = *generation;
                 pv.running = None;
+                let secs = pv.started.take().map(|t| t.elapsed().as_secs_f32());
                 if generation == pv.want {
                     match r {
                         Err(e) if e == "cancelled" => {}
-                        r => pv.finish(generation, r),
+                        r => {
+                            if let Some(secs) = secs {
+                                pv.last_secs = Some(secs);
+                                let how = if r.is_ok() { "done" } else { "failed" };
+                                log::info!("content-aware preview ({}): {how} in {secs:.1} s", w.opts.fill_method());
+                            }
+                            pv.finish(generation, r)
+                        }
                     }
                 }
             }
@@ -559,7 +600,10 @@ pub(super) fn drive_preview(app: &mut PhotocraftApp, ctx: &egui::Context, draggi
         repaint.request_repaint();
     });
     match spawned {
-        Ok(_) => w.preview.running = Some((generation, rx, job)),
+        Ok(_) => {
+            w.preview.running = Some((generation, rx, job));
+            w.preview.started = Some(web_time::Instant::now());
+        }
         Err(e) => w.preview.error = Some(format!("could not start the preview: {e}")),
     }
 }

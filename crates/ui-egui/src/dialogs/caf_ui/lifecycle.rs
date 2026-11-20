@@ -106,7 +106,7 @@ pub fn apply(app: &mut PhotocraftApp) -> Result<Value, String> {
         Ok(v) if v.get("pending").and_then(Value::as_bool) == Some(true) => {
             let job = v.get("job").and_then(Value::as_u64).map(JobId).ok_or("background Content-Aware Fill returned no job id")?;
             if let Some(w) = app.distort.caf.as_mut() {
-                w.pending_fill = Some(PendingFill { job, close_on_success: false });
+                w.pending_fill = Some(PendingFill { job, close_on_success: false, started: web_time::Instant::now() });
             }
         }
         Ok(_) => refresh(app),
@@ -151,6 +151,7 @@ pub(crate) fn on_job_event(app: &mut PhotocraftApp, e: &JobEvent) {
     let Some(w) = app.distort.caf.as_mut() else { return };
     let Some(pending) = w.pending_fill.filter(|p| p.job == e.id) else { return };
     w.pending_fill = None;
+    w.preview.last_fill_secs = Some(pending.started.elapsed().as_secs_f32());
     if e.document != Some(w.document) {
         return;
     }
@@ -340,6 +341,8 @@ pub(super) fn reset(app: &mut PhotocraftApp, what: &str) {
     let d = CafOpts::default();
     match what {
         "fill" => {
+            w.opts.edge_grow = d.edge_grow;
+            w.opts.edge_feather = d.edge_feather;
             w.opts.color_adaptation = d.color_adaptation;
             w.opts.rotation = d.rotation;
             w.opts.scale = d.scale;
