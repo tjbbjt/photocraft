@@ -233,31 +233,99 @@ pub(crate) fn layer_copy(doc: &Document, id: LayerId, add_copy: bool) -> Result<
 /// show, become one pixel layer in its place, named after it. Like Photoshop, the layer keeps the
 /// group's opacity, blend mode (Pass Through becomes Normal), clipping and locks; the group's mask
 /// and style are applied to the pixels.
+/// Layer › Merge Down: `upper` composited onto the layer right below it, into one raster layer
+/// in that layer's place. From the desktop app ([`Session::start`]) the pair is composited on a
+/// worker with the document locked (#210): on a 1.1-gigapixel storyboard that took 0.2–1.7 s on
+/// the UI thread, long enough on Wayland for the compositor to drop the window.
+pub(super) fn merge_down(s: &mut Session, upper: LayerId) -> Result<Value> {
+    let doc = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
+    let lower = layer_below(&doc, upper)?;
+    let label = "Merge Down";
+    crate::jobs::run(
+        s,
+        label,
+        true,
+        move |ctx| {
+            ctx.progress(0.0, label);
+            let below = doc.layer(lower).ok_or(EngineError::NoLayer(lower))?;
+            let above = doc.layer(upper).ok_or(EngineError::NoLayer(upper))?;
+            Ok(pixels::merge_down(&doc, below, above))
+        },
+        move |s, merged| {
+            s.edit(label, |doc, active| {
+                // The document was locked while the job ran, so the pair is where it was.
+                if layer_below(doc, upper)? != lower {
+                    return Err(EngineError::Other("the layers changed while they were merged".into()));
+                }
+                let at = doc.path_of(lower).ok_or(EngineError::NoLayer(lower))?;
+                doc.remove(upper);
+                *doc.layer_at_mut(&at).ok_or(EngineError::NoLayer(lower))? = merged;
+                *active = Some(lower);
+                Ok(())
+            })?;
+            Ok(Value::Null)
+        },
+    )
+}
+
+/// The layer right below `id` in its group: the one Merge Down merges it into.
+fn layer_below(doc: &Document, id: LayerId) -> Result<LayerId> {
+    let path = doc.path_of(id).ok_or(EngineError::NoLayer(id))?;
+    let Some((&idx, parent)) = path.split_last() else { return Err(EngineError::NoLayer(id)) };
+    if idx == 0 {
+        return Err(EngineError::Other("no layer below to merge into".into()));
+    }
+    let mut below = parent.to_vec();
+    below.push(idx - 1);
+    Ok(doc.layer_at(&below).ok_or(EngineError::NoLayer(id))?.id)
+}
+
+/// Layer › Merge Group: the group composited into one raster layer in its place. From the desktop
+/// app ([`Session::start`]) it is composited on a worker with the document locked, as Merge Down is.
 pub(super) fn merge_group(s: &mut Session, id: LayerId) -> Result<Value> {
-    s.edit("Merge Group", |doc, active| {
-        let group = doc.layer(id).ok_or(EngineError::NoLayer(id))?.clone();
-        if !group.visible {
-            return Err(EngineError::Other("the group is hidden".into()));
-        }
-        let fmt = doc.pixel_format();
-        let fmt = photocraft_color::PixelFormat::new(fmt.mode, fmt.sample, true);
-        let mut solo = group.clone();
-        solo.opacity = 1.0;
-        solo.blend = photocraft_doc::BlendMode::Normal;
-        solo.clipped = false;
-        let mut tmp = doc.clone();
-        tmp.layers = vec![solo];
-        let mut merged = Layer::new(group.name.clone(), LayerContent::Raster(pixels::composite_layers_uncropped(&tmp, fmt)));
-        merged.id = group.id;
-        merged.opacity = group.opacity;
-        merged.blend = if group.blend == photocraft_doc::BlendMode::PassThrough { photocraft_doc::BlendMode::Normal } else { group.blend };
-        merged.clipped = group.clipped;
-        merged.locks = group.locks;
-        *doc.layer_mut(id).ok_or(EngineError::NoLayer(id))? = merged;
-        *active = Some(id);
-        Ok(())
-    })?;
-    Ok(json!({ "layer": id.0 }))
+    let doc = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
+    if !doc.layer(id).ok_or(EngineError::NoLayer(id))?.visible {
+        return Err(EngineError::Other("the group is hidden".into()));
+    }
+    let label = "Merge Group";
+    crate::jobs::run(
+        s,
+        label,
+        true,
+        move |ctx| {
+            ctx.progress(0.0, label);
+            merged_group(&doc, id)
+        },
+        move |s, merged| {
+            s.edit(label, |doc, active| {
+                *doc.layer_mut(id).ok_or(EngineError::NoLayer(id))? = merged;
+                *active = Some(id);
+                Ok(())
+            })?;
+            Ok(json!({ "layer": id.0 }))
+        },
+    )
+}
+
+/// Group `id` of `doc` composited into one raster layer, with the group's id, opacity, blend mode,
+/// clipping and locks.
+fn merged_group(doc: &Document, id: LayerId) -> Result<Layer> {
+    let group = doc.layer(id).ok_or(EngineError::NoLayer(id))?.clone();
+    let fmt = doc.pixel_format();
+    let fmt = photocraft_color::PixelFormat::new(fmt.mode, fmt.sample, true);
+    let mut solo = group.clone();
+    solo.opacity = 1.0;
+    solo.blend = photocraft_doc::BlendMode::Normal;
+    solo.clipped = false;
+    let mut tmp = doc.clone();
+    tmp.layers = vec![solo];
+    let mut merged = Layer::new(group.name.clone(), LayerContent::Raster(pixels::composite_layers_uncropped(&tmp, fmt)));
+    merged.id = group.id;
+    merged.opacity = group.opacity;
+    merged.blend = if group.blend == photocraft_doc::BlendMode::PassThrough { photocraft_doc::BlendMode::Normal } else { group.blend };
+    merged.clipped = group.clipped;
+    merged.locks = group.locks;
+    Ok(merged)
 }
 
 #[cfg(test)]
