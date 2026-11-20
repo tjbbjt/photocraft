@@ -17,6 +17,13 @@ pub struct Stats {
     /// `None` unless [`Compositor::measure_gpu_time`] is on and a measurement has landed.
     /// Always `None` from [`Compositor::encode`], which submits nothing of its own.
     pub gpu_time: Option<timing::GpuTiming>,
+    /// Where a render's time went on the CPU, in milliseconds (zero in the browser): planning
+    /// the document, building effect maps, recording the page cells' chunks (with their uploads),
+    /// and submitting a huge refresh's intermediate batches and waiting for the previous one.
+    pub plan_ms: f32,
+    pub fx_ms: f32,
+    pub cells_ms: f32,
+    pub wait_ms: f32,
     pub passes: usize,
     pub chunks: usize,
     pub slots: u32,

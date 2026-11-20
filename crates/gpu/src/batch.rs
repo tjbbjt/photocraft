@@ -198,6 +198,7 @@ pub(crate) fn submit_batch(
         // One refresh, several command buffers: the measurement spans all of them.
         t.split(&mut done, encoder);
     }
+    let started = timing::cpu_now();
     let prev = last.replace(queue.submit([done.finish()]));
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(prev) = prev {
@@ -212,4 +213,5 @@ pub(crate) fn submit_batch(
     }
     #[cfg(target_arch = "wasm32")]
     let _ = (prev, health);
+    timing::add_wait(started);
 }
