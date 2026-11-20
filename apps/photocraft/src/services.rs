@@ -221,6 +221,19 @@ fn dialog_file_name(suggested: &str, adds_extension: bool) -> Option<String> {
     Some(if bare { stem.to_string_lossy().into_owned() } else { name })
 }
 
+/// The name the portal's Save dialog starts with: the stem, as [`dialog_file_name`] gives it,
+/// unless the suggested file (a full path) `exists`. Then the whole name, so the dialog asks about
+/// replacing that file as it is accepted. COSMIC's dialog returns the stem as it is; given its
+/// extension afterwards it named the existing file, and the dialog opened a second time to ask
+/// (`portal_save::save_as`): re-exporting Artboards to PDF over its last PDF showed the Save
+/// dialog twice.
+#[cfg(any(target_os = "linux", test))]
+fn portal_file_name(suggested: &str, exists: impl Fn(&Path) -> bool) -> Option<String> {
+    let path = Path::new(suggested);
+    let in_a_folder = path.parent().is_some_and(|dir| !dir.as_os_str().is_empty());
+    if in_a_folder && exists(path) { path.file_name().map(|n| n.to_string_lossy().into_owned()) } else { dialog_file_name(suggested, true) }
+}
+
 /// Shows an Open or Save dialog without blocking the event loop (#673, #574): rfd's async dialog
 /// is created here, on the main thread, with the window as its parent (a sheet on macOS, an owned
 /// modal window elsewhere), and a helper thread waits for it and hands the answer to the app.
@@ -277,7 +290,7 @@ fn show_file_dialog(request: FileDialogRequest, parent: Option<&eframe::Frame>, 
                 let parent = crate::portal_save::parent_id(parent.and_then(|p| p.window_handle().ok()).map(|h| h.as_raw()));
                 let req = crate::portal_save::SaveRequest {
                     parent,
-                    name: dialog_file_name(&suggested, true),
+                    name: portal_file_name(&suggested, |p| p.exists()),
                     suggested: Path::new(&suggested).file_name().map(|n| n.to_string_lossy().into_owned()),
                     folder: dir,
                     filters,
