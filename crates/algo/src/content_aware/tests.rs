@@ -151,6 +151,7 @@ fn adaptations_run_and_stay_deterministic() {
         nearby: false,
         layout_only: false,
         same_depth: false,
+        horizon: None,
     };
     let a = fill(w, h, 3, &rgb, &hole, &src, &opts);
     let b = fill(w, h, 3, &rgb, &hole, &src, &opts);
