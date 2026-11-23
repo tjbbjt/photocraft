@@ -1096,3 +1096,27 @@ fn a_stamped_model_fill_is_classic_nearby_around_the_models_layout() {
     assert_eq!(depth.opts.color_adaptation, photocraft_algo::inpaint::Adapt::NONE, "nearby fills adapt no colours");
     assert_ne!(classic.opts.color_adaptation, photocraft_algo::inpaint::Adapt::NONE, "Classic keeps its colour adaptation");
 }
+
+/// Horizon: Ruler Line needs the Ruler tool's line, nearer level than upright; the fill's
+/// horizon then runs along it (moved onto the window), and Auto finds its own.
+#[test]
+fn a_ruler_line_sets_the_horizon_of_a_fill_at_the_same_depth() {
+    let mut s = blob_session(8);
+    s.execute("select.rect", json!({"x": 24, "y": 16, "width": 16, "height": 16})).unwrap();
+    let id = s.active().unwrap().active_layer.unwrap();
+    let ruler = json!({"method": "classicDepth", "horizon": "ruler"});
+    let err = content_aware_plan(&s.active().unwrap().doc, id, &ruler, "edit.contentAwareFill").unwrap_err();
+    assert!(err.to_string().contains("Ruler"), "{err}");
+    s.execute("image.analysis.rulerTool", json!({"start": [0, 10], "end": [40, 50]})).unwrap();
+    let err = content_aware_plan(&s.active().unwrap().doc, id, &ruler, "edit.contentAwareFill").unwrap_err();
+    assert!(err.to_string().contains("upright"), "{err}");
+    s.execute("image.analysis.rulerTool", json!({"start": [0, 30], "end": [60, 30]})).unwrap();
+    let plan = content_aware_plan(&s.active().unwrap().doc, id, &ruler, "edit.contentAwareFill").unwrap();
+    let hz = plan.opts.horizon.expect("a horizon");
+    assert_eq!(hz.len(), plan.rect.width() as usize);
+    let want = 30.0 - plan.rect.y0 as f32;
+    assert!(hz.iter().all(|r| (r - want).abs() <= 4.0), "{:?} not about {want}", &hz[..4]);
+    assert!(content_aware_plan(&s.active().unwrap().doc, id, &json!({"method": "classicDepth", "horizon": "sideways"}), "edit.contentAwareFill").is_err());
+    let classic = content_aware_plan(&s.active().unwrap().doc, id, &json!({"method": "classic", "horizon": "ruler"}), "edit.contentAwareFill").unwrap();
+    assert_eq!(classic.opts.horizon, None, "Classic measures no depth");
+}

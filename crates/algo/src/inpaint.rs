@@ -53,6 +53,7 @@ use proximity_integral::HoleIntegral;
 
 mod cells;
 mod common;
+mod horizon;
 mod levels;
 mod solver;
 mod sources;
@@ -64,7 +65,8 @@ use common::Bounds;
 pub(crate) use common::Rng;
 pub use common::{Adapt, Px};
 use common::{Level, SOURCE_MOMENTS_MAX};
-pub use levels::{dilate_mask, drop_fringe, horizon_line, seamless_levels};
+pub use horizon::{Hint, find as find_horizon};
+pub use levels::{dilate_mask, drop_fringe, seamless_levels};
 pub(crate) use solver::fit;
 #[cfg(test)]
 use solver::least_sum;
@@ -121,7 +123,7 @@ pub struct CompleteParams {
     /// or down a fifth of its distance from the horizon, or from the top of the picture without
     /// one), so ground far off, finer and smoother, is not copied into ground close by, where it
     /// reads as a road; near the horizon, from its own rows only, so its line runs on. The horizon
-    /// is found per column ([`solver::horizon_line`]), and the sky is measured from it upwards as
+    /// is found per column ([`find_horizon`]), and the sky is measured from it upwards as
     /// the ground downwards. Only with [`Self::nearby`].
     pub same_depth: bool,
     /// The horizon to measure [`Self::same_depth`] from, a row per column of the image (found in
@@ -342,6 +344,9 @@ fn complete_cow<'a>(
     let total_px: usize = levels.iter().map(|l| l.w * l.h).sum();
     let mut done_px = 0usize;
     let ri = r as i32;
+    // The horizon, found once on the whole picture when not given: each level measures from it.
+    let found = if p.nearby && p.same_depth && p.horizon.is_none() { solver::horizon_line(&levels[0].img, &levels[0].px, w, h, ch) } else { None };
+    let horizon_given = p.horizon.as_ref().or(found.as_ref());
     for li in (0..nlev).rev() {
         ctl.check()?;
         let Level { w: lw, h: lh, img: limg, px: lpx } = std::mem::replace(&mut levels[li], Level::EMPTY);
@@ -400,21 +405,17 @@ fn complete_cow<'a>(
         // from the horizon (the picture's top without one).
         let depth = p.nearby.then(|| {
             if p.same_depth {
-                let horizon = match &p.horizon {
-                    // The given horizon at this level's size.
+                let horizon = match horizon_given {
+                    // The horizon at this level's size.
                     Some(hz) if hz.len() == w => (0..lw)
                         .map(|x| {
                             let sx = ((x as f32 + 0.5) * w as f32 / lw as f32) as usize;
                             hz[sx.min(w - 1)] * lh as f32 / h as f32
                         })
                         .collect(),
-                    _ => solver::horizon_line(&limg, &lpx, lw, lh, ch).unwrap_or_default(),
+                    _ => Vec::new(),
                 };
-                let mut d = Depth::new(&valid, lw, lh, reach, p.patch_radius as i32, SAME_DEPTH_PER_ROW, &horizon);
-                if !horizon.is_empty() {
-                    d.sky = solver::SkyRule::new(&limg, &lpx, lw, lh, ch, |x| d.horizon_at(x), p.patch_radius, reach);
-                }
-                d
+                Depth::new(&valid, lw, lh, reach, p.patch_radius as i32, SAME_DEPTH_PER_ROW, &horizon)
             } else {
                 Depth::new(&valid, lw, lh, reach, reach as i32, 0.0, &[])
             }

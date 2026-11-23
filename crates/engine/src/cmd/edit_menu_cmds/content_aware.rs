@@ -216,6 +216,8 @@ struct CafParams<'a> {
     model: Option<FillModel>,
     edge: Edge,
     surf: &'a Surface,
+    /// `horizon: "ruler"`: the Ruler tool's line, on the canvas, for the horizon to follow.
+    horizon_line: Option<photocraft_algo::inpaint::Hint>,
 }
 
 /// The band around the fill area that blends the fill into the picture: `grow` px filled
@@ -342,8 +344,26 @@ fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Resul
         opts.color_adaptation = color_level("none");
     }
     let edge = edge_param(p, cmd)?;
+    let horizon_line = horizon_param(doc, p, cmd)?;
     let surf = doc.layer(id).and_then(|l| l.surface()).ok_or(EngineError::NoLayer(id))?;
-    Ok(CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, model, edge, surf })
+    Ok(CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, model, edge, surf, horizon_line })
+}
+
+/// `horizon`: `auto` (found in the picture) or `ruler` (near the Ruler tool's line, which must be
+/// drawn, and nearer level than upright), for a fill at the same depth.
+fn horizon_param(doc: &Document, p: &Value, cmd: &str) -> Result<Option<photocraft_algo::inpaint::Hint>> {
+    match str_or(p, "horizon", "auto") {
+        "auto" => Ok(None),
+        "ruler" => {
+            let r = doc.measurement.ruler.as_ref().ok_or_else(|| bad(cmd, "Horizon: Ruler Line needs a line drawn with the Ruler tool along the horizon"))?;
+            let (dx, dy) = (r.end[0] - r.start[0], r.end[1] - r.start[1]);
+            if dy.abs() > dx.abs() {
+                return Err(bad(cmd, "the Ruler line is closer to upright than level: draw it along the horizon"));
+            }
+            Ok(Some(photocraft_algo::inpaint::Hint { from: [r.start[0] as f32, r.start[1] as f32], to: [r.end[0] as f32, r.end[1] as f32] }))
+        }
+        other => Err(bad(cmd, format!("unknown horizon `{other}` (auto|ruler)"))),
+    }
 }
 
 /// How far from a not-quite-opaque pixel a nearby fill's sources start, px
@@ -361,7 +381,8 @@ pub fn content_aware_plan_with(doc: &Document, id: LayerId, p: &Value, cmd: &str
     use rayon::prelude::*;
 
     use crate::fill_cmds::{read_window, read_window_mask};
-    let CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, model, edge, surf } = caf_params(doc, id, p, cmd)?;
+    let CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, mut opts, output, model, edge, surf, horizon_line } =
+        caf_params(doc, id, p, cmd)?;
     let canvas = doc.bounds();
     let cancel = || ctl.cancelled();
     let stop = || if ctl.cancelled() { Err(EngineError::Cancelled) } else { Ok(()) };
@@ -513,6 +534,14 @@ pub fn content_aware_plan_with(doc: &Document, id: LayerId, p: &Value, cmd: &str
     if opts.nearby && fmt.alpha {
         stop()?;
         photocraft_algo::inpaint::drop_fringe(&mut source, &img, w, h, n, CAF_FRINGE);
+    }
+    // The horizon a fill at the same depth measures from: found in the window, near the Ruler
+    // line when one is asked for (moved onto the window).
+    if opts.same_depth {
+        stop()?;
+        let (ox, oy) = (rect.x0 as f32, rect.y0 as f32);
+        let hint = horizon_line.map(|l| photocraft_algo::inpaint::Hint { from: [l.from[0] - ox, l.from[1] - oy], to: [l.to[0] - ox, l.to[1] - oy] });
+        opts.horizon = photocraft_algo::inpaint::find_horizon(&img, &hole, w, h, n, fmt.mode.color_channels(), hint);
     }
     Ok(CafPlan { layer: id, rect, window, fmt, img, layer_px, cover, hole, base, source, opts, output, model })
 }

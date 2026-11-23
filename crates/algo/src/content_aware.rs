@@ -56,6 +56,9 @@ pub struct FillOptions {
     pub layout_only: bool,
     /// A nearby fill copies at the same depth ([`crate::inpaint::CompleteParams::same_depth`]).
     pub same_depth: bool,
+    /// The horizon to measure the depth from, a row per column of the image (found in it when
+    /// `None`): [`crate::inpaint::find_horizon`], along a line the user drew or on its own.
+    pub horizon: Option<Vec<f32>>,
 }
 
 impl Default for FillOptions {
@@ -69,6 +72,7 @@ impl Default for FillOptions {
             nearby: false,
             layout_only: false,
             same_depth: false,
+            horizon: None,
         }
     }
 }
@@ -282,6 +286,7 @@ fn fill_cow(
         nearby: opts.nearby,
         layout_only: opts.layout_only,
         same_depth: opts.same_depth,
+        horizon: opts.horizon.clone().filter(|hz| hz.len() == w),
         ..Default::default()
     };
     let gap = 2 * params.patch_radius + 2;
@@ -350,6 +355,12 @@ fn fill_cow(
         (w, h, None, par::map(w * h, true, role))
     };
     drop((extra, ok));
+    // A mosaic is wider than the image: its variants' columns hold the horizon's last row.
+    let mut params = params;
+    if let Some(hz) = params.horizon.as_mut() {
+        let last = hz.last().copied().unwrap_or(0.0);
+        hz.resize(mw, last);
+    }
     ctl.check()?;
     // The completion is nearly all the work.
     let cancel = || ctl.cancelled();
@@ -441,9 +452,10 @@ pub fn fill_in_pieces(
         nearby: opts.nearby,
         layout_only: opts.layout_only,
         same_depth: opts.same_depth,
+        horizon: opts.horizon.clone().filter(|hz| hz.len() == w),
         ..Default::default()
     };
-    let horizon = if opts.same_depth { crate::inpaint::horizon_line(&img, hole, w, h, ch) } else { None };
+    let horizon = if opts.same_depth { opts.horizon.clone().or_else(|| crate::inpaint::find_horizon(&img, hole, w, h, ch, ch.min(3), None)) } else { None };
     let canvas = Rect::new(0, 0, w as i32, h as i32);
     let mut filled = vec![false; w * h];
     let total = pieces.len();
@@ -535,6 +547,7 @@ pub fn fill_guided_owned(
         nearby: opts.nearby,
         layout_only: opts.layout_only,
         same_depth: opts.same_depth,
+        horizon: opts.horizon.clone().filter(|hz| hz.len() == w),
         ..Default::default()
     };
     let roles: Vec<Px> = par::map(w * h, true, |i| {

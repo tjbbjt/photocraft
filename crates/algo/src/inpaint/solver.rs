@@ -143,10 +143,7 @@ impl Solver<'_> {
     /// about its depth, for one at the same depth.
     #[inline]
     pub(super) fn allowed(&self, t: (i32, i32), s: (i32, i32)) -> bool {
-        self.reach <= 0
-            || ((s.0 - t.0).abs() <= self.reach
-                && self.depth_step(t, s).abs() <= self.rows_of(t)
-                && self.depth.as_ref().and_then(|d| d.sky.as_ref()).is_none_or(|k| k.allows(t, s, self.w)))
+        self.reach <= 0 || ((s.0 - t.0).abs() <= self.reach && self.depth_step(t, s).abs() <= self.rows_of(t))
     }
 
     /// What copying `s` costs on top of the patch distance: [`Uses::factor`], 1 without.
@@ -1104,9 +1101,6 @@ pub(super) struct Depth {
     to_sources: Vec<(u16, (i32, i32))>,
     /// Blocks across.
     bw: usize,
-    /// Above the horizon: which targets may take clouds ([`SkyRule`]); none below or without
-    /// a clear sky.
-    pub(super) sky: Option<SkyRule>,
 }
 
 /// The block [`Depth`] measures in, px.
@@ -1179,7 +1173,7 @@ impl Depth {
             k.0 = k.0.saturating_mul(DEPTH_BLOCK as u16);
         }
         let horizon = horizon.iter().map(|v| v.round() as i32).collect();
-        Self { least: least.max(1), per_row, horizon, to_sources, bw, sky: None }
+        Self { least: least.max(1), per_row, horizon, to_sources, bw }
     }
 
     #[inline]
@@ -1208,256 +1202,10 @@ impl Depth {
     }
 }
 
-/// Sky and cloud are told apart only when their mean blueness (blue less red) is this far
-/// apart.
-const SKY_SPLIT: f32 = 0.025;
-/// The blueness [`SkyRule`] measures, from -this to this.
-const SKY_BLUE_RANGE: f32 = 0.25;
-/// The block [`SkyRule`] counts the hole's edge in, px.
-const SKY_BLOCK: usize = 8;
-
-/// Above the horizon a nearby fill at the same depth goes on with the clouds where the hole's
-/// edge is mostly cloud (a cloud cut by much of its size, a bank of clouds along a border), and
-/// makes no new ones elsewhere: there a target copies only sky, away from any cloud. A cloud's
-/// top grazing the border got a slab of cloud above it, copied up from it; a dome over each cut
-/// was tried and came out as a flat disc of cloud.
-pub(super) struct SkyRule {
-    /// Targets that copy only sky.
-    sky_only: Vec<bool>,
-    /// Sources within a patch of a cloud.
-    near_cloud: Vec<bool>,
-}
-
-impl SkyRule {
-    /// From the known pixels above `horizon_at` (a row per column) in `img` (`w` × `h`, `ch`
-    /// channels, RGB first): sky and cloud split by blueness ([`SKY_SPLIT`]). `r`: the patch
-    /// radius; `reach`: how far a target looks along the hole's edge, each way. `None` without
-    /// a clear split, or with no target held to sky.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(img: &[f32], px: &[Px], w: usize, h: usize, ch: usize, horizon_at: impl Fn(i32) -> i32, r: usize, reach: usize) -> Option<Self> {
-        if ch < 3 || w == 0 || h == 0 {
-            return None;
-        }
-        let top: Vec<usize> = (0..w).map(|x| horizon_at(x as i32).clamp(0, h as i32) as usize).collect();
-        // Blueness, 0..256: clouds are grey or white, the sky blue (brightness doesn't tell a
-        // cloud's shadowed grey from the sky's light low down).
-        let blue = |i: usize| (((img[i * ch + 2] - img[i * ch]) / SKY_BLUE_RANGE + 1.0) * 128.0).clamp(0.0, 255.0);
-        // Otsu's split of the known pixels' blueness above the horizon.
-        let mut hist = [0u64; 256];
-        for (x, &t) in top.iter().enumerate() {
-            for y in 0..t {
-                let i = y * w + x;
-                if matches!(px[i], Px::Source | Px::Known) {
-                    hist[blue(i) as usize] += 1;
-                }
-            }
-        }
-        let total: u64 = hist.iter().sum();
-        if total == 0 {
-            return None;
-        }
-        let all: f64 = hist.iter().enumerate().map(|(b, n)| b as f64 * *n as f64).sum();
-        let (mut n0, mut s0, mut best) = (0u64, 0f64, (0usize, -1f64, 0f64, 0f64));
-        for (b, n) in hist.iter().enumerate().take(255) {
-            n0 += n;
-            s0 += b as f64 * *n as f64;
-            let n1 = total - n0;
-            if n0 == 0 || n1 == 0 {
-                continue;
-            }
-            let (m0, m1) = (s0 / n0 as f64, (all - s0) / n1 as f64);
-            let between = n0 as f64 * n1 as f64 * (m1 - m0) * (m1 - m0);
-            if between > best.1 {
-                best = (b, between, m0, m1);
-            }
-        }
-        let (cut, _, m0, m1) = best;
-        if (m1 - m0) / 128.0 * f64::from(SKY_BLUE_RANGE) < f64::from(SKY_SPLIT) {
-            return None;
-        }
-        let cut = cut as f32 + 1.0;
-        let above = |i: usize| i / w < top[i % w];
-        let cloud: Vec<bool> = (0..w * h).map(|i| matches!(px[i], Px::Source | Px::Known) && above(i) && blue(i) < cut).collect();
-        // The hole's edge above the horizon: known pixels beside a hole pixel.
-        let edge = |i: usize| {
-            let (x, y) = (i % w, i / w);
-            matches!(px[i], Px::Source | Px::Known)
-                && above(i)
-                && ((x > 0 && px[i - 1] == Px::Hole)
-                    || (x + 1 < w && px[i + 1] == Px::Hole)
-                    || (y > 0 && px[i - w] == Px::Hole)
-                    || (y + 1 < h && px[i + w] == Px::Hole))
-        };
-        let is_edge: Vec<bool> = (0..w * h).map(edge).collect();
-        // Per block: the edge's pixels and its cloud's, summed (2D prefix sums over blocks).
-        let (bw, bh) = (w.div_ceil(SKY_BLOCK), h.div_ceil(SKY_BLOCK));
-        let mut sum = vec![(0u32, 0u32); (bw + 1) * (bh + 1)];
-        for i in 0..w * h {
-            if is_edge[i] {
-                let k = (i / w / SKY_BLOCK + 1) * (bw + 1) + i % w / SKY_BLOCK + 1;
-                sum[k].0 += 1;
-                sum[k].1 += u32::from(cloud[i]);
-            }
-        }
-        for by in 1..=bh {
-            for bx in 1..=bw {
-                let (l, u, ul) = (sum[by * (bw + 1) + bx - 1], sum[(by - 1) * (bw + 1) + bx], sum[(by - 1) * (bw + 1) + bx - 1]);
-                let k = &mut sum[by * (bw + 1) + bx];
-                k.0 += l.0 + u.0 - ul.0;
-                k.1 += l.1 + u.1 - ul.1;
-            }
-        }
-        let kb = reach / (4 * SKY_BLOCK) + 1;
-        let mostly_cloud = |x: usize, y: usize| {
-            let (bx, by) = (x / SKY_BLOCK, y / SKY_BLOCK);
-            let (x0, y0, x1, y1) = (bx.saturating_sub(kb), by.saturating_sub(kb), (bx + kb + 1).min(bw), (by + kb + 1).min(bh));
-            let at = |x: usize, y: usize| sum[y * (bw + 1) + x];
-            let (a, b, c, d) = (at(x1, y1), at(x0, y1), at(x1, y0), at(x0, y0));
-            let edge = a.0 + d.0 - b.0 - c.0;
-            let cl = a.1 + d.1 - b.1 - c.1;
-            edge > 0 && 2 * cl >= edge
-        };
-        let sky_only: Vec<bool> = (0..w * h).map(|i| px[i] == Px::Hole && above(i) && !mostly_cloud(i % w, i / w)).collect();
-        if !sky_only.iter().any(|s| *s) {
-            return None;
-        }
-        let near_cloud = super::levels::dilate_mask(&cloud, w, h, r + 1);
-        Some(Self { sky_only, near_cloud })
-    }
-
-    /// Whether target `t` may copy source `s` (`w` across).
-    #[inline]
-    pub(super) fn allows(&self, t: (i32, i32), s: (i32, i32), w: usize) -> bool {
-        let at = |p: (i32, i32)| p.1 as usize * w + p.0 as usize;
-        !(self.sky_only.get(at(t)).copied().unwrap_or(false) && self.near_cloud.get(at(s)).copied().unwrap_or(false))
-    }
-}
-
-/// The horizon of a landscape as a row per column, for [`Depth`]: [`horizon`] over the whole
-/// picture, then per strip of columns the row that best splits the known pixels within a
-/// quarter of the picture's height of it; strips with too few known pixels there, or no clear
-/// split, take their neighbours' (in between, a straight line; past the last, the same row).
-/// `None` without a clear horizon over the whole picture.
+/// The horizon as a row per column, for [`Depth`] ([`super::horizon::find`], no line to follow).
 pub(super) fn horizon_line(img: &[f32], px: &[Px], w: usize, h: usize, ch: usize) -> Option<Vec<f32>> {
-    let whole = horizon(img, px, w, h, ch)? as usize;
-    let sw = (w / 24).clamp(16.min(w), w.max(1));
-    let (y0, y1) = (whole.saturating_sub(h / 4), (whole + h / 4).min(h));
-    let strips = w.div_ceil(sw);
-    let mut at: Vec<Option<f32>> = vec![None; strips];
-    for (k, a) in at.iter_mut().enumerate() {
-        let (x0, x1) = (k * sw, ((k + 1) * sw).min(w));
-        let mut rows = vec![(0u32, 0u32); y1 - y0];
-        let mut lum = vec![0f32; y1 - y0];
-        for ((r, l), y) in rows.iter_mut().zip(lum.iter_mut()).zip(y0..y1) {
-            for x in x0..x1 {
-                let i = y * w + x;
-                if px[i] != Px::Hole {
-                    let p = &img[i * ch..i * ch + 3];
-                    r.0 += 1;
-                    r.1 += u32::from(p[2] > p[0] * 1.04 + 1e-4);
-                    *l += p[0] + p[1] + p[2];
-                }
-            }
-        }
-        let known: u32 = rows.iter().map(|r| r.0).sum();
-        if (known as usize) * 10 >= (x1 - x0) * (y1 - y0) * 3 {
-            *a = best_split(&rows).map(|y| (y0 + snap_to_edge(&rows, &lum, y)) as f32);
-        }
-    }
-    let known: Vec<(usize, f32)> = at.iter().enumerate().filter_map(|(k, v)| v.map(|v| (k, v))).collect();
-    if known.is_empty() {
-        return Some(vec![whole as f32; w]);
-    }
-    let strip_row = |k: usize| -> f32 {
-        match known.binary_search_by_key(&k, |e| e.0) {
-            Ok(j) => known[j].1,
-            Err(0) => known[0].1,
-            Err(j) if j == known.len() => known[j - 1].1,
-            Err(j) => {
-                let ((ka, a), (kb, b)) = (known[j - 1], known[j]);
-                a + (b - a) * (k - ka) as f32 / (kb - ka) as f32
-            }
-        }
-    };
-    // Strip rows, a median of three against a stray strip; then a straight line between centres.
-    let raw: Vec<f32> = (0..strips).map(strip_row).collect();
-    let rows: Vec<f32> = (0..strips)
-        .map(|k| {
-            let mut t = [raw[k.saturating_sub(1)], raw[k], raw[(k + 1).min(strips - 1)]];
-            t.sort_by(f32::total_cmp);
-            t[1]
-        })
-        .collect();
-    Some(
-        (0..w)
-            .map(|x| {
-                let f = ((x as f32 + 0.5) / sw as f32 - 0.5).clamp(0.0, (strips - 1) as f32);
-                let (k, t) = (f.floor() as usize, f - f.floor());
-                rows[k] * (1.0 - t) + rows[(k + 1).min(strips - 1)] * t
-            })
-            .collect(),
-    )
-}
-
-/// Steps in brightness (the sum of the three channels, per pixel) the horizon snaps to, at least.
-const HORIZON_EDGE: f32 = 0.12;
-
-/// `row` moved to the sharpest drop in brightness (sky above, ground below) within a few percent
-/// of the strip's height of it: a dark ridge of the same grey as the haze above it doesn't split
-/// by colour at its top, and the line came out a hand below it. `lum`: the sum of each row's
-/// known pixels' brightness (`rows`' counts say how many).
-fn snap_to_edge(rows: &[(u32, u32)], lum: &[f32], row: usize) -> usize {
-    let n = rows.len();
-    let (k, reach) = ((n / 40).max(2), (n / 12).max(4));
-    let mean = |a: usize, b: usize| {
-        let (s, c) = (a..b.min(n)).fold((0f32, 0u32), |(s, c), y| (s + lum[y], c + rows[y].0));
-        (c > 0).then(|| s / c as f32)
-    };
-    let drop = |y: usize| match (mean(y.saturating_sub(k), y), mean(y, y + k)) {
-        (Some(up), Some(down)) => up - down,
-        _ => 0.0,
-    };
-    let best = (row.saturating_sub(reach).max(1)..(row + reach).min(n.saturating_sub(1))).max_by(|a, b| drop(*a).total_cmp(&drop(*b)));
-    best.filter(|y| drop(*y) >= HORIZON_EDGE).unwrap_or(row)
-}
-
-/// The row that best splits `rows` (known pixels, and how many look like sky) into sky above and
-/// ground from it on, where that fits at least three in four of them.
-fn best_split(rows: &[(u32, u32)]) -> Option<usize> {
-    let known: u64 = rows.iter().map(|r| u64::from(r.0)).sum();
-    let ground: u64 = rows.iter().map(|r| u64::from(r.0 - r.1)).sum();
-    if known == 0 {
-        return None;
-    }
-    let (mut fit, mut best) = (ground, (ground, 0usize));
-    for (y, r) in rows.iter().enumerate() {
-        fit = fit + u64::from(r.1) - u64::from(r.0 - r.1);
-        if fit > best.0 {
-            best = (fit, y + 1);
-        }
-    }
-    (best.0 * 4 >= known * 3 && best.1 > 0 && best.1 < rows.len()).then_some(best.1)
-}
-
-/// The row of the horizon in a landscape, for [`Depth`]: the row that best splits the known
-/// pixels into sky above (bluer than red, clouds included) and ground below (not). `None` when
-/// that split fits under three in four of them (no clear horizon), or the picture has no colour.
-pub(super) fn horizon(img: &[f32], px: &[Px], w: usize, h: usize, ch: usize) -> Option<f32> {
-    if ch < 3 {
-        return None;
-    }
-    // Per row: known pixels, and how many look like sky.
-    let mut rows = vec![(0u32, 0u32); h];
-    for (i, k) in px.iter().enumerate().take(w * h) {
-        if *k == Px::Hole {
-            continue;
-        }
-        let p = &img[i * ch..i * ch + 3];
-        let r = &mut rows[i / w];
-        r.0 += 1;
-        r.1 += u32::from(p[2] > p[0] * 1.04 + 1e-4);
-    }
-    best_split(&rows).map(|y| y as f32)
+    let hole: Vec<bool> = px.iter().map(|k| *k == Px::Hole).collect();
+    super::horizon::find(img, &hole, w, h, ch, ch.min(3), None)
 }
 
 /// How often each part of the picture is copied, for a nearby fill: Classic takes whatever

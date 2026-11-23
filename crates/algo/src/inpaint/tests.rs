@@ -761,47 +761,55 @@ fn the_same_depth_follows_a_tilted_horizon() {
     assert!(!s.allowed((70, 30), (60, 30)), "the same row is 5 rows deeper there");
 }
 
-/// The horizon: the row that best splits the picture into sky (bluer than red) above and
-/// ground below, per column along a tilted one; none without a clear split, or without colour.
-#[test]
-fn the_horizon_is_where_the_sky_meets_the_ground() {
-    let (w, h) = (40, 30);
-    let px = vec![Px::Source; w * h];
-    let land: Vec<f32> = (0..w * h).flat_map(|i| if i / w < 12 { [0.2, 0.3, 0.6] } else { [0.4, 0.3, 0.2] }).collect();
-    assert_eq!(solver::horizon(&land, &px, w, h, 3), Some(12.0));
-    // A hole over part of it changes nothing.
-    let holed: Vec<Px> = (0..w * h).map(|i| if i % w < 10 { Px::Hole } else { Px::Source }).collect();
-    assert_eq!(solver::horizon(&land, &holed, w, h, 3), Some(12.0));
-    let stripes: Vec<f32> = (0..w * h).flat_map(|i| if i % 2 == 0 { [0.2, 0.3, 0.6] } else { [0.4, 0.3, 0.2] }).collect();
-    assert_eq!(solver::horizon(&stripes, &px, w, h, 3), None, "no clear split");
-    assert_eq!(solver::horizon(&vec![0.5; w * h], &px, w, h, 1), None, "no colour");
-    // Tilted: from row 40 on the left to row 60 on the right, 320 columns across; the hole over
-    // the right 60 columns takes the row of the last strip with pixels.
-    let (w, h) = (320, 100);
-    let at = |x: usize| 40.0 + 20.0 * x as f32 / w as f32;
-    let tilted: Vec<f32> = (0..w * h).flat_map(|i| if ((i / w) as f32) < at(i % w) { [0.2, 0.3, 0.6] } else { [0.4, 0.3, 0.2] }).collect();
-    let holed: Vec<Px> = (0..w * h).map(|i| if i % w >= 260 { Px::Hole } else { Px::Source }).collect();
-    let line = solver::horizon_line(&tilted, &holed, w, h, 3).unwrap();
-    assert!((line[100] - at(100)).abs() <= 1.5, "{} at column 100, not {}", line[100], at(100));
-    assert!((line[310] - line[250]).abs() <= 1.5 && line[310] > 52.0, "held on past the last: {} / {}", line[310], line[250]);
+/// A grey picture: smooth sky above row `at(x)`, busy ground below (no colour to go by).
+fn landscape(w: usize, h: usize, at: impl Fn(usize) -> f32) -> Vec<f32> {
+    let mut seed = 7u32;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as f32 / (1u32 << 24) as f32
+    };
+    (0..w * h).map(|i| if ((i / w) as f32) < at(i % w) { 0.62 + 0.01 * noise() } else { 0.35 + 0.25 * noise() }).collect()
 }
 
-/// A dark ridge of the sky's blue-grey, under bright haze: the colour split alone puts the
-/// horizon at the ridge's foot (below it, the ground's brown); the line snaps to the ridge's top,
-/// where the brightness drops, as a person would draw it.
+/// The horizon is where the smooth sky meets the busy ground, found without colour; carried
+/// into a hole over the right of the picture on its own slope.
 #[test]
-fn the_horizon_is_the_ridges_top_when_the_ridge_is_not_brown() {
-    let (w, h) = (480, 200);
-    let px = vec![Px::Source; w * h];
-    let img: Vec<f32> = (0..w * h)
-        .flat_map(|i| match i / w {
-            0..=99 => [0.45, 0.46, 0.50],
-            100..=105 => [0.12, 0.12, 0.14],
-            _ => [0.20, 0.19, 0.18],
-        })
-        .collect();
-    let line = solver::horizon_line(&img, &px, w, h, 3).unwrap();
-    assert!(line.iter().all(|r| (r - 100.0).abs() <= 3.0), "{} / {}", line[0], line[300]);
+fn the_horizon_is_found_by_its_edge_and_carried_on_its_slope() {
+    let (w, h) = (400, 200);
+    let at = |x: usize| 80.0 + x as f32 * 0.05;
+    let img = landscape(w, h, at);
+    let line = find_horizon(&img, &vec![false; w * h], w, h, 1, 1, None).expect("a horizon");
+    for x in [10, 200, 390] {
+        assert!((line[x] - at(x)).abs() <= 2.5, "column {x}: {} not {}", line[x], at(x));
+    }
+    let hole: Vec<bool> = (0..w * h).map(|i| i % w >= 300).collect();
+    let line = find_horizon(&img, &hole, w, h, 1, 1, None).expect("a horizon");
+    assert!((line[395] - at(395)).abs() <= 4.0, "carried on: {} not {}", line[395], at(395));
+}
+
+/// A picture with no line across it has no horizon.
+#[test]
+fn a_picture_without_a_line_across_has_no_horizon() {
+    let (w, h) = (300, 200);
+    let img = landscape(w, h, |_| -1.0);
+    assert_eq!(find_horizon(&img, &vec![false; w * h], w, h, 1, 1, None), None);
+}
+
+/// Two lines across (a bank of cloud's flat base and the horizon): a line the user drew picks
+/// which, and the horizon follows the picture's edge near it rather than the line as drawn.
+#[test]
+fn a_drawn_line_picks_the_horizon_and_the_edge_near_it_is_followed() {
+    let (w, h) = (400, 240);
+    let mut img = landscape(w, h, |_| 150.0);
+    // A bright, smooth bank down to row 60.
+    for v in img.iter_mut().take(60 * w) {
+        *v = 0.95;
+    }
+    let hint = |y: f32| Some(Hint { from: [0.0, y], to: [400.0, y + 4.0] });
+    let low = find_horizon(&img, &vec![false; w * h], w, h, 1, 1, hint(146.0)).unwrap();
+    assert!((low[200] - 150.0).abs() <= 2.5, "{}", low[200]);
+    let high = find_horizon(&img, &vec![false; w * h], w, h, 1, 1, hint(56.0)).unwrap();
+    assert!((high[200] - 60.0).abs() <= 2.5, "{}", high[200]);
 }
 
 /// Seamless levels: a fill lighter than the picture beside it is brought down to it, all the
@@ -879,36 +887,6 @@ fn a_fallback_source_lies_inside_the_picture() {
     assert_eq!(s.1, 55, "{s:?}");
     assert_eq!(d.rows((20, 4)), 2 + 2 * 48, "the rows measured to the sources' edge");
     assert!(valid[s.1 as usize * w + s.0 as usize]);
-}
-
-/// The sky rule: above the horizon, where the hole's edge is mostly cloud a target may copy
-/// cloud; where it is sky, only sky away from any cloud. Below the horizon, anything.
-#[test]
-fn the_sky_goes_on_with_clouds_only_where_the_edge_is_cloud() {
-    let (w, h, ch) = (64, 64, 3);
-    // Sky above row 40, ground below; a grey cloud over columns 0..20, rows 6..30.
-    let img: Vec<f32> = (0..w * h)
-        .flat_map(|i| {
-            let (x, y) = (i % w, i / w);
-            if y >= 40 {
-                [0.35, 0.3, 0.25]
-            } else if x < 20 && y < 30 {
-                [0.45, 0.46, 0.48]
-            } else {
-                [0.2, 0.25, 0.35]
-            }
-        })
-        .collect();
-    // The hole: a strip along the top.
-    let px: Vec<Px> = (0..w * h).map(|i| if i / w < 6 { Px::Hole } else { Px::Source }).collect();
-    let k = solver::SkyRule::new(&img, &px, w, h, ch, |_| 40, 1, 8).expect("a sky rule");
-    let (cloud, sky) = ((10, 15), (50, 20));
-    assert!(k.allows((4, 2), cloud, w), "over the cut cloud, cloud goes on");
-    assert!(!k.allows((50, 2), cloud, w), "over sky, no new cloud");
-    assert!(k.allows((50, 2), sky, w));
-    // No split without clouds.
-    let clear: Vec<f32> = (0..w * h).flat_map(|i| if i / w >= 40 { [0.35, 0.3, 0.25] } else { [0.2, 0.25, 0.35] }).collect();
-    assert!(solver::SkyRule::new(&clear, &px, w, h, ch, |_| 40, 1, 8).is_none());
 }
 
 /// Uses: a block copied once (a stretch copied whole) costs nothing more; each further copy of

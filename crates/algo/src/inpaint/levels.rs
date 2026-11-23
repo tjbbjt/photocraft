@@ -1,7 +1,6 @@
 //! A fill's sources and last steps: the fringe of a transparent edge kept out of its sources,
 //! and its levels brought to the picture's around it.
 
-use super::Px;
 use crate::par;
 use crate::poisson::membrane_fill;
 
@@ -85,13 +84,6 @@ pub fn seamless_levels(img: &mut [f32], hole: &[bool], w: usize, h: usize, ch: u
             img[i * ch + c] = (img[i * ch + c] + top * (1.0 - ty) + bottom * ty).max(0.0);
         }
     }
-}
-
-/// The horizon of an RGB landscape as a row per column (the sky's blue meeting the ground's
-/// red, per strip of columns), from the pixels outside `hole`; `None` without one.
-pub fn horizon_line(img: &[f32], hole: &[bool], w: usize, h: usize, ch: usize) -> Option<Vec<f32>> {
-    let px: Vec<Px> = hole.iter().map(|h| if *h { Px::Hole } else { Px::Source }).collect();
-    super::solver::horizon_line(img, &px, w, h, ch)
 }
 
 /// `mask` grown by `r` px each way (a square): true where any of `mask` is within `r` across
