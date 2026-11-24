@@ -73,9 +73,39 @@ fn load(path: &Path) -> Result<Photo, String> {
         })
         .collect();
     let (w, h, rgba) = shrink(w, h, &rgba);
-    let rgba = rgba.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() / 255.0).collect();
+    let mut rgba: Vec<f32> = rgba.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() / 255.0).collect();
+    clear_black_border(w, h, &mut rgba);
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     Ok(Photo { name, w, h, rgba })
+}
+
+/// Makes black reaching the photo's border transparent: a panorama exported without
+/// transparency has black where its edges are missing, which would otherwise count as picture
+/// (holes cut there would score a fill against black, and fills could copy it).
+fn clear_black_border(w: usize, h: usize, rgba: &mut [f32]) {
+    let black = |rgba: &[f32], i: usize| rgba[i * 4..i * 4 + 3].iter().all(|v| *v <= 3.0 / 255.0);
+    let mut seen = vec![false; w * h];
+    let mut stack: Vec<usize> = (0..w).flat_map(|x| [x, (h - 1) * w + x]).chain((0..h).flat_map(|y| [y * w, y * w + w - 1])).collect();
+    while let Some(i) = stack.pop() {
+        if seen[i] || !black(rgba, i) {
+            continue;
+        }
+        seen[i] = true;
+        rgba[i * 4 + 3] = 0.0;
+        let (x, y) = (i % w, i / w);
+        if x > 0 {
+            stack.push(i - 1);
+        }
+        if x + 1 < w {
+            stack.push(i + 1);
+        }
+        if y > 0 {
+            stack.push(i - w);
+        }
+        if y + 1 < h {
+            stack.push(i + w);
+        }
+    }
 }
 
 /// `rgba` shrunk by box averaging so its long side is at most [`LONG_SIDE`]; colours weighted by
