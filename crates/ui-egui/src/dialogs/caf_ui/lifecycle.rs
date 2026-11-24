@@ -194,11 +194,28 @@ fn log_fill(outcome: &JobOutcome) {
             let ((ww, wh), (bw, bh)) = (size("window"), size("fillBounds"));
             let filled = v.get("filled").and_then(Value::as_u64).unwrap_or(0);
             let ms = v.get("ms").and_then(Value::as_u64).unwrap_or(0);
+            let method = v.get("method").and_then(Value::as_str).unwrap_or("?");
             log::info!(
-                "content-aware fill: {filled} px ({:.1} MP) filled in {ms} ms; window {ww}x{wh} ({:.1} MP), fill area bounds {bw}x{bh}",
+                "content-aware fill: {filled} px ({:.1} MP) filled in {ms} ms by {method}; window {ww}x{wh} ({:.1} MP), fill area bounds {bw}x{bh}",
                 filled as f64 / 1e6,
                 (ww * wh) as f64 / 1e6
             );
+            // The process's memory after each stage, and its most during the stage.
+            let stages: Vec<String> = v
+                .get("memory")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|m| {
+                            let gb = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0) as f64 / 1024.0;
+                            format!("{} {:.1} GB (peak {:.1} GB)", m.get("stage").and_then(Value::as_str).unwrap_or("?"), gb("mb"), gb("peakMb"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !stages.is_empty() {
+                log::info!("content-aware fill memory: {}", stages.join(", "));
+            }
         }
         JobOutcome::Failed(err) => log::info!("content-aware fill: failed: {err}"),
         JobOutcome::Cancelled => log::info!("content-aware fill: cancelled"),

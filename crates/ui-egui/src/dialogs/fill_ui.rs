@@ -33,7 +33,7 @@ pub const CONTENTS: [(&str, &str); 9] = [
 ];
 
 /// Params the dialog edits and remembers.
-const KEYS: [&str; 15] = [
+const KEYS: [&str; 14] = [
     "contents",
     "color",
     "pattern",
@@ -46,7 +46,6 @@ const KEYS: [&str; 15] = [
     "detail",
     "stamp",
     "matchDepth",
-    "horizon",
     "edgeGrow",
     "edgeFeather",
 ];
@@ -54,9 +53,6 @@ const KEYS: [&str; 15] = [
 /// Content-Aware's methods: (param, label).
 pub const METHODS: [(&str, &str); 5] =
     [("classic", "Classic"), ("classicDepth", "Classic + Depth"), ("lama", "LaMa"), ("migan", "MI-GAN"), ("mix", "Mix (LaMa + MI-GAN)")];
-
-/// Where a fill at the same depth takes its horizon from: (param, label).
-pub const HORIZONS: [(&str, &str); 2] = [("auto", "Auto"), ("ruler", "Ruler Line")];
 
 /// The edge band PhotoCraft starts with, in px: grown outright, then feathered.
 pub const EDGE_GROW: f64 = 2.0;
@@ -84,7 +80,6 @@ fn valid(app: &PhotocraftApp, key: &str, v: &Value) -> bool {
         "colorAdaptation" | "detail" | "stamp" | "matchDepth" => v.is_boolean(),
         "fillMode" => matches!(v.as_str(), Some("parity" | "photocraft")),
         "method" => v.as_str().is_some_and(|m| METHODS.iter().any(|(k, _)| *k == m)),
-        "horizon" => v.as_str().is_some_and(|m| HORIZONS.iter().any(|(k, _)| *k == m)),
         "edgeGrow" | "edgeFeather" => v.as_f64().is_some_and(|n| (0.0..=EDGE_MAX).contains(&n)),
         _ => false,
     }
@@ -107,7 +102,6 @@ pub fn default_fields(app: &PhotocraftApp) -> Map<String, Value> {
     f.insert("detail".into(), json!(true));
     f.insert("stamp".into(), json!(true));
     f.insert("matchDepth".into(), json!(true));
-    f.insert("horizon".into(), json!("auto"));
     f.insert("edgeGrow".into(), json!(EDGE_GROW));
     f.insert("edgeFeather".into(), json!(EDGE_FEATHER));
     f.insert("mode".into(), json!("normal"));
@@ -204,7 +198,6 @@ pub fn photocraft_params(f: &Map<String, Value>) -> Option<Value> {
         "detail": f.get("detail").and_then(Value::as_bool).unwrap_or(true),
         "stamp": f.get("stamp").and_then(Value::as_bool).unwrap_or(true),
         "matchDepth": f.get("matchDepth").and_then(Value::as_bool).unwrap_or(true),
-        "horizon": get("horizon").unwrap_or("auto"),
         "edgeGrow": px("edgeGrow", EDGE_GROW),
         "edgeFeather": px("edgeFeather", EDGE_FEATHER),
         "output": "current",
@@ -387,18 +380,6 @@ fn content_aware_body(ui: &mut egui::Ui, f: &mut Map<String, Value>, label: &dyn
             });
         });
     }
-    // The horizon the depth is measured from: found, or along the Ruler tool's line.
-    let depth = method == "classicDepth" || (model && stamp && f.get("matchDepth").and_then(Value::as_bool).unwrap_or(true));
-    ui.horizontal(|ui| {
-        label(ui, tl!("Horizon:"));
-        let mut horizon = get_str(f, "horizon", "auto");
-        let opts: Vec<(String, &str)> = HORIZONS.iter().map(|(k, l)| (k.to_string(), *l)).collect();
-        ui.add_enabled_ui(depth, |ui| {
-            if crate::widgets::dropdown(ui, "fill-horizon", tl!("Horizon:"), &mut horizon, &opts, 170.0) {
-                f.insert("horizon".into(), json!(horizon));
-            }
-        });
-    });
     for (key, name, default) in [("edgeGrow", tl!("Edge Grow:"), EDGE_GROW), ("edgeFeather", tl!("Edge Feather:"), EDGE_FEATHER)] {
         ui.horizontal(|ui| {
             label(ui, name);

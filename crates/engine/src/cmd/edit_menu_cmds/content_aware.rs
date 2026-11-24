@@ -216,8 +216,6 @@ struct CafParams<'a> {
     model: Option<FillModel>,
     edge: Edge,
     surf: &'a Surface,
-    /// `horizon: "ruler"`: the Ruler tool's line, on the canvas, for the horizon to follow.
-    horizon_line: Option<photocraft_algo::inpaint::Hint>,
 }
 
 /// The band around the fill area that blends the fill into the picture: `grow` px filled
@@ -344,26 +342,8 @@ fn caf_params<'a>(doc: &'a Document, id: LayerId, p: &Value, cmd: &str) -> Resul
         opts.color_adaptation = color_level("none");
     }
     let edge = edge_param(p, cmd)?;
-    let horizon_line = horizon_param(doc, p, cmd)?;
     let surf = doc.layer(id).and_then(|l| l.surface()).ok_or(EngineError::NoLayer(id))?;
-    Ok(CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, model, edge, surf, horizon_line })
-}
-
-/// `horizon`: `auto` (found in the picture) or `ruler` (near the Ruler tool's line, which must be
-/// drawn, and nearer level than upright), for a fill at the same depth.
-fn horizon_param(doc: &Document, p: &Value, cmd: &str) -> Result<Option<photocraft_algo::inpaint::Hint>> {
-    match str_or(p, "horizon", "auto") {
-        "auto" => Ok(None),
-        "ruler" => {
-            let r = doc.measurement.ruler.as_ref().ok_or_else(|| bad(cmd, "Horizon: Ruler Line needs a line drawn with the Ruler tool along the horizon"))?;
-            let (dx, dy) = (r.end[0] - r.start[0], r.end[1] - r.start[1]);
-            if dy.abs() > dx.abs() {
-                return Err(bad(cmd, "the Ruler line is closer to upright than level: draw it along the horizon"));
-            }
-            Ok(Some(photocraft_algo::inpaint::Hint { from: [r.start[0] as f32, r.start[1] as f32], to: [r.end[0] as f32, r.end[1] as f32] }))
-        }
-        other => Err(bad(cmd, format!("unknown horizon `{other}` (auto|ruler)"))),
-    }
+    Ok(CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, opts, output, model, edge, surf })
 }
 
 /// How far from a not-quite-opaque pixel a nearby fill's sources start, px
@@ -381,8 +361,7 @@ pub fn content_aware_plan_with(doc: &Document, id: LayerId, p: &Value, cmd: &str
     use rayon::prelude::*;
 
     use crate::fill_cmds::{read_window, read_window_mask};
-    let CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, mut opts, output, model, edge, surf, horizon_line } =
-        caf_params(doc, id, p, cmd)?;
+    let CafParams { sel, sb, edits, strokes, sampling, custom_mask, custom_rect, mut opts, output, model, edge, surf } = caf_params(doc, id, p, cmd)?;
     let canvas = doc.bounds();
     let cancel = || ctl.cancelled();
     let stop = || if ctl.cancelled() { Err(EngineError::Cancelled) } else { Ok(()) };
@@ -535,13 +514,10 @@ pub fn content_aware_plan_with(doc: &Document, id: LayerId, p: &Value, cmd: &str
         stop()?;
         photocraft_algo::inpaint::drop_fringe(&mut source, &img, w, h, n, CAF_FRINGE);
     }
-    // The horizon a fill at the same depth measures from: found in the window, near the Ruler
-    // line when one is asked for (moved onto the window).
+    // The horizon a fill at the same depth measures from, found in the window.
     if opts.same_depth {
         stop()?;
-        let (ox, oy) = (rect.x0 as f32, rect.y0 as f32);
-        let hint = horizon_line.map(|l| photocraft_algo::inpaint::Hint { from: [l.from[0] - ox, l.from[1] - oy], to: [l.to[0] - ox, l.to[1] - oy] });
-        opts.horizon = photocraft_algo::inpaint::find_horizon(&img, &hole, w, h, n, fmt.mode.color_channels(), hint);
+        opts.horizon = photocraft_algo::inpaint::find_horizon(&img, &hole, w, h, n, fmt.mode.color_channels(), None);
     }
     Ok(CafPlan { layer: id, rect, window, fmt, img, layer_px, cover, hole, base, source, opts, output, model })
 }
@@ -570,11 +546,17 @@ fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &
             use rayon::prelude::*;
             ctx.progress(0.0, label);
             let started = web_time::Instant::now();
+            let method = str_or(&p, "method", "classic").to_string();
+            let mut memory = Memory::start();
             let cancel = || ctx.cancelled();
             let plan = content_aware_plan_with(&doc, id, &p, cmd, &photocraft_raster::Interrupt::cancel_only(&cancel))?;
+            memory.note("window read");
             // A fill model works first, on the window shrunk to its working size.
             let model_share = if plan.model.is_some() && plan.source.iter().any(|s| *s) { 0.7 } else { 0.05 };
             let guide = ctx.stage(0.0, model_share, label, |ctl| model_guide(&plan, ctl))?;
+            if plan.model.is_some() {
+                memory.note("model");
+            }
             let CafPlan { layer, rect, fmt, img, layer_px, cover, hole, source, opts, output, model, .. } = plan;
             // Patches come only from the sampling area outside the fill area. With none (a
             // Rectangular `margin` of 0, a Custom area inside the selection or off the canvas)
@@ -599,6 +581,7 @@ fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &
             let with = model.as_ref().zip(guide.as_ref());
             let mut filled =
                 ctx.stage(model_share, 1.0, label, |ctl| caf_fill(w, h, &fmt, img, &hole, &source, &opts, with, ctl)).map_err(|_| EngineError::Cancelled)?;
+            memory.note("filled");
             // Sampled from all layers: outside the fill area the window keeps the layer's pixels.
             if let Some(own) = layer_px {
                 filled.par_chunks_mut(n.max(1)).zip(own.par_chunks(n.max(1))).zip(hole.par_iter()).for_each(|((f, o), h)| {
@@ -608,7 +591,8 @@ fn content_aware_fill_as(s: &mut Session, p: &Value, cmd: &'static str, label: &
                 });
             }
             let ms = started.elapsed().as_millis() as u64;
-            Ok((layer, rect, fmt, output, FilledWindow { filled, selected, original, bounds: (bx0, by0, bx1, by1), ms }))
+            memory.note("copied back");
+            Ok((layer, rect, fmt, output, FilledWindow { filled, selected, original, bounds: (bx0, by0, bx1, by1), ms, method, memory }))
         },
         move |s, (layer, rect, fmt, output, done)| apply_content_aware_fill(s, label, layer, &output, fmt, rect, done),
     )
@@ -771,6 +755,52 @@ struct FilledWindow {
     original: Vec<f32>,
     bounds: (usize, usize, usize, usize),
     ms: u64,
+    /// The fill's `method`, for the log.
+    method: String,
+    memory: Memory,
+}
+
+/// The process's memory at each stage of a fill, for the log: a whole-image fill grew the
+/// process by about 12 GB, and which stage holds it decides what to shrink. Linux only (read
+/// from `/proc`); elsewhere nothing is noted.
+struct Memory {
+    /// `(stage, MB now, MB at the most since the fill started)`.
+    stages: Vec<(&'static str, u64, u64)>,
+}
+
+impl Memory {
+    /// Starts counting: the process's peak is reset (where the kernel allows it) so each stage's
+    /// peak is this fill's.
+    fn start() -> Self {
+        #[cfg(target_os = "linux")]
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        let mut m = Memory { stages: Vec::new() };
+        m.note("start");
+        m
+    }
+
+    fn note(&mut self, stage: &'static str) {
+        if let Some((now, peak)) = process_memory_mb() {
+            self.stages.push((stage, now, peak));
+        }
+    }
+
+    fn json(&self) -> Value {
+        Value::Array(self.stages.iter().map(|(stage, mb, peak)| json!({"stage": stage, "mb": mb, "peakMb": peak})).collect())
+    }
+}
+
+/// The process's resident memory and its peak, in MB.
+#[cfg(target_os = "linux")]
+fn process_memory_mb() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = |key: &str| status.lines().find(|l| l.starts_with(key))?.split_whitespace().nth(1)?.parse::<u64>().ok();
+    Some((kb("VmRSS:")? / 1024, kb("VmHWM:")? / 1024))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_memory_mb() -> Option<(u64, u64)> {
+    None
 }
 
 /// Bounds `(x0, y0, x1, y1)` of the set cells of a `w × h` mask (all zero when there are none).
@@ -795,7 +825,7 @@ fn mask_bounds(w: usize, h: usize, m: &[bool]) -> (usize, usize, usize, usize) {
 fn apply_content_aware_fill(s: &mut Session, label: &str, id: LayerId, output: &str, fmt: PixelFormat, window: Rect, done: FilledWindow) -> Result<Value> {
     let n = fmt.channels();
     let (w, h) = (window.width() as usize, window.height() as usize);
-    let FilledWindow { mut filled, selected, original, bounds: (bx0, by0, bx1, by1), ms } = done;
+    let FilledWindow { mut filled, selected, original, bounds: (bx0, by0, bx1, by1), ms, method, mut memory } = done;
     let n_hole = selected.len();
     let layer = s.edit(label, |doc, active| {
         let target = match output {
@@ -840,11 +870,14 @@ fn apply_content_aware_fill(s: &mut Session, label: &str, id: LayerId, output: &
         surf.write_region(window, &filled);
         Ok(target)
     })?;
+    memory.note("written");
     Ok(json!({
         "layer": layer.0,
         "filled": n_hole,
         "window": [window.x0, window.y0, window.width(), window.height()],
         "fillBounds": [bx0, by0, bx1.saturating_sub(bx0), by1.saturating_sub(by0)],
         "ms": ms,
+        "method": method,
+        "memory": memory.json(),
     }))
 }
