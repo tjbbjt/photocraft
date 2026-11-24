@@ -1107,7 +1107,7 @@ fn a_ruler_line_sets_the_horizon_of_a_fill_at_the_same_depth() {
     let ruler = json!({"method": "classicDepth", "horizon": "ruler"});
     let Err(err) = content_aware_plan(&s.active().unwrap().doc, id, &ruler, "edit.contentAwareFill") else { panic!("refused") };
     assert!(err.to_string().contains("Ruler"), "{err}");
-    s.execute("image.analysis.rulerTool", json!({"start": [0, 10], "end": [40, 50]})).unwrap();
+    s.execute("image.analysis.rulerTool", json!({"start": [0, 10], "end": [20, 50]})).unwrap();
     let Err(err) = content_aware_plan(&s.active().unwrap().doc, id, &ruler, "edit.contentAwareFill") else { panic!("refused") };
     assert!(err.to_string().contains("upright"), "{err}");
     s.execute("image.analysis.rulerTool", json!({"start": [0, 30], "end": [60, 30]})).unwrap();
