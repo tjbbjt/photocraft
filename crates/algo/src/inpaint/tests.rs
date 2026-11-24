@@ -1001,16 +1001,6 @@ fn a_nearby_fill_keeps_the_texture_away_from_the_picture() {
     assert!(ratio > 0.6, "texture deep in the hole is {ratio} of the picture's");
 }
 
-/// A seam cut ([`super::seams`]) takes from one copy only the pixels whose whole patch box is hole.
-#[test]
-fn only_pixels_deep_in_the_hole_take_one_copy() {
-    let (w, h) = (9, 9);
-    let px: Vec<Px> = (0..w * h).map(|i| if (2..7).contains(&(i % w)) && (2..7).contains(&(i / w)) { Px::Hole } else { Px::Source }).collect();
-    let deep = super::seams::deep_in_hole(&px, w, h, 1);
-    let want: Vec<bool> = (0..w * h).map(|i| (3..6).contains(&(i % w)) && (3..6).contains(&(i / w))).collect();
-    assert_eq!(deep, want);
-}
-
 /// A pixel from a copy that disagrees with its neighbours' copy takes theirs: the seams around
 /// it cost more than none.
 #[test]

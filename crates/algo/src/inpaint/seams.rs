@@ -118,12 +118,8 @@ pub(super) fn cut(img: &mut [f32], px: &[Px], w: usize, h: usize, ch: usize, act
                     let cost = |a: (i32, i32)| -> f32 { nbrs[..n].iter().map(|&(nx, ny)| edge(x, y, a, nx, ny)).sum() };
                     let cur = lab[p];
                     let mut best = (cur, if view.at(x, y, cur).is_some() { cost(cur) } else { f32::INFINITY });
-                    for &(nx, ny) in &nbrs[..n] {
-                        let q = ny * w + nx;
-                        if !active[q] {
-                            continue;
-                        }
-                        let cand = lab[q];
+                    let neighbours = nbrs[..n].iter().filter(|&&(nx, ny)| active[ny * w + nx]).map(|&(nx, ny)| lab[ny * w + nx]);
+                    for cand in neighbours {
                         if cand == best.0 || view.at(x, y, cand).is_none() {
                             continue;
                         }
@@ -253,38 +249,82 @@ fn dilate_box(mask: &[bool], w: usize, h: usize, f: usize) -> Vec<bool> {
     out
 }
 
-/// The hole pixels whose whole `(2r + 1)²` box is hole: the ones a stamped fill takes from one
-/// copy (nearer the picture it blends).
-pub(super) fn deep_in_hole(px: &[Px], w: usize, h: usize, r: usize) -> Vec<bool> {
-    let hole: Vec<bool> = px.iter().map(|p| *p == Px::Hole).collect();
-    // Along rows, then down columns: all of the run of 2r + 1 centred here is hole (off the
-    // picture counts as not).
-    let run = |get: &dyn Fn(usize) -> bool, len: usize, out: &mut dyn FnMut(usize, bool)| {
-        let mut count = 0usize;
-        for i in 0..len + r {
-            if i < len && get(i) {
-                count += 1;
+/// Brings the cut fill to the picture where they meet, so no edge is left where the hole was:
+/// next to the picture, each fill pixel's copy is compared with the picture beside it (what the
+/// copy shows there against what is there), and that difference is added to the fill, fading
+/// to nothing `fade` pixels into the hole. Like seamless cloning, but local: a copy that is a
+/// little brighter or a little cloudier than the picture it continues blends into it instead of
+/// meeting it at a line, and farther in the copy keeps its own texture.
+pub(super) fn meet_picture(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), active: &[bool], labels: &[(i32, i32)], fade: usize) {
+    let (w, h, ch) = dims;
+    if fade == 0 {
+        return;
+    }
+    let picture = |q: usize| matches!(px[q], Px::Source | Px::Known);
+    let nbrs = |p: usize| {
+        let (x, y) = (p % w, p / w);
+        [(x > 0).then(|| p - 1), (x + 1 < w).then(|| p + 1), (y > 0).then(|| p - w), (y + 1 < h).then(|| p + w)].into_iter().flatten()
+    };
+    // The first layer: fill pixels beside the picture, each with the picture minus its copy there.
+    let mut corr = vec![0.0f32; w * h * ch];
+    let mut layer: Vec<usize> = Vec::new();
+    let mut depth = vec![0usize; w * h];
+    {
+        let view = View { img: &*img, px, w, h, ch };
+        for p in (0..w * h).filter(|p| active[*p]) {
+            let (mut acc, mut n) = (vec![0.0f32; ch], 0usize);
+            for q in nbrs(p).filter(|q| picture(*q)) {
+                let (qx, qy) = (q % w, q / w);
+                let there = &img[q * ch..(q + 1) * ch];
+                let copy = view.at(qx, qy, labels[p]).unwrap_or(&img[p * ch..(p + 1) * ch]);
+                for ((a, t), c) in acc.iter_mut().zip(there).zip(copy) {
+                    *a += t - c;
+                }
+                n += 1;
             }
-            if i > 2 * r && get(i - 2 * r - 1) {
-                count -= 1;
-            }
-            if i >= r {
-                let c = i - r;
-                let lo = c.saturating_sub(r);
-                let hi = (c + r).min(len - 1);
-                let span = hi - lo + 1;
-                out(c, span == 2 * r + 1 && count == span);
+            if n > 0 {
+                for (o, a) in corr[p * ch..(p + 1) * ch].iter_mut().zip(&acc) {
+                    *o = a / n as f32;
+                }
+                depth[p] = 1;
+                layer.push(p);
             }
         }
-    };
-    let mut rows = vec![false; w * h];
-    for y in 0..h {
-        let line = &hole[y * w..(y + 1) * w];
-        run(&|i| line[i], w, &mut |c, v| rows[y * w + c] = v);
     }
-    let mut out = vec![false; w * h];
-    for x in 0..w {
-        run(&|i| rows[i * w + x], h, &mut |c, v| out[c * w + x] = v);
+    // Inwards, layer by layer: the mean of the layer before, shrinking so it is gone at `fade`.
+    let mut all = layer.clone();
+    for k in 2..=fade {
+        let keep = (fade + 1 - k) as f32 / (fade + 2 - k) as f32;
+        let mut next = Vec::new();
+        for &p in &layer {
+            for q in nbrs(p) {
+                if active[q] && depth[q] == 0 {
+                    depth[q] = k;
+                    next.push(q);
+                }
+            }
+        }
+        for &q in &next {
+            let (mut acc, mut n) = (vec![0.0f32; ch], 0usize);
+            for r in nbrs(q).filter(|r| depth[*r] == k - 1) {
+                for (a, c) in acc.iter_mut().zip(&corr[r * ch..(r + 1) * ch]) {
+                    *a += c;
+                }
+                n += 1;
+            }
+            for (o, a) in corr[q * ch..(q + 1) * ch].iter_mut().zip(&acc) {
+                *o = keep * a / n.max(1) as f32;
+            }
+        }
+        all.extend_from_slice(&next);
+        layer = next;
+        if layer.is_empty() {
+            break;
+        }
     }
-    out
+    for p in all {
+        for (o, c) in img[p * ch..(p + 1) * ch].iter_mut().zip(&corr[p * ch..(p + 1) * ch]) {
+            *o += c;
+        }
+    }
 }

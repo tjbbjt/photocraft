@@ -501,7 +501,9 @@ impl Solver<'_> {
     /// `nnf`), and the copies are relaxed so that seams run where neighbouring copies agree.
     pub(super) fn cut_seams(&mut self, nnf: &[(i32, i32)]) {
         let (w, h) = (self.w, self.h);
-        let active = super::seams::deep_in_hole(self.px, w, h, self.r.max(0) as usize);
+        // The whole hole: next to the picture too, so the copies there must continue it (sky by
+        // blue sky takes sky), and the picture itself is what they are measured against.
+        let active: Vec<bool> = self.px.iter().map(|p| *p == Px::Hole).collect();
         let mut labels = vec![(0i32, 0i32); w * h];
         let mut any = false;
         let mut matched = vec![false; w * h];
@@ -522,6 +524,9 @@ impl Solver<'_> {
         // Then cross-faded over about two patches, so no seam is left hard.
         let f = super::seam_feather(self.r.max(1) as usize);
         super::seams::feather(&mut self.img[..], self.px, (w, h, self.ch), &active, &labels, f);
+        // And brought to the picture where they meet it, fading in over about four patches.
+        let fade = super::edge_fade(self.r.max(1) as usize);
+        super::seams::meet_picture(&mut self.img[..], self.px, (w, h, self.ch), &active, &labels, fade);
     }
 
     /// One PatchMatch pass over all target rows, in bands of the grid's rows: each band is
