@@ -499,7 +499,7 @@ impl Solver<'_> {
     /// Cuts the stamped fill's seams ([`super::seams`]): each hole pixel deep enough in the hole
     /// to come from one copy starts with the copy of the patch centred on it (its match in
     /// `nnf`), and the copies are relaxed so that seams run where neighbouring copies agree.
-    pub(super) fn cut_seams(&mut self, nnf: &[(i32, i32)]) {
+    pub(super) fn cut_seams(&mut self, nnf: &[(i32, i32)], relit: &super::seams::Relit) {
         let (w, h) = (self.w, self.h);
         // The whole hole: next to the picture too, so the copies there must continue it (sky by
         // blue sky takes sky), and the picture itself is what they are measured against.
@@ -521,6 +521,9 @@ impl Solver<'_> {
         // A pixel without a match of its own stays as voted.
         let active: Vec<bool> = active.iter().zip(&matched).map(|(a, m)| *a && *m).collect();
         super::seams::cut(&mut self.img[..], self.px, w, h, self.ch, &active, &mut labels);
+        // The copies are written; the picture beside the hole is put back as it was before it was
+        // relit, so the fill is evened out against, and lit like, the picture it really sits in.
+        relit.put_back(&mut self.img[..], self.ch);
         let dims = (w, h, self.ch);
         // Then evened out with their neighbours and the picture over their whole size, keeping
         // each copy's own texture.

@@ -550,8 +550,7 @@ fn a_border_ring_has_targets_only_along_the_borders() {
 
 /// A guide decides the fill's layout: a hole across the line between a bright upper half and a
 /// dark lower one, guided by the picture as it was, comes out with the line where it was, and
-/// closer to the picture than the unguided fill. The pixels outside the hole stay as they are,
-/// but for the relit edge beside it.
+/// closer to the picture than the unguided fill. The pixels outside the hole stay as they are.
 #[test]
 fn a_guide_steers_the_fill_towards_it() {
     let (w, h, ch) = (120, 96, 3);
@@ -580,14 +579,9 @@ fn a_guide_steers_the_fill_towards_it() {
     // Bright above the line, dark below it, inside the hole too.
     let mean = |y: usize| (40..80).map(|x| guided[(y * w + x) * ch]).sum::<f32>() / 40.0;
     assert!(mean(30) > mean(50) + 0.2, "{} above vs {} below", mean(30), mean(50));
-    // Outside the hole only the picture's edge may be relit (see `relit_edge_stays_near_the_hole`):
-    // by a few levels at most, and not past the band beside the hole.
-    let (_, band, _) = crate::inpaint::relight_params(p.patch_radius.max(1), w, h);
     for (i, hh) in hole.iter().enumerate() {
         if !*hh {
-            let near = (0..w * h).any(|j| hole[j] && (j % w).abs_diff(i % w).max((j / w).abs_diff(i / w)) <= band + 1);
-            let most = guided[i * ch..(i + 1) * ch].iter().zip(&truth[i * ch..(i + 1) * ch]).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-            assert!(if near { most <= 17.0 / 255.0 } else { most == 0.0 }, "pixel {i} moved by {most}");
+            assert_eq!(bits(&guided[i * ch..(i + 1) * ch]), bits(&truth[i * ch..(i + 1) * ch]));
         }
     }
 }
@@ -1035,20 +1029,51 @@ fn a_lone_copy_that_disagrees_takes_its_neighbours() {
 }
 
 /// Fusing evens out two copies that disagree in brightness, over their whole size: a hole filled
-/// with its left half copied from a patch of the picture 0.1 brighter than the right half's
-/// copy, beside a picture of the right half's brightness, comes out without a step at the seam
-/// or the hole's edge, and its texture (a ramp across each copy) is kept.
+/// with its left half copied from a patch of the picture 6/255 brighter (a panorama's shading)
+/// than the right half's copy, beside a picture of the right half's brightness, comes out
+/// without a step at the seam or the hole's edges, and its texture (a ramp) is kept.
 #[test]
 fn fusing_evens_out_copies_of_different_brightness() {
-    let (w, h) = (90, 40);
-    // The picture: a ramp, its columns 0..30 brighter by 0.1; the hole: columns 40..80.
+    let (w, h) = (100, 40);
+    // The picture: a ramp of 0.002 a column (period 10), columns 0..30 brighter by 6/255.
     let ramp = |x: usize| 0.002 * (x % 10) as f32;
-    let mut img: Vec<f32> = (0..w * h).map(|i| ramp(i % w) + if i % w < 30 { 0.5 } else { 0.4 }).collect();
+    let mut img: Vec<f32> = (0..w * h).map(|i| ramp(i % w) + if i % w < 30 { 0.4 + 6.0 / 255.0 } else { 0.4 }).collect();
+    // The hole: columns 41..81; its left half copies from 40 px left (the bright part), its right
+    // half from 10 px right.
+    let hole: Vec<bool> = (0..w * h).map(|i| (41..81).contains(&(i % w)) && (5..35).contains(&(i / w))).collect();
+    let px: Vec<Px> = hole.iter().map(|o| if *o { Px::Hole } else { Px::Source }).collect();
+    let labels: Vec<(i32, i32)> = (0..w * h)
+        .map(|i| {
+            if !hole[i] {
+                (0, 0)
+            } else if i % w < 61 {
+                (-40, 0)
+            } else {
+                (10, 0)
+            }
+        })
+        .collect();
+    for i in (0..w * h).filter(|i| hole[*i]) {
+        let s = (i as i64 + i64::from(labels[i].0)) as usize;
+        img[i] = img[s];
+    }
+    let step = |img: &[f32], x: usize| img[20 * w + x] - img[20 * w + x - 1];
+    assert!(step(&img, 61).abs() > 0.02, "the copies differ by {}", step(&img, 61));
+    super::seams::fuse(&mut img, &px, (w, h, 1), &hole, &labels);
+    // Every step is the ramp's own again: at the seam, at both edges, inside a copy.
+    for x in [41, 52, 61, 81] {
+        assert!((step(&img, x) - 0.002).abs() < 0.004, "a step of {} at column {x}", step(&img, x));
+    }
+}
+
+/// Fusing leaves a big difference where two copies meet mostly as it is (a cloud's edge against
+/// sky): it doesn't lift or sink a whole copy to hide it.
+#[test]
+fn fusing_keeps_most_of_a_big_step_between_copies() {
+    let (w, h) = (90, 40);
+    let mut img: Vec<f32> = (0..w * h).map(|i| if i % w < 30 { 0.9 } else { 0.3 }).collect();
     let hole: Vec<bool> = (0..w * h).map(|i| (40..80).contains(&(i % w)) && (5..35).contains(&(i / w))).collect();
     let px: Vec<Px> = hole.iter().map(|o| if *o { Px::Hole } else { Px::Source }).collect();
-    // Left half of the hole copies from 40 px to the left (the bright part), right half from 30
-    // px to the right... of nothing: from column 80+ is the picture's dim part, so from 40 left
-    // of 80..: shift (-50, 0) for x in 40..60 (columns -10..10: bright, 0..10) and (+10, 0) beyond.
     let labels: Vec<(i32, i32)> = (0..w * h)
         .map(|i| {
             if !hole[i] {
@@ -1061,20 +1086,14 @@ fn fusing_evens_out_copies_of_different_brightness() {
         })
         .collect();
     for i in (0..w * h).filter(|i| hole[*i]) {
-        let s = (i as i64 + i64::from(labels[i].0)) as usize;
-        img[i] = img[s];
+        img[i] = img[(i as i64 + i64::from(labels[i].0)) as usize];
     }
-    let step = |img: &[f32], x: usize| img[20 * w + x] - img[20 * w + x - 1];
-    assert!(step(&img, 60).abs() > 0.08, "the copies differ by {}", step(&img, 60));
     super::seams::fuse(&mut img, &px, (w, h, 1), &hole, &labels);
-    for x in [40, 60, 80] {
-        assert!(step(&img, x).abs() < 0.03, "a step of {} at column {x}", step(&img, x));
-    }
-    // The ramp's own steps inside a copy are kept.
-    assert!((step(&img, 52) - 0.002).abs() < 0.004, "{}", step(&img, 52));
+    let step = img[20 * w + 60] - img[20 * w + 59];
+    assert!(step < -0.4, "the bright copy's edge keeps most of its 0.6 step: {step}");
 }
 
-/// Relighting evens out a darker edge beside the hole: sky at 0.6 that darkens to 0.5 in the
+/// Relighting (before a fill) evens out a darker edge beside the hole: sky at 0.6 that darkens to 0.5 in the
 /// 15 px next to the hole (a panorama's stitched edge) is brought most of the way back up next
 /// to the hole, less farther out, and not at all past the band; a textured edge keeps its own.
 #[test]
@@ -1088,13 +1107,16 @@ fn relit_edge_stays_near_the_hole() {
     let mut img: Vec<f32> = (0..w * h).map(|i| sky(i % w)).collect();
     let before = img.clone();
     let radius = band.div_ceil(8).max(3);
-    super::seams::relight(&mut img, &px, (w, h, 1), &vec![false; w * h], radius, band, cap);
+    let relit = super::seams::relight(&mut img, &px, (w, h, 1), &vec![false; w * h], radius, band, cap);
     let at = |v: &[f32], x: usize| v[150 * w + x];
     assert!(at(&img, 101) - at(&before, 101) > 0.04, "{} -> {}", at(&before, 101), at(&img, 101));
     assert!(at(&img, 101) - at(&before, 101) <= cap + 1e-4);
     for x in band + 101..w {
         assert_eq!(at(&img, x).to_bits(), at(&before, x).to_bits(), "column {x}");
     }
+    // What it changed goes back as it was.
+    relit.put_back(&mut img, 1);
+    assert!(img.iter().zip(&before).all(|(a, b)| a.to_bits() == b.to_bits()));
     // A textured edge (a checkerboard 0.2 apart) keeps its pixels.
     let mut tex: Vec<f32> = (0..w * h).map(|i| if hole[i] { 0.0 } else { sky(i % w) + if (i % w + i / w) % 2 == 0 { 0.1 } else { -0.1 } }).collect();
     let tex0 = tex.clone();

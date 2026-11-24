@@ -72,6 +72,7 @@ fn rows(foreground: [f32; 3], first_pattern: Option<String>) -> Vec<Param> {
     let photocraft = |row: Param| row.visible_when("contents", "contentAware").enabled_when("fillMode", "photocraft");
     rows.extend([
         Param::new("fillMode", tl!("Behavior:"), ParamKind::radio(modes, Some("photocraft".into())))
+            .options_in_row()
             .visible_when("contents", "contentAware")
             .tooltip(tl!("PhotoCraft: Content-Aware gets fill methods and the edge band, and runs in the background. Parity: Fill as in Photoshop.")),
         photocraft(Param::new("method", tl!("Method:"), ParamKind::choice(methods, Some("classic".into())))),

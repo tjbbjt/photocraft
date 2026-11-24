@@ -93,8 +93,9 @@ fn seam_feather(r: usize, w: usize, h: usize) -> usize {
     let relative = ((w as f32).hypot(h as f32) / 1500.0).round() as usize;
     FEATHER.get_or_init(|| std::env::var("PHOTOCRAFT_CAF_FEATHER").ok().and_then(|v| v.parse().ok())).unwrap_or(relative.min(FEATHER_MAX).max(2 * r))
 }
-/// The widest [`seam_feather`] (its cost grows with the square).
-const FEATHER_MAX: usize = 16;
+/// The widest [`seam_feather`]: its cost grows with the square, and [`seams::fuse`] already evens
+/// out tone at any size.
+const FEATHER_MAX: usize = 8;
 
 /// How far into the hole a cut fill is brought to the picture it meets ([`seams::meet_picture`]):
 /// four patch radii, or `PHOTOCRAFT_CAF_EDGE_FADE` px (0: none), to compare on the quality test.
@@ -391,14 +392,17 @@ fn complete_cow<'a>(
     // doesn't copy that shading into the hole ([`seams::relight`]).
     // It also copies nothing from the picture's very edge beside the hole (still matched against):
     // a stitched or cut-out edge is often darker, lighter or fringed there.
+    // The relit picture pixels go back as they were once the fill is done: only the fill changes.
+    let mut relit = seams::Relit::default();
     let (img, lpx0): (Cow<'a, [f32]>, Cow<'a, [Px]>) = if (guide.is_some() || p.nearby) && seams_on() {
         let mut img = img.into_owned();
         let (radius, band, cap) = relight_params(r, w, h);
-        seams::relight(&mut img, px, (w, h, ch), &vec![false; w * h], radius, band, cap);
+        relit = seams::relight(&mut img, px, (w, h, ch), &vec![false; w * h], radius, band, cap);
         (Cow::Owned(img), Cow::Owned(seams::keep_off_edge(px, w, h, (band / 16).max(r))))
     } else {
         (img, Cow::Borrowed(px))
     };
+    let put_back = |v: &mut [f32]| relit.put_back(v, ch);
     let Pyramid { mut levels, boxes, exts, thin, thickness } = build_pyramid(Level { w, h, img, px: lpx0 }, ch, hb0, psz, ctl)?;
     let nlev = levels.len();
     // The guide at each level's size, finest first, and how much softer than that level it is.
@@ -422,7 +426,12 @@ fn complete_cow<'a>(
         // Nothing to copy from at the finest level: the caller falls back (and gets its pixels
         // back as they were).
         if li == 0 && sources.len() == 0 {
-            return Ok(Err(limg));
+            if relit.pixels.is_empty() {
+                return Ok(Err(limg));
+            }
+            let mut back = limg.into_owned();
+            put_back(&mut back);
+            return Ok(Err(Cow::Owned(back)));
         }
         // The level's own pixels to fill (at level 0 the caller's, or a copy made in parallel).
         let mut limg = into_owned_pixels(limg);
@@ -563,7 +572,7 @@ fn complete_cow<'a>(
         }
         // A stamped fill's seams, at full size: moved off the patch grid to where the copies agree.
         if li == 0 && solver.stamp && seams_on() {
-            solver.cut_seams(&nnf);
+            solver.cut_seams(&nnf, &relit);
         }
         // A vote that saw the cancellation stopped part-way: never hand its pixels on.
         ctl.check()?;
@@ -576,7 +585,13 @@ fn complete_cow<'a>(
         ctl.progress(done_px as f32 / total_px.max(1) as f32);
         prev = Some(Coarser { w: lw, h: lh, img: limg, field, cells });
     }
-    Ok(prev.map(|c| c.img).ok_or(Cow::Owned(Vec::new())))
+    Ok(prev
+        .map(|c| {
+            let mut v = c.img;
+            put_back(&mut v);
+            v
+        })
+        .ok_or(Cow::Owned(Vec::new())))
 }
 
 /// The levels of the completion, finest first, with the hole's bounds and extent at each.

@@ -350,6 +350,10 @@ const CYCLES: usize = 12;
 /// The largest residual (in 0..1 of a channel, summed over a pixel's links) a solve stops at.
 const TOL: f32 = 1.0 / 400.0;
 const SMOOTH: usize = 3;
+/// The most [`fuse`] changes one step between neighbours (in 0..1 of a channel): it evens out
+/// a copy's slight shading, while two copies that differ more where they meet (a cloud's edge
+/// against sky) keep most of their step, instead of lifting or sinking a whole region to hide it.
+const FUSE_LINK: f32 = 8.0 / 255.0;
 /// At or below this many unknowns a level is solved by sweeps alone.
 const COARSEST: usize = 2048;
 
@@ -465,26 +469,22 @@ impl Level {
         .fold(0.0f32, f32::max)
     }
 
-    /// Red-black Gauss–Seidel sweeps of `diag·v − Σ links·neighbours = b`.
+    /// Red-black Gauss–Seidel sweeps of `diag·v − Σ links·neighbours = b`, each half written
+    /// into the other of two buffers (so rows run in parallel without sharing what they write).
     fn smooth(&self, v: &mut [f32], b: &[f32], sweeps: usize) {
         let par = self.w * self.h >= PAR_MIN;
-        for _ in 0..sweeps {
-            for parity in 0..2 {
-                let cur = &*v;
-                let rows = par::map(self.h, par, |y| {
-                    let mut out = Vec::new();
-                    for x in ((y + parity) % 2..self.w).step_by(2) {
-                        let p = y * self.w + x;
-                        if self.solve[p] {
-                            out.push((p, (b[p] + self.nbr_sum(x, y, cur)) / self.diag[p]));
-                        }
-                    }
-                    out
-                });
-                for (p, x) in rows.into_iter().flatten() {
-                    v[p] = x;
+        let mut other = vec![0.0f32; v.len()];
+        let half = |src: &[f32], dst: &mut [f32], parity: usize| {
+            par::chunks_mut(dst, self.w, par, |y, row| {
+                for (x, out) in row.iter_mut().enumerate() {
+                    let p = y * self.w + x;
+                    *out = if self.solve[p] && (x + y) % 2 == parity { (b[p] + self.nbr_sum(x, y, src)) / self.diag[p] } else { src[p] };
                 }
-            }
+            });
+        };
+        for _ in 0..sweeps {
+            half(v, &mut other, 0);
+            half(&other, v, 1);
         }
     }
 }
@@ -564,7 +564,9 @@ pub(super) fn fuse(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), acti
         levels.extend(next);
     }
     let par = bw * bh >= PAR_MIN;
-    for c in 0..ch {
+    // The colour channels: a last alpha channel (RGBA, gray + alpha) is left as the copies have it.
+    let colours = if ch == 2 || ch == 4 { ch - 1 } else { ch };
+    for c in 0..colours {
         // Each channel reads only its own values, and the picture (never written).
         let view = View { img: &*img, px, w, h, ch };
         let img_r = &*img;
@@ -598,7 +600,7 @@ pub(super) fn fuse(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), acti
                     } else {
                         continue;
                     };
-                    *out += want - (f - g);
+                    *out += (want - (f - g)).clamp(-FUSE_LINK, FUSE_LINK);
                 }
             }
             row
@@ -731,17 +733,21 @@ fn chamfer(from: &[bool], w: usize, h: usize) -> Vec<f32> {
     d
 }
 
-/// Relights the fill and the edge of the picture beside it. The lighting (brightness averaged over
-/// `radius` px) the picture has `band` px and more from the hole is carried smoothly into the hole
-/// and across that band; the fill is pulled to it, and so is the band, fully at the hole and less
-/// and less to nothing `band` px out, in even areas only (sky, haze: not texture or a shadow's
-/// edge, which keep their own). Each pull is at most about `cap`. So a panorama's darker stitched edge or a lens's
-/// vignetting beside the hole is evened out instead of showing as a dark arc around the fill, and
-/// the fill doesn't copy that shading elsewhere. With no `active` pixels, only the band is relit
-/// (before a fill, so it copies the band relit). Lighting is smooth, so it is all worked out on
-/// a grid of blocks about half the radius across and the corrections are spread back over the
-/// pixels: cheap at any size. Returns the picture pixels it changed.
-pub(super) fn relight(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), active: &[bool], radius: usize, band: usize, cap: f32) -> Vec<usize> {
+/// Relights in one of two ways, from the lighting (brightness averaged over `radius` px).
+///
+/// With no `active` pixels (before a fill): the picture's even areas (sky, haze: not texture or
+/// a shadow's edge) within `band` px of the hole take the lighting the picture has past the band,
+/// carried smoothly across it, fully at the hole and less and less to nothing `band` px out, so
+/// the fill doesn't copy a panorama's darker stitched edge or a lens's vignetting into the hole.
+/// The caller puts those pixels back afterwards (the picture is never changed): it returns them
+/// as they were.
+///
+/// With `active` pixels (after a fill): the fill takes the lighting of the picture all round it,
+/// carried smoothly into the hole, where the picture around it is even.
+///
+/// Each pull is at most about `cap`. Lighting is smooth, so it is worked out on a grid of blocks
+/// about half the radius across and spread back over the pixels: cheap at any size.
+pub(super) fn relight(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), active: &[bool], radius: usize, band: usize, cap: f32) -> Relit {
     let (w, h, ch) = dims;
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
     for p in (0..w * h).filter(|p| px[*p] == Px::Hole) {
@@ -749,7 +755,7 @@ pub(super) fn relight(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
         (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
     }
     if x0 > x1 || cap <= 0.0 || ch == 0 {
-        return Vec::new();
+        return Relit::default();
     }
     // The box around the hole, wide enough for the band, the picture past it and the blur.
     let m = band + 2 * radius + 2;
@@ -806,7 +812,11 @@ pub(super) fn relight(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
     let fill_light = box_mean(&amean, &has_all, bw, bh, ch, rl);
     let dist: Vec<f32> = chamfer(&holes, bw, bh).iter().map(|d| d * s as f32).collect();
     // The lighting carried in from the band's far side.
-    let unknown: Vec<bool> = (0..n).map(|b| !(has_pic[b] && dist[b] >= band as f32)).collect();
+    // A fill takes the lighting of the picture all round it (so it meets the picture it sits
+    // in); the band, before a fill, the lighting from past it.
+    let fill = acount.iter().zip(&pcount).any(|(a, p)| a > p);
+    let far = if fill { 0.0 } else { band as f32 };
+    let unknown: Vec<bool> = (0..n).map(|b| !(has_pic[b] && dist[b] >= far)).collect();
     let carried = crate::poisson::membrane_fill(bw, bh, ch, &pic_light, &unknown);
     // How even the picture is, block by block, and carried into the hole: the fill is relit
     // only where the picture around it is even too (a hole across a shadow's edge or in a
@@ -827,7 +837,7 @@ pub(super) fn relight(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
             if has_all[b] {
                 fill_corr[i] = even_in[b] * soft(carried[i] - fill_light[i]);
             }
-            if has_pic[b] && dist[b] < band as f32 {
+            if !fill && has_pic[b] && dist[b] < band as f32 {
                 let t = (dist[b] / band as f32).clamp(0.0, 1.0);
                 let fade = 1.0 - t * t * (3.0 - 2.0 * t);
                 band_corr[i] = fade * even_at(b) * soft(carried[i] - pic_light[i]);
@@ -845,26 +855,43 @@ pub(super) fn relight(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
         let g = |bx: usize, by: usize| corr[(by * bw + bx) * ch + c];
         (g(ix, iy) * (1.0 - tx) + g(jx, iy) * tx) * (1.0 - ty) + (g(ix, jy) * (1.0 - tx) + g(jx, jy) * tx) * ty
     };
-    let mut changed = Vec::new();
+    let mut changed = Relit::default();
     for y in y0..=y1 {
         for x in x0..=x1 {
             let p = y * w + x;
             let corr = if active[p] {
                 &fill_corr
-            } else if matches!(px[p], Px::Source | Px::Known) && dist[((y - y0) / s) * bw + (x - x0) / s] < (band + s) as f32 {
+            } else if !fill && matches!(px[p], Px::Source | Px::Known) && dist[((y - y0) / s) * bw + (x - x0) / s] < (band + s) as f32 {
                 &band_corr
             } else {
                 continue;
             };
+            if !active[p] {
+                changed.pixels.push(p);
+                changed.was.extend_from_slice(&img[p * ch..(p + 1) * ch]);
+            }
             for c in 0..ch {
                 img[p * ch + c] += sample(corr, x, y, c);
-            }
-            if !active[p] {
-                changed.push(p);
             }
         }
     }
     changed
+}
+
+/// Picture pixels [`relight`] changed, and their values before.
+#[derive(Default)]
+pub(super) struct Relit {
+    pub(super) pixels: Vec<usize>,
+    pub(super) was: Vec<f32>,
+}
+
+impl Relit {
+    /// Puts the pixels back in `img` (`ch` channels) as they were.
+    pub(super) fn put_back(&self, img: &mut [f32], ch: usize) {
+        for (i, p) in self.pixels.iter().enumerate() {
+            img[p * ch..(p + 1) * ch].copy_from_slice(&self.was[i * ch..(i + 1) * ch]);
+        }
+    }
 }
 
 /// How far the picture strays from its own lighting where it counts as even (in 0..1 of a
