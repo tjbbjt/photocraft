@@ -12,7 +12,7 @@ fn tmp(name: &str) -> String {
 
 /// A document with two artboards, `Red Board` (80 × 60) and `Blue Board` (40 × 30), in that order.
 fn session() -> Session {
-    let mut s = Session::new();
+    let mut s = crate::session();
     s.execute("file.new", json!({"width": 200, "height": 100, "name": "boards.psd"})).unwrap();
     s.execute("layer.new.artboard", json!({"rect": [0, 0, 80, 60], "name": "Red Board"})).unwrap();
     s.execute("layer.new.artboard", json!({"rect": [100, 0, 40, 30], "name": "Blue Board"})).unwrap();
@@ -51,7 +51,7 @@ fn a_file_named_in_the_save_dialog_gives_the_folder_and_format() {
 #[test]
 fn boards_with_one_name_are_numbered() {
     let dir = tmp("dup");
-    let mut s = Session::new();
+    let mut s = crate::session();
     s.execute("file.new", json!({"width": 200, "height": 100})).unwrap();
     s.execute("layer.new.artboard", json!({"rect": [0, 0, 20, 20], "name": "Board"})).unwrap();
     s.execute("layer.new.artboard", json!({"rect": [40, 0, 20, 20], "name": "board"})).unwrap();
@@ -63,7 +63,7 @@ fn boards_with_one_name_are_numbered() {
 #[test]
 fn a_document_without_artboards_still_writes_one_file() {
     let dir = tmp("plain");
-    let mut s = Session::new();
+    let mut s = crate::session();
     s.execute("file.new", json!({"width": 20, "height": 10})).unwrap();
     let path = join(&dir, "plain.png");
     let r = s.execute("file.export.quickExport", json!({"path": path})).unwrap();
@@ -96,7 +96,7 @@ fn a_started_quick_export_runs_as_a_job() {
     let r = land(&mut s, json!({"dir": dir}));
     assert_eq!(r["files"].as_array().unwrap().len(), 2, "{r}");
     assert_eq!(png_size(&join(&dir, "Red Board.png")), (80, 60));
-    let mut s = Session::new();
+    let mut s = crate::session();
     s.execute("file.new", json!({"width": 30, "height": 20})).unwrap();
     let path = join(&dir, "flat.png");
     let r = land(&mut s, json!({"path": path}));
