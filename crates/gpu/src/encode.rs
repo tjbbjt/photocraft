@@ -226,7 +226,7 @@ impl Compositor {
             let mut batch = flush.then_some(&mut last_submit);
             stats.wait_ms += timing::take_wait();
             let recording = timing::cpu_now();
-            self.run_cell(device, queue, encoder, doc.id, &plan, &runs, &paged, cell, &fr, &chunks, checkpoint, &mut stats, sink, &mut batch);
+            self.run_cell(device, queue, encoder, doc.id, &plan, &runs, &paged, cell, &fr, &chunks, checkpoint, &mut stats, sink, &mut batch)?;
             // A cell's own intermediate submits count as waiting, not recording.
             let waited = timing::take_wait();
             stats.wait_ms += waited;
@@ -264,7 +264,7 @@ impl Compositor {
                     return Err(Unsupported(f.to_string()));
                 }
                 let mut batch = Some(&mut last_submit);
-                self.run_cell(device, queue, encoder, doc.id, &plan, &runs, &paged, cell, &fr, &chunks, checkpoint, &mut stats, sink, &mut batch);
+                self.run_cell(device, queue, encoder, doc.id, &plan, &runs, &paged, cell, &fr, &chunks, checkpoint, &mut stats, sink, &mut batch)?;
                 if let Some(f) = self.fault() {
                     return Err(Unsupported(f.to_string()));
                 }
