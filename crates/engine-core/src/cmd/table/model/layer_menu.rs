@@ -1,7 +1,7 @@
 use crate::cmd::{
     Adjustment, Color, ColorMode, CommandSpec, EngineError, Fill, Layer, LayerContent, LayerId, LayerMask, Result, Session, Value, adjustment_kind, arrange,
     bad, cmyk_param, color_param, has_doc, has_layer, has_selection, json, layer_copy, layer_panel_option, layer_param, mask_new_layer, merge_down,
-    merge_group, move_mask, parse_blend, pixels, set_clipped, set_mask, set_mask_and_deselect,
+    merge_group, move_mask, parse_blend, set_clipped, set_mask, set_mask_and_deselect,
 };
 use photocraft_color::BlendMode;
 
