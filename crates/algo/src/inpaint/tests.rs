@@ -997,3 +997,40 @@ fn a_nearby_fill_copies_pixels_whole_away_from_the_picture() {
     let n = deep.iter().filter(|d| **d).count();
     assert_eq!(whole, n, "{whole} of {n} pixels deep in the hole are copies");
 }
+
+/// A seam cut ([`super::seams`]) takes from one copy only the pixels whose whole patch box is hole.
+#[test]
+fn only_pixels_deep_in_the_hole_take_one_copy() {
+    let (w, h) = (9, 9);
+    let px: Vec<Px> = (0..w * h).map(|i| if (2..7).contains(&(i % w)) && (2..7).contains(&(i / w)) { Px::Hole } else { Px::Source }).collect();
+    let deep = super::seams::deep_in_hole(&px, w, h, 1);
+    let want: Vec<bool> = (0..w * h).map(|i| (3..6).contains(&(i % w)) && (3..6).contains(&(i / w))).collect();
+    assert_eq!(deep, want);
+}
+
+/// A pixel from a copy that disagrees with its neighbours' copy takes theirs: the seams around
+/// it cost more than none.
+#[test]
+fn a_lone_copy_that_disagrees_takes_its_neighbours() {
+    // Rows 0 and 1: the picture (copy B shows row 0, copy A row 1, two rows down); row 2: the
+    // hole, copy A throughout except one pixel from B; row 3: the picture again.
+    let (w, h) = (8, 4);
+    let mut px = vec![Px::Source; w * h];
+    let mut img = vec![0.0f32; w * h];
+    for x in 0..w {
+        img[x] = if x % 2 == 0 { 0.0 } else { 1.0 };
+        img[w + x] = 0.5;
+        img[3 * w + x] = 0.5;
+    }
+    let mut active = vec![false; w * h];
+    let mut labels = vec![(0i32, 0i32); w * h];
+    for x in 0..w {
+        let i = 2 * w + x;
+        px[i] = Px::Hole;
+        active[i] = true;
+        labels[i] = if x == 5 { (0, -2) } else { (0, -1) };
+    }
+    super::seams::cut(&mut img, &px, w, h, 1, &active, &mut labels);
+    assert_eq!(labels[2 * w + 5], (0, -1));
+    assert!(img[2 * w..3 * w].iter().all(|v| *v == 0.5), "{:?}", &img[2 * w..3 * w]);
+}

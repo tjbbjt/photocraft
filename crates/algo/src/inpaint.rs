@@ -55,6 +55,7 @@ mod cells;
 mod common;
 mod horizon;
 mod levels;
+mod seams;
 mod solver;
 mod sources;
 mod synthesis;
@@ -76,6 +77,13 @@ use sources::{Coarser, Sources, THIN_RATIO, downsample, hole_bounds, hole_thickn
 use sources::{hole_bbox, integral};
 use synthesis::onion_peel;
 pub use synthesis::{best_offset, synthesize};
+
+/// Whether a stamped fill's seams are cut ([`seams`]): `PHOTOCRAFT_CAF_SEAMS=off` stamps as
+/// before, to compare on the quality test (`caf_quality`).
+fn seams_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("PHOTOCRAFT_CAF_SEAMS").is_ok_and(|v| v == "off"))
+}
 
 /// How strongly a guided fill favours coherent matches ([`Solver::coherence`]).
 const GUIDED_COHERENCE: f32 = 6.0;
@@ -495,6 +503,10 @@ fn complete_cow<'a>(
             ctl.check()?;
             solver.vote(&nnf, &cost);
             ctl.check()?;
+        }
+        // A stamped fill's seams, at full size: moved off the patch grid to where the copies agree.
+        if li == 0 && solver.stamp && seams_on() {
+            solver.cut_seams(&nnf);
         }
         // A vote that saw the cancellation stopped part-way: never hand its pixels on.
         ctl.check()?;

@@ -496,6 +496,31 @@ impl Solver<'_> {
         (best, bc)
     }
 
+    /// Cuts the stamped fill's seams ([`super::seams`]): each hole pixel deep enough in the hole
+    /// to come from one copy starts with the copy of the patch centred on it (its match in
+    /// `nnf`), and the copies are relaxed so that seams run where neighbouring copies agree.
+    pub(super) fn cut_seams(&mut self, nnf: &[(i32, i32)]) {
+        let (w, h) = (self.w, self.h);
+        let active = super::seams::deep_in_hole(self.px, w, h, self.r.max(0) as usize);
+        let mut labels = vec![(0i32, 0i32); w * h];
+        let mut any = false;
+        let mut matched = vec![false; w * h];
+        for (k, x, y) in self.cells.iter() {
+            let i = y * w + x;
+            if active[i] && k < nnf.len() {
+                labels[i] = (nnf[k].0 - x as i32, nnf[k].1 - y as i32);
+                matched[i] = true;
+                any = true;
+            }
+        }
+        if !any || self.ctl.cancelled() {
+            return;
+        }
+        // A pixel without a match of its own stays as voted.
+        let active: Vec<bool> = active.iter().zip(&matched).map(|(a, m)| *a && *m).collect();
+        super::seams::cut(&mut self.img[..], self.px, w, h, self.ch, &active, &mut labels);
+    }
+
     /// One PatchMatch pass over all target rows, in bands of the grid's rows: each band is
     /// visited in raster order (backwards on odd passes), propagating within itself, its random
     /// numbers seeded by its index. `nnf` and `cost` are per target. The bands run in parallel;
