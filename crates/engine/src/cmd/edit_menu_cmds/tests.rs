@@ -1105,10 +1105,10 @@ fn a_ruler_line_sets_the_horizon_of_a_fill_at_the_same_depth() {
     s.execute("select.rect", json!({"x": 24, "y": 16, "width": 16, "height": 16})).unwrap();
     let id = s.active().unwrap().active_layer.unwrap();
     let ruler = json!({"method": "classicDepth", "horizon": "ruler"});
-    let err = content_aware_plan(&s.active().unwrap().doc, id, &ruler, "edit.contentAwareFill").unwrap_err();
+    let Err(err) = content_aware_plan(&s.active().unwrap().doc, id, &ruler, "edit.contentAwareFill") else { panic!("refused") };
     assert!(err.to_string().contains("Ruler"), "{err}");
     s.execute("image.analysis.rulerTool", json!({"start": [0, 10], "end": [40, 50]})).unwrap();
-    let err = content_aware_plan(&s.active().unwrap().doc, id, &ruler, "edit.contentAwareFill").unwrap_err();
+    let Err(err) = content_aware_plan(&s.active().unwrap().doc, id, &ruler, "edit.contentAwareFill") else { panic!("refused") };
     assert!(err.to_string().contains("upright"), "{err}");
     s.execute("image.analysis.rulerTool", json!({"start": [0, 30], "end": [60, 30]})).unwrap();
     let plan = content_aware_plan(&s.active().unwrap().doc, id, &ruler, "edit.contentAwareFill").unwrap();
