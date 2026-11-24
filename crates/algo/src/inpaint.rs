@@ -85,12 +85,16 @@ fn seams_on() -> bool {
     *ON.get_or_init(|| !std::env::var("PHOTOCRAFT_CAF_SEAMS").is_ok_and(|v| v == "off"))
 }
 
-/// How far either side of a cut seam its two copies cross-fade ([`seams::feather`]): two patch
-/// radii, or `PHOTOCRAFT_CAF_FEATHER` px (0: none), to compare on the quality test.
-fn seam_feather(r: usize) -> usize {
+/// How far a cut fill's seams are cross-faded ([`seams::feather`]): a share of the picture's size
+/// (so it looks the same at any resolution), at least two patch radii and at most
+/// [`FEATHER_MAX`] px; or `PHOTOCRAFT_CAF_FEATHER` px (0: none), to compare on the quality test.
+fn seam_feather(r: usize, w: usize, h: usize) -> usize {
     static FEATHER: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    FEATHER.get_or_init(|| std::env::var("PHOTOCRAFT_CAF_FEATHER").ok().and_then(|v| v.parse().ok())).unwrap_or(2 * r)
+    let relative = ((w as f32).hypot(h as f32) / 1500.0).round() as usize;
+    FEATHER.get_or_init(|| std::env::var("PHOTOCRAFT_CAF_FEATHER").ok().and_then(|v| v.parse().ok())).unwrap_or(relative.min(FEATHER_MAX).max(2 * r))
 }
+/// The widest [`seam_feather`] (its cost grows with the square).
+const FEATHER_MAX: usize = 16;
 
 /// How far into the hole a cut fill is brought to the picture it meets ([`seams::meet_picture`]):
 /// four patch radii, or `PHOTOCRAFT_CAF_EDGE_FADE` px (0: none), to compare on the quality test.
@@ -98,6 +102,32 @@ fn edge_fade(r: usize) -> usize {
     static FADE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     FADE.get_or_init(|| std::env::var("PHOTOCRAFT_CAF_EDGE_FADE").ok().and_then(|v| v.parse().ok())).unwrap_or(4 * r)
 }
+
+/// Whether a cut fill is fused with its neighbours and the picture ([`seams::fuse`]): on unless
+/// `PHOTOCRAFT_CAF_FUSE=off`, to compare on the quality test.
+fn fuse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PHOTOCRAFT_CAF_FUSE").map_or(true, |v| v != "off"))
+}
+
+/// What [`seams::relight`] takes: the lighting radius and the band of picture it evens out, both a
+/// share of the picture's size (so the same at any resolution), and the most it relights by.
+/// `PHOTOCRAFT_CAF_RELIGHT=<band share>,<cap in 1/255>` to compare on the quality test (cap 0: none).
+fn relight_params(r: usize, w: usize, h: usize) -> (usize, usize, f32) {
+    static P: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+    let set = P.get_or_init(|| {
+        let v = std::env::var("PHOTOCRAFT_CAF_RELIGHT").ok()?;
+        let (a, b) = v.split_once(',')?;
+        Some((a.parse().ok()?, b.parse::<f32>().ok()?))
+    });
+    let (share, cap) = set.unwrap_or((RELIGHT_BAND, RELIGHT_CAP));
+    let band = ((w as f32).hypot(h as f32) * share).round() as usize;
+    (band.div_ceil(8).max(r), band.max(2 * r), cap / 255.0)
+}
+/// The band of picture beside the hole [`seams::relight`] evens out, as a share of the picture's
+/// diagonal, and the most it relights by, in 1/255.
+const RELIGHT_BAND: f32 = 1.0 / 24.0;
+const RELIGHT_CAP: f32 = 16.0;
 
 /// How strongly a guided fill favours coherent matches ([`Solver::coherence`]).
 const GUIDED_COHERENCE: f32 = 6.0;
@@ -357,7 +387,19 @@ fn complete_cow<'a>(
     }
     let r = p.patch_radius.max(1);
     let psz = 2 * r + 1;
-    let Pyramid { mut levels, boxes, exts, thin, thickness } = build_pyramid(Level { w, h, img, px: Cow::Borrowed(px) }, ch, hb0, psz, ctl)?;
+    // A stamped fill first evens out the shading of the picture's edge beside the hole, so it
+    // doesn't copy that shading into the hole ([`seams::relight`]).
+    // It also copies nothing from the picture's very edge beside the hole (still matched against):
+    // a stitched or cut-out edge is often darker, lighter or fringed there.
+    let (img, lpx0): (Cow<'a, [f32]>, Cow<'a, [Px]>) = if (guide.is_some() || p.nearby) && seams_on() {
+        let mut img = img.into_owned();
+        let (radius, band, cap) = relight_params(r, w, h);
+        seams::relight(&mut img, px, (w, h, ch), &vec![false; w * h], radius, band, cap);
+        (Cow::Owned(img), Cow::Owned(seams::keep_off_edge(px, w, h, (band / 16).max(r))))
+    } else {
+        (img, Cow::Borrowed(px))
+    };
+    let Pyramid { mut levels, boxes, exts, thin, thickness } = build_pyramid(Level { w, h, img, px: lpx0 }, ch, hb0, psz, ctl)?;
     let nlev = levels.len();
     // The guide at each level's size, finest first, and how much softer than that level it is.
     let guides: Option<(Vec<Vec<f32>>, f32)> = guide.map(|(g, scale)| (guide_pyramid(g, w, h, ch, nlev), scale));

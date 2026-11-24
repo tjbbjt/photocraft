@@ -521,12 +521,24 @@ impl Solver<'_> {
         // A pixel without a match of its own stays as voted.
         let active: Vec<bool> = active.iter().zip(&matched).map(|(a, m)| *a && *m).collect();
         super::seams::cut(&mut self.img[..], self.px, w, h, self.ch, &active, &mut labels);
-        // Then cross-faded over about two patches, so no seam is left hard.
-        let f = super::seam_feather(self.r.max(1) as usize);
-        super::seams::feather(&mut self.img[..], self.px, (w, h, self.ch), &active, &labels, f);
-        // And brought to the picture where they meet it, fading in over about four patches.
-        let fade = super::edge_fade(self.r.max(1) as usize);
-        super::seams::meet_picture(&mut self.img[..], self.px, (w, h, self.ch), &active, &labels, fade);
+        let dims = (w, h, self.ch);
+        // Then evened out with their neighbours and the picture over their whole size, keeping
+        // each copy's own texture.
+        if super::fuse_on() {
+            super::seams::fuse(&mut self.img[..], self.px, dims, &active, &labels);
+        }
+        // Then cross-faded, so no seam is left hard.
+        let f = super::seam_feather(self.r.max(1) as usize, w, h);
+        super::seams::feather(&mut self.img[..], self.px, dims, &active, &labels, f);
+        // And relit: shading copied from elsewhere doesn't repeat in the hole.
+        let (radius, band, cap) = super::relight_params(self.r.max(1) as usize, w, h);
+        super::seams::relight(&mut self.img[..], self.px, dims, &active, radius, band, cap);
+        if !super::fuse_on() {
+            // Without the fusion, brought to the picture where they meet, fading in over about
+            // four patches.
+            let fade = super::edge_fade(self.r.max(1) as usize);
+            super::seams::meet_picture(&mut self.img[..], self.px, dims, &active, &labels, fade);
+        }
     }
 
     /// One PatchMatch pass over all target rows, in bands of the grid's rows: each band is

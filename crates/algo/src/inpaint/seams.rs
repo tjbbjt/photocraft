@@ -174,7 +174,8 @@ pub(super) fn feather(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
     let view = View { img: &*img, px, w, h, ch };
     let rows = par::map(h, par, |y| {
         let mut out: Vec<(usize, Vec<f32>)> = Vec::new();
-        let mut copies: Vec<((i32, i32), f32)> = Vec::new();
+        // Each copy near: its weight, and what [`fuse`] added to it.
+        let mut copies: Vec<((i32, i32), f32, Vec<f32>)> = Vec::new();
         for x in 0..w {
             let p = y * w + x;
             if !active[p] || !near[p] {
@@ -189,18 +190,28 @@ pub(super) fn feather(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
                     }
                     let d = qx.abs_diff(x).max(qy.abs_diff(y));
                     let wt = (f + 1 - d) as f32;
-                    match copies.iter_mut().find(|c| c.0 == labels[q]) {
-                        Some(c) => c.1 += wt,
-                        None => copies.push((labels[q], wt)),
-                    }
+                    let i = match copies.iter().position(|c| c.0 == labels[q]) {
+                        Some(i) => i,
+                        None => {
+                            // What [`fuse`] added to this copy, read where it was first met (it
+                            // varies slowly within a copy).
+                            let mut add = vec![0.0f32; ch];
+                            if let Some(own) = view.at(qx, qy, labels[q]) {
+                                add.iter_mut().zip(&view.img[q * ch..(q + 1) * ch]).zip(own).for_each(|((a, now), o)| *a = now - o);
+                            }
+                            copies.push((labels[q], 0.0, add));
+                            copies.len() - 1
+                        }
+                    };
+                    copies[i].1 += wt;
                 }
             }
             let mut acc = vec![0.0f32; ch];
             let mut sum = 0.0f32;
-            for &(l, wt) in &copies {
-                if let Some(v) = view.at(x, y, l) {
-                    for (a, v) in acc.iter_mut().zip(v) {
-                        *a += v * wt;
+            for (l, wt, cs) in &copies {
+                if let Some(v) = view.at(x, y, *l) {
+                    for ((a, v), s) in acc.iter_mut().zip(v).zip(cs) {
+                        *a += (v + s) * wt;
                     }
                     sum += wt;
                 }
@@ -327,4 +338,543 @@ pub(super) fn meet_picture(img: &mut [f32], px: &[Px], dims: (usize, usize, usiz
             *o += c;
         }
     }
+}
+
+/// Grid cells of the [`fuse`] solve: left out (no equation, a free edge), solved, or held at 0.
+const OUT: u8 = 0;
+const SOLVE: u8 = 1;
+const HELD: u8 = 2;
+/// V-cycles per channel of the [`fuse`] solve, and smoothing sweeps before and after each
+/// coarser solve.
+const CYCLES: usize = 12;
+/// The largest residual (in 0..1 of a channel, summed over a pixel's links) a solve stops at.
+const TOL: f32 = 1.0 / 400.0;
+const SMOOTH: usize = 3;
+/// At or below this many unknowns a level is solved by sweeps alone.
+const COARSEST: usize = 2048;
+
+/// One level of the [`fuse`] solve: which cells are solved, each solved cell's diagonal, and the
+/// weights of the links to its right and lower neighbours. The first level is the pixel grid (links
+/// of 1 between solved pixels, a held neighbour counted in the diagonal only); each level above
+/// joins 2×2 cells into one and adds up their equations (a Galerkin coarsening by aggregation), so
+/// a coarse correction never makes the error worse.
+struct Level {
+    w: usize,
+    h: usize,
+    solve: Vec<bool>,
+    diag: Vec<f32>,
+    right: Vec<f32>,
+    down: Vec<f32>,
+    unknowns: usize,
+}
+
+impl Level {
+    fn pixels(w: usize, h: usize, kind: &[u8]) -> Level {
+        let solve: Vec<bool> = kind.iter().map(|k| *k == SOLVE).collect();
+        let (mut diag, mut right, mut down) = (vec![0.0f32; w * h], vec![0.0f32; w * h], vec![0.0f32; w * h]);
+        for y in 0..h {
+            for x in 0..w {
+                let p = y * w + x;
+                if !solve[p] {
+                    continue;
+                }
+                let n = [(x > 0).then(|| p - 1), (x + 1 < w).then(|| p + 1), (y > 0).then(|| p - w), (y + 1 < h).then(|| p + w)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|q| kind[*q] != OUT)
+                    .count();
+                // A little pull to 0, so a region that touches nothing held still has one answer.
+                diag[p] = n as f32 + 1e-3;
+                if x + 1 < w && solve[p + 1] {
+                    right[p] = 1.0;
+                }
+                if y + 1 < h && solve[p + w] {
+                    down[p] = 1.0;
+                }
+            }
+        }
+        let unknowns = solve.iter().filter(|s| **s).count();
+        Level { w, h, solve, diag, right, down, unknowns }
+    }
+
+    fn coarser(&self) -> Level {
+        let (w, h) = (self.w.div_ceil(2), self.h.div_ceil(2));
+        let (mut diag, mut right, mut down) = (vec![0.0f32; w * h], vec![0.0f32; w * h], vec![0.0f32; w * h]);
+        let mut solve = vec![false; w * h];
+        for y in 0..self.h {
+            for x in 0..self.w {
+                let p = y * self.w + x;
+                if !self.solve[p] {
+                    continue;
+                }
+                let c = (y / 2) * w + x / 2;
+                solve[c] = true;
+                diag[c] += self.diag[p];
+                // A link inside the block cancels out of its sum; one out of it links two blocks.
+                if self.right[p] != 0.0 {
+                    if x % 2 == 0 {
+                        diag[c] -= 2.0 * self.right[p];
+                    } else {
+                        right[c] += self.right[p];
+                    }
+                }
+                if self.down[p] != 0.0 {
+                    if y % 2 == 0 {
+                        diag[c] -= 2.0 * self.down[p];
+                    } else {
+                        down[c] += self.down[p];
+                    }
+                }
+            }
+        }
+        let unknowns = solve.iter().filter(|s| **s).count();
+        Level { w, h, solve, diag, right, down, unknowns }
+    }
+
+    fn nbr_sum(&self, x: usize, y: usize, v: &[f32]) -> f32 {
+        let (w, p) = (self.w, y * self.w + x);
+        let mut s = 0.0;
+        if x > 0 {
+            s += self.right[p - 1] * v[p - 1];
+        }
+        if x + 1 < w {
+            s += self.right[p] * v[p + 1];
+        }
+        if y > 0 {
+            s += self.down[p - w] * v[p - w];
+        }
+        if y + 1 < self.h {
+            s += self.down[p] * v[p + w];
+        }
+        s
+    }
+
+    /// The largest residual of `diag·v − Σ links·neighbours = b`.
+    fn residual(&self, v: &[f32], b: &[f32]) -> f32 {
+        let par = self.w * self.h >= PAR_MIN;
+        par::map(self.h, par, |y| {
+            (0..self.w)
+                .filter(|x| self.solve[y * self.w + x])
+                .map(|x| {
+                    let p = y * self.w + x;
+                    (b[p] - (self.diag[p] * v[p] - self.nbr_sum(x, y, v))).abs()
+                })
+                .fold(0.0f32, f32::max)
+        })
+        .into_iter()
+        .fold(0.0f32, f32::max)
+    }
+
+    /// Red-black Gauss–Seidel sweeps of `diag·v − Σ links·neighbours = b`.
+    fn smooth(&self, v: &mut [f32], b: &[f32], sweeps: usize) {
+        let par = self.w * self.h >= PAR_MIN;
+        for _ in 0..sweeps {
+            for parity in 0..2 {
+                let cur = &*v;
+                let rows = par::map(self.h, par, |y| {
+                    let mut out = Vec::new();
+                    for x in ((y + parity) % 2..self.w).step_by(2) {
+                        let p = y * self.w + x;
+                        if self.solve[p] {
+                            out.push((p, (b[p] + self.nbr_sum(x, y, cur)) / self.diag[p]));
+                        }
+                    }
+                    out
+                });
+                for (p, x) in rows.into_iter().flatten() {
+                    v[p] = x;
+                }
+            }
+        }
+    }
+}
+
+/// One multigrid V-cycle at `levels[0]`.
+fn v_cycle(levels: &[Level], v: &mut [f32], b: &[f32]) {
+    let l = &levels[0];
+    if levels.len() == 1 || l.unknowns <= COARSEST {
+        l.smooth(v, b, if l.unknowns <= COARSEST { 4 * l.w.max(l.h) } else { 64 });
+        return;
+    }
+    l.smooth(v, b, SMOOTH);
+    let c = &levels[1];
+    let par = l.w * l.h >= PAR_MIN;
+    // The residual, summed into the coarser cells (two fine rows to each coarse one).
+    let cb: Vec<f32> = par::map(c.h, par, |cy| {
+        let mut row = vec![0.0f32; c.w];
+        for y in (2 * cy)..(2 * cy + 2).min(l.h) {
+            for x in 0..l.w {
+                let p = y * l.w + x;
+                if l.solve[p] {
+                    row[x / 2] += b[p] - (l.diag[p] * v[p] - l.nbr_sum(x, y, v));
+                }
+            }
+        }
+        row
+    })
+    .concat();
+    let mut cv = vec![0.0f32; c.w * c.h];
+    v_cycle(&levels[1..], &mut cv, &cb);
+    par::chunks_mut(v, l.w, par, |y, row| {
+        for (x, vp) in row.iter_mut().enumerate() {
+            if l.solve[y * l.w + x] {
+                *vp += cv[(y / 2) * c.w + x / 2];
+            }
+        }
+    });
+    l.smooth(v, b, SMOOTH);
+}
+
+/// Fuses the cut fill in the gradient domain, so no step is left at any size: a correction is
+/// added to the fill that keeps every copy's own texture (its steps between neighbours) but, where
+/// two copies meet, takes the step between them to be what both copies show there, and where the
+/// fill meets the picture, what its copy shows there (Pérez et al. 2003; Agarwala et al. 2004's
+/// gradient-domain fusion). A copy a little brighter, bluer or cloudier than its neighbours is
+/// evened out over its whole size, however big, instead of over a fixed few pixels.
+pub(super) fn fuse(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), active: &[bool], labels: &[(i32, i32)]) {
+    let (w, h, ch) = dims;
+    let picture = |q: usize| matches!(px[q], Px::Source | Px::Known);
+    // The active pixels' box, one pixel wider for the picture around them.
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+    for p in (0..w * h).filter(|p| active[*p]) {
+        let (x, y) = (p % w, p / w);
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    if x0 > x1 {
+        return;
+    }
+    let (x0, y0, x1, y1) = (x0.saturating_sub(1), y0.saturating_sub(1), (x1 + 1).min(w - 1), (y1 + 1).min(h - 1));
+    let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+    let at = |bx: usize, by: usize| (y0 + by) * w + x0 + bx;
+    let kind: Vec<u8> = (0..bw * bh)
+        .map(|i| {
+            let p = at(i % bw, i / bw);
+            if active[p] {
+                SOLVE
+            } else if picture(p) {
+                HELD
+            } else {
+                OUT
+            }
+        })
+        .collect();
+    let mut levels = vec![Level::pixels(bw, bh, &kind)];
+    while levels.last().is_some_and(|l| l.unknowns > COARSEST && l.w > 2 && l.h > 2) {
+        let next = levels.last().map(Level::coarser);
+        levels.extend(next);
+    }
+    let par = bw * bh >= PAR_MIN;
+    for c in 0..ch {
+        // Each channel reads only its own values, and the picture (never written).
+        let view = View { img: &*img, px, w, h, ch };
+        let img_r = &*img;
+        // Each solved cell's right-hand side: the steps to its neighbours the fill should take,
+        // less the steps it takes.
+        let rows = par::map(bh, par, |by| {
+            let mut row = vec![0.0f32; bw];
+            for (bx, out) in row.iter_mut().enumerate() {
+                let p = at(bx, by);
+                if !active[p] {
+                    continue;
+                }
+                let (x, y) = (p % w, p / w);
+                let f = img_r[p * ch + c];
+                let nbrs = [(x > 0).then(|| (x - 1, y)), (x + 1 < w).then(|| (x + 1, y)), (y > 0).then(|| (x, y - 1)), (y + 1 < h).then(|| (x, y + 1))];
+                for (nx, ny) in nbrs.into_iter().flatten() {
+                    let q = ny * w + nx;
+                    let g = img_r[q * ch + c];
+                    let step = |s: (i32, i32)| Some(view.at(x, y, s)?[c] - view.at(nx, ny, s)?[c]);
+                    let want = if active[q] {
+                        if labels[q] == labels[p] {
+                            continue;
+                        }
+                        match (step(labels[p]), step(labels[q])) {
+                            (Some(a), Some(b)) => 0.5 * (a + b),
+                            (Some(a), None) | (None, Some(a)) => a,
+                            (None, None) => 0.0,
+                        }
+                    } else if picture(q) {
+                        step(labels[p]).unwrap_or(0.0)
+                    } else {
+                        continue;
+                    };
+                    *out += want - (f - g);
+                }
+            }
+            row
+        });
+        let b: Vec<f32> = rows.into_iter().flatten().collect();
+        let mut v = vec![0.0f32; bw * bh];
+        for _ in 0..CYCLES {
+            v_cycle(&levels, &mut v, &b);
+            if levels[0].residual(&v, &b) < TOL {
+                break;
+            }
+        }
+        drop(b);
+        for (i, x) in v.iter().enumerate() {
+            let p = at(i % bw, i / bw);
+            if active[p] {
+                img[p * ch + c] += x;
+            }
+        }
+    }
+}
+
+/// `v` (`ch` channels) averaged over a `(2r + 1)²` box, counting only pixels where `wt` is set
+/// (where none is, 0).
+fn box_mean(v: &[f32], wt: &[bool], w: usize, h: usize, ch: usize, r: usize) -> Vec<f32> {
+    // Running sums along rows, then along columns; the last channel slot holds the count.
+    let n = ch + 1;
+    let mut rows = vec![0.0f32; w * h * n];
+    for y in 0..h {
+        let mut acc = vec![0.0f64; n];
+        let add = |acc: &mut [f64], x: usize, s: f64| {
+            let p = y * w + x;
+            if wt[p] {
+                for c in 0..ch {
+                    acc[c] += s * f64::from(v[p * ch + c]);
+                }
+                acc[ch] += s;
+            }
+        };
+        for x in 0..r.min(w) {
+            add(&mut acc, x, 1.0);
+        }
+        for x in 0..w {
+            if x + r < w {
+                add(&mut acc, x + r, 1.0);
+            }
+            if x > r {
+                add(&mut acc, x - r - 1, -1.0);
+            }
+            for c in 0..n {
+                rows[(y * w + x) * n + c] = acc[c] as f32;
+            }
+        }
+    }
+    let mut out = vec![0.0f32; w * h * ch];
+    for x in 0..w {
+        let mut acc = vec![0.0f64; n];
+        let add = |acc: &mut [f64], y: usize, s: f64| {
+            for c in 0..n {
+                acc[c] += s * f64::from(rows[(y * w + x) * n + c]);
+            }
+        };
+        for y in 0..r.min(h) {
+            add(&mut acc, y, 1.0);
+        }
+        for y in 0..h {
+            if y + r < h {
+                add(&mut acc, y + r, 1.0);
+            }
+            if y > r {
+                add(&mut acc, y - r - 1, -1.0);
+            }
+            if acc[ch] > 0.5 {
+                for c in 0..ch {
+                    out[(y * w + x) * ch + c] = (acc[c] / acc[ch]) as f32;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Distance (chamfer 3-4, in pixels) from each pixel to the nearest pixel of `from`.
+fn chamfer(from: &[bool], w: usize, h: usize) -> Vec<f32> {
+    let mut d = vec![f32::INFINITY; w * h];
+    for (p, f) in from.iter().enumerate() {
+        if *f {
+            d[p] = 0.0;
+        }
+    }
+    let (a, b) = (1.0f32, 1.4f32);
+    for y in 0..h {
+        for x in 0..w {
+            let p = y * w + x;
+            let mut v = d[p];
+            if x > 0 {
+                v = v.min(d[p - 1] + a);
+            }
+            if y > 0 {
+                v = v.min(d[p - w] + a);
+                if x > 0 {
+                    v = v.min(d[p - w - 1] + b);
+                }
+                if x + 1 < w {
+                    v = v.min(d[p - w + 1] + b);
+                }
+            }
+            d[p] = v;
+        }
+    }
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
+            let p = y * w + x;
+            let mut v = d[p];
+            if x + 1 < w {
+                v = v.min(d[p + 1] + a);
+            }
+            if y + 1 < h {
+                v = v.min(d[p + w] + a);
+                if x + 1 < w {
+                    v = v.min(d[p + w + 1] + b);
+                }
+                if x > 0 {
+                    v = v.min(d[p + w - 1] + b);
+                }
+            }
+            d[p] = v;
+        }
+    }
+    d
+}
+
+/// Relights the fill and the edge of the picture beside it. The lighting (brightness averaged over
+/// `radius` px) the picture has `band` px and more from the hole is carried smoothly into the hole
+/// and across that band; the fill is pulled to it, and so is the band, fully at the hole and less
+/// and less to nothing `band` px out, in even areas only (sky, haze: not texture or a shadow's
+/// edge, which keep their own). Each pull is at most about `cap`. So a panorama's darker stitched edge or a lens's
+/// vignetting beside the hole is evened out instead of showing as a dark arc around the fill, and
+/// the fill doesn't copy that shading elsewhere. With no `active` pixels, only the band is relit
+/// (before a fill, so it copies the band relit). Lighting is smooth, so it is all worked out on
+/// a grid of blocks about half the radius across and the corrections are spread back over the
+/// pixels: cheap at any size. Returns the picture pixels it changed.
+pub(super) fn relight(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), active: &[bool], radius: usize, band: usize, cap: f32) -> Vec<usize> {
+    let (w, h, ch) = dims;
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+    for p in (0..w * h).filter(|p| px[*p] == Px::Hole) {
+        let (x, y) = (p % w, p / w);
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    if x0 > x1 || cap <= 0.0 || ch == 0 {
+        return Vec::new();
+    }
+    // The box around the hole, wide enough for the band, the picture past it and the blur.
+    let m = band + 2 * radius + 2;
+    let (x0, y0, x1, y1) = (x0.saturating_sub(m), y0.saturating_sub(m), (x1 + m).min(w - 1), (y1 + m).min(h - 1));
+    let s = (radius / 2).max(1);
+    let (bw, bh) = ((x1 - x0 + 1).div_ceil(s), (y1 - y0 + 1).div_ceil(s));
+    let n = bw * bh;
+    // Per block: the picture's sum, sum of squares and count; the fill's (with the picture) sum
+    // and count; whether any of it is hole.
+    let (mut psum, mut psq, mut pcount) = (vec![0.0f64; n * ch], vec![0.0f64; n], vec![0u32; n]);
+    let (mut asum, mut acount, mut holes) = (vec![0.0f64; n * ch], vec![0u32; n], vec![false; n]);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (p, b) = (y * w + x, ((y - y0) / s) * bw + (x - x0) / s);
+            let v = &img[p * ch..(p + 1) * ch];
+            let pic = matches!(px[p], Px::Source | Px::Known);
+            if px[p] == Px::Hole {
+                holes[b] = true;
+            }
+            if pic {
+                for c in 0..ch {
+                    psum[b * ch + c] += f64::from(v[c]);
+                    psq[b] += f64::from(v[c]) * f64::from(v[c]);
+                }
+                pcount[b] += 1;
+            }
+            if pic || active[p] {
+                for c in 0..ch {
+                    asum[b * ch + c] += f64::from(v[c]);
+                }
+                acount[b] += 1;
+            }
+        }
+    }
+    let mean = |sum: &[f64], count: &[u32]| -> Vec<f32> {
+        (0..n * ch).map(|i| if count[i / ch] > 0 { (sum[i] / f64::from(count[i / ch])) as f32 } else { 0.0 }).collect()
+    };
+    let (pmean, amean) = (mean(&psum, &pcount), mean(&asum, &acount));
+    let has_pic: Vec<bool> = pcount.iter().map(|c| *c > 0).collect();
+    let has_all: Vec<bool> = acount.iter().map(|c| *c > 0).collect();
+    // How even each block of picture is: its spread about its own mean, per channel.
+    let spread: Vec<f32> = (0..n)
+        .map(|b| {
+            if pcount[b] == 0 {
+                return f32::INFINITY;
+            }
+            let k = f64::from(pcount[b]) * ch as f64;
+            let mu2: f64 = (0..ch).map(|c| (psum[b * ch + c] / f64::from(pcount[b])).powi(2)).sum::<f64>() / ch as f64;
+            ((psq[b] / k - mu2).max(0.0).sqrt()) as f32
+        })
+        .collect();
+    let rl = radius.div_ceil(s).max(1);
+    let pic_light = box_mean(&pmean, &has_pic, bw, bh, ch, rl);
+    let fill_light = box_mean(&amean, &has_all, bw, bh, ch, rl);
+    let dist: Vec<f32> = chamfer(&holes, bw, bh).iter().map(|d| d * s as f32).collect();
+    // The lighting carried in from the band's far side.
+    let unknown: Vec<bool> = (0..n).map(|b| !(has_pic[b] && dist[b] >= band as f32)).collect();
+    let carried = crate::poisson::membrane_fill(bw, bh, ch, &pic_light, &unknown);
+    // How even the picture is, block by block, and carried into the hole: the fill is relit
+    // only where the picture around it is even too (a hole across a shadow's edge or in a
+    // textured area keeps the lighting its copies bring).
+    // (Its spread within each block, and of the blocks about their lighting nearby.)
+    let dev: Vec<f32> = (0..n).map(|b| (0..ch).map(|c| (pmean[b * ch + c] - pic_light[b * ch + c]).powi(2)).sum::<f32>() / ch as f32).collect();
+    let dev = box_mean(&dev, &has_pic, bw, bh, 1, rl);
+    let even: Vec<f32> = (0..n).map(|b| (1.0 - ((spread[b].powi(2) + dev[b]).sqrt() - EVEN) / EVEN).clamp(0.0, 1.0)).collect();
+    let no_pic: Vec<bool> = has_pic.iter().map(|p| !p).collect();
+    let even_in = crate::poisson::membrane_fill(bw, bh, 1, &even, &no_pic);
+    let soft = |d: f32| cap * (d / cap).tanh();
+    let even_at = |b: usize| if has_pic[b] { even[b] } else { 0.0 };
+    let mut fill_corr = vec![0.0f32; n * ch];
+    let mut band_corr = vec![0.0f32; n * ch];
+    for b in 0..n {
+        for c in 0..ch {
+            let i = b * ch + c;
+            if has_all[b] {
+                fill_corr[i] = even_in[b] * soft(carried[i] - fill_light[i]);
+            }
+            if has_pic[b] && dist[b] < band as f32 {
+                let t = (dist[b] / band as f32).clamp(0.0, 1.0);
+                let fade = 1.0 - t * t * (3.0 - 2.0 * t);
+                band_corr[i] = fade * even_at(b) * soft(carried[i] - pic_light[i]);
+            }
+        }
+    }
+    // Spread back over the pixels, bilinearly between block centres.
+    let sample = |corr: &[f32], x: usize, y: usize, c: usize| -> f32 {
+        let fx = ((x - x0) as f32 + 0.5) / s as f32 - 0.5;
+        let fy = ((y - y0) as f32 + 0.5) / s as f32 - 0.5;
+        let (ix, iy) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
+        let (ix, iy) = (ix.min(bw - 1), iy.min(bh - 1));
+        let (jx, jy) = ((ix + 1).min(bw - 1), (iy + 1).min(bh - 1));
+        let (tx, ty) = ((fx - ix as f32).clamp(0.0, 1.0), (fy - iy as f32).clamp(0.0, 1.0));
+        let g = |bx: usize, by: usize| corr[(by * bw + bx) * ch + c];
+        (g(ix, iy) * (1.0 - tx) + g(jx, iy) * tx) * (1.0 - ty) + (g(ix, jy) * (1.0 - tx) + g(jx, jy) * tx) * ty
+    };
+    let mut changed = Vec::new();
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let p = y * w + x;
+            let corr = if active[p] {
+                &fill_corr
+            } else if matches!(px[p], Px::Source | Px::Known) && dist[((y - y0) / s) * bw + (x - x0) / s] < (band + s) as f32 {
+                &band_corr
+            } else {
+                continue;
+            };
+            for c in 0..ch {
+                img[p * ch + c] += sample(corr, x, y, c);
+            }
+            if !active[p] {
+                changed.push(p);
+            }
+        }
+    }
+    changed
+}
+
+/// How far the picture strays from its own lighting where it counts as even (in 0..1 of a
+/// channel); twice that is texture, which [`relight`] leaves alone.
+const EVEN: f32 = 3.0 / 255.0;
+
+/// `px` with the picture within `m` px of the hole matched against but not copied from
+/// ([`Px::Known`]).
+pub(super) fn keep_off_edge(px: &[Px], w: usize, h: usize, m: usize) -> Vec<Px> {
+    let hole: Vec<bool> = px.iter().map(|p| *p == Px::Hole).collect();
+    let near = dilate_box(&hole, w, h, m);
+    px.iter().zip(&near).map(|(p, n)| if *n && *p == Px::Source { Px::Known } else { *p }).collect()
 }
