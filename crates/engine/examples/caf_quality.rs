@@ -5,6 +5,8 @@
 //! cargo run --release -p photocraft-engine --example caf_quality -- <photos dir> <out dir> [methods]
 //! ```
 //!
+//! `CAF_HOLES=real,corner,big` keeps only the holes whose names start with those.
+//!
 //! `methods`: comma-separated, from `classic`, `classicDepth`, `lama`, `migan`, `mix` (default
 //! `classic,classicDepth,lama,mix`); the model methods stamp at the same depth, as the dialog
 //! starts. A model whose weights aren't there is reported as `n/a`.
@@ -442,6 +444,9 @@ fn main() {
         if (0.002..0.6).contains(&clear) {
             cases.push(("real".to_string(), opaque.iter().map(|o| !*o).collect(), false));
         }
+        // `CAF_HOLES=real,corner,big` (prefixes) keeps only those holes, for a quicker run.
+        let only: Option<Vec<String>> = std::env::var("CAF_HOLES").ok().map(|v| v.split(',').map(str::to_string).collect());
+        cases.retain(|(case, _, _)| only.as_ref().is_none_or(|o| o.iter().any(|p| case.starts_with(p.as_str()))));
         for (case, m, scored) in &cases {
             let s = match session(&photo, m) {
                 Ok(s) => s,
