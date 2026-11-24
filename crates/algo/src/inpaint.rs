@@ -85,6 +85,13 @@ fn seams_on() -> bool {
     *ON.get_or_init(|| !std::env::var("PHOTOCRAFT_CAF_SEAMS").is_ok_and(|v| v == "off"))
 }
 
+/// How far either side of a cut seam its two copies cross-fade ([`seams::feather`]): two patch
+/// radii, or `PHOTOCRAFT_CAF_FEATHER` px (0: none), to compare on the quality test.
+fn seam_feather(r: usize) -> usize {
+    static FEATHER: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    FEATHER.get_or_init(|| std::env::var("PHOTOCRAFT_CAF_FEATHER").ok().and_then(|v| v.parse().ok())).unwrap_or(2 * r)
+}
+
 /// How strongly a guided fill favours coherent matches ([`Solver::coherence`]).
 const GUIDED_COHERENCE: f32 = 6.0;
 /// The least distance a nearby fill copies from ([`CompleteParams::nearby`]), full-size px.

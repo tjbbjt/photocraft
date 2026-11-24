@@ -519,6 +519,9 @@ impl Solver<'_> {
         // A pixel without a match of its own stays as voted.
         let active: Vec<bool> = active.iter().zip(&matched).map(|(a, m)| *a && *m).collect();
         super::seams::cut(&mut self.img[..], self.px, w, h, self.ch, &active, &mut labels);
+        // Then cross-faded over about two patches, so no seam is left hard.
+        let f = super::seam_feather(self.r.max(1) as usize);
+        super::seams::feather(&mut self.img[..], self.px, (w, h, self.ch), &active, &labels, f);
     }
 
     /// One PatchMatch pass over all target rows, in bands of the grid's rows: each band is

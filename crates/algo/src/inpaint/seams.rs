@@ -156,6 +156,103 @@ pub(super) fn cut(img: &mut [f32], px: &[Px], w: usize, h: usize, ch: usize, act
     }
 }
 
+/// Feathers the seams [`cut`] left: each active pixel within `f` pixels of a seam (an active
+/// neighbour from another copy) becomes the mix of the copies around it, each weighted by how
+/// many of its pixels are near and how near (a tent falling to nothing `f + 1` pixels away), so
+/// two copies cross-fade over about `2f` pixels instead of meeting at a hard edge. Pixels
+/// farther from any seam keep their copy as it is.
+pub(super) fn feather(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), active: &[bool], labels: &[(i32, i32)], f: usize) {
+    let (w, h, ch) = dims;
+    if f == 0 {
+        return;
+    }
+    let seam: Vec<bool> = (0..w * h)
+        .map(|p| {
+            let (x, y) = (p % w, p / w);
+            let differs = |q: usize| active[q] && labels[q] != labels[p];
+            active[p] && ((x > 0 && differs(p - 1)) || (x + 1 < w && differs(p + 1)) || (y > 0 && differs(p - w)) || (y + 1 < h && differs(p + w)))
+        })
+        .collect();
+    let near = dilate_box(&seam, w, h, f);
+    let par = w * h >= PAR_MIN;
+    let view = View { img: &*img, px, w, h, ch };
+    let rows = par::map(h, par, |y| {
+        let mut out: Vec<(usize, Vec<f32>)> = Vec::new();
+        let mut copies: Vec<((i32, i32), f32)> = Vec::new();
+        for x in 0..w {
+            let p = y * w + x;
+            if !active[p] || !near[p] {
+                continue;
+            }
+            copies.clear();
+            for qy in y.saturating_sub(f)..(y + f + 1).min(h) {
+                for qx in x.saturating_sub(f)..(x + f + 1).min(w) {
+                    let q = qy * w + qx;
+                    if !active[q] {
+                        continue;
+                    }
+                    let d = qx.abs_diff(x).max(qy.abs_diff(y));
+                    let wt = (f + 1 - d) as f32;
+                    match copies.iter_mut().find(|c| c.0 == labels[q]) {
+                        Some(c) => c.1 += wt,
+                        None => copies.push((labels[q], wt)),
+                    }
+                }
+            }
+            let mut acc = vec![0.0f32; ch];
+            let mut sum = 0.0f32;
+            for &(l, wt) in &copies {
+                if let Some(v) = view.at(x, y, l) {
+                    for (a, v) in acc.iter_mut().zip(v) {
+                        *a += v * wt;
+                    }
+                    sum += wt;
+                }
+            }
+            if sum > 0.0 {
+                acc.iter_mut().for_each(|a| *a /= sum);
+                out.push((p, acc));
+            }
+        }
+        out
+    });
+    for (p, v) in rows.into_iter().flatten() {
+        img[p * ch..(p + 1) * ch].copy_from_slice(&v);
+    }
+}
+
+/// `mask` grown by `f` pixels in each direction (a `(2f + 1)²` box).
+fn dilate_box(mask: &[bool], w: usize, h: usize, f: usize) -> Vec<bool> {
+    let grow = |get: &dyn Fn(usize) -> bool, len: usize, out: &mut dyn FnMut(usize, bool)| {
+        // The distance back to the last set pixel, then forward to the next.
+        let mut last: Option<usize> = None;
+        let mut near = vec![false; len];
+        for (i, n) in near.iter_mut().enumerate() {
+            if get(i) {
+                last = Some(i);
+            }
+            *n = last.is_some_and(|l| i - l <= f);
+        }
+        last = None;
+        for i in (0..len).rev() {
+            if get(i) {
+                last = Some(i);
+            }
+            out(i, near[i] || last.is_some_and(|l| l - i <= f));
+        }
+    };
+    let mut rows = vec![false; w * h];
+    for y in 0..h {
+        let line = &mask[y * w..(y + 1) * w];
+        grow(&|i| line[i], w, &mut |c, v| rows[y * w + c] = v);
+    }
+    let mut out = vec![false; w * h];
+    for x in 0..w {
+        grow(&|i| rows[i * w + x], h, &mut |c, v| out[c * w + x] = v);
+    }
+    out
+}
+
 /// The hole pixels whose whole `(2r + 1)²` box is hole: the ones a stamped fill takes from one
 /// copy (nearer the picture it blends).
 pub(super) fn deep_in_hole(px: &[Px], w: usize, h: usize, r: usize) -> Vec<bool> {

@@ -978,10 +978,11 @@ fn a_layout_only_guide_lays_out_the_hole_and_classic_fills_it() {
     assert!(spread(30) > 0.05 && spread(50) > 0.02, "spread {} / {}", spread(30), spread(50));
 }
 
-/// A nearby fill stamps: away from the picture, each pixel is one of the picture's own (a sharp
-/// copy, not a blend of near misses); beside it, a blend.
+/// A nearby fill stamps: away from the picture its pixels are copies of the picture's, cross-faded
+/// only where two copies meet ([`super::seams::feather`]), so it keeps the picture's texture
+/// rather than greying it into a blend of near misses.
 #[test]
-fn a_nearby_fill_copies_pixels_whole_away_from_the_picture() {
+fn a_nearby_fill_keeps_the_texture_away_from_the_picture() {
     let (w, h, ch) = (96, 64, 3);
     let img = busy(w, h, ch, 9);
     let hole = disc(w, h, 48.0, 32.0, 14.0);
@@ -989,13 +990,15 @@ fn a_nearby_fill_copies_pixels_whole_away_from_the_picture() {
     let none = photocraft_raster::Interrupt::NONE;
     let p = CompleteParams { nearby: true, ..Default::default() };
     let out = complete_masked_owned(w, h, ch, img.clone(), &px, &p, &none).unwrap().unwrap();
-    let picture: std::collections::HashSet<[u32; 3]> =
-        (0..w * h).filter(|i| !hole[*i]).map(|i| [img[i * ch].to_bits(), img[i * ch + 1].to_bits(), img[i * ch + 2].to_bits()]).collect();
     let deep = disc(w, h, 48.0, 32.0, 8.0);
-    let whole =
-        (0..w * h).filter(|i| deep[*i]).filter(|i| picture.contains(&[out[i * ch].to_bits(), out[i * ch + 1].to_bits(), out[i * ch + 2].to_bits()])).count();
-    let n = deep.iter().filter(|d| **d).count();
-    assert_eq!(whole, n, "{whole} of {n} pixels deep in the hole are copies");
+    // Mean step to the right neighbour, over the given pixels.
+    let step = |a: &[f32], m: &dyn Fn(usize) -> bool| {
+        let v: Vec<f32> =
+            (0..w * h).filter(|i| i % w + 1 < w && m(*i)).map(|i| (0..ch).map(|c| (a[(i + 1) * ch + c] - a[i * ch + c]).abs()).sum::<f32>()).collect();
+        v.iter().sum::<f32>() / v.len().max(1) as f32
+    };
+    let ratio = step(&out, &|i| deep[i]) / step(&img, &|i| !hole[i]);
+    assert!(ratio > 0.6, "texture deep in the hole is {ratio} of the picture's");
 }
 
 /// A seam cut ([`super::seams`]) takes from one copy only the pixels whose whole patch box is hole.
