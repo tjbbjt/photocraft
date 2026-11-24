@@ -402,7 +402,8 @@ fn complete_cow<'a>(
     let Pyramid { mut levels, boxes, exts, thin, thickness } = build_pyramid(Level { w, h, img, px: lpx0 }, ch, hb0, psz, ctl)?;
     let nlev = levels.len();
     // The guide at each level's size, finest first, and how much softer than that level it is.
-    let guides: Option<(Vec<Vec<f32>>, f32)> = guide.map(|(g, scale)| (guide_pyramid(g, w, h, ch, nlev), scale));
+    // A guide that only lays out the coarsest level keeps only that level.
+    let guides: Option<(Vec<Cow<'_, [f32]>>, f32)> = guide.map(|(g, scale)| (guide_pyramid(g, w, h, ch, nlev, !p.layout_only), scale));
     // The coarser level's result.
     let mut prev: Option<Coarser> = None;
     let total_px: usize = levels.iter().map(|l| l.w * l.h).sum();
@@ -623,9 +624,11 @@ fn build_pyramid<'a>(
 }
 
 /// A `w × h × ch` guide at each of `levels` pyramid levels, finest first: halved as the pyramid
-/// halves the picture (each cell the mean of its 2 × 2 pixels within the grid).
-fn guide_pyramid(g: &[f32], w: usize, h: usize, ch: usize, levels: usize) -> Vec<Vec<f32>> {
-    let mut out = vec![g.to_vec()];
+/// halves the picture (each cell the mean of its 2 × 2 pixels within the grid). Without
+/// `keep_all` only the coarsest is kept (the others are empty).
+fn guide_pyramid(g: &[f32], w: usize, h: usize, ch: usize, levels: usize, keep_all: bool) -> Vec<Cow<'_, [f32]>> {
+    // The finest level is the caller's guide itself, not a copy (a whole picture's worth).
+    let mut out: Vec<Cow<'_, [f32]>> = vec![Cow::Borrowed(g)];
     let (mut cw, mut chh) = (w, h);
     while out.len() < levels {
         let cur = &out[out.len() - 1];
@@ -648,7 +651,13 @@ fn guide_pyramid(g: &[f32], w: usize, h: usize, ch: usize, levels: usize) -> Vec
                 }
             }
         });
-        out.push(next);
+        if !keep_all {
+            // Only the coarsest is wanted: the level it was made from goes (an empty level is
+            // no guide there).
+            let last = out.len() - 1;
+            out[last] = Cow::Borrowed(&[]);
+        }
+        out.push(Cow::Owned(next));
         (cw, chh) = (nw, nh);
     }
     out
