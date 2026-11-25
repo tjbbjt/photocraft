@@ -51,8 +51,19 @@ pub fn quick_export_target_is_own_file(s: &Session) -> bool {
 
 /// File › Export › Quick Export as <format>: the format, quality, metadata, colour space and
 /// location from Export Preferences. `path` overrides the location ("ask" needs one).
+///
+/// A document with artboards writes one file per artboard instead, `<artboard name>.<format>`,
+/// into the folder `dir` names (else the folder of `path`, else the location), as the reference
+/// application does (#12902): it wrote one image of the whole canvas with every board side by side.
+///
+/// Flattening and encoding run as a job: a storyboard's boards took 13.7 s on the UI thread, and
+/// the compositor closed the window that stopped answering.
 pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.export.quickExport";
+    let has_boards = s.active().is_some_and(|d| !d.doc.artboards().is_empty());
+    if has_boards {
+        return quick_export_artboards(s, p);
+    }
     let prefs = s.prefs().export.clone();
     let fmt = quick_export_ext(s);
     let path = match p.get("path").and_then(Value::as_str).filter(|v| !v.is_empty()) {
@@ -76,15 +87,30 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
         Some(e @ ("png" | "gif" | "webp" | "exr")) => e.into(),
         Some(e) => return Err(bad(cmd, format!("Quick Export writes PNG, JPEG, GIF, WebP or EXR, not .{e}; use Export As"))),
     };
-    let d = s.active().ok_or(EngineError::NoDocument)?;
-    let doc = d.doc.clone();
+    let doc = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
+    crate::jobs::run(
+        s,
+        "Quick Export",
+        false,
+        move |ctx| {
+            ctx.progress(0.0, "Quick Export");
+            export_quick(&doc, &path, &fmt, &prefs, cmd)
+        },
+        |s, out| {
+            crate::automate_cmds::fire_event(s, "export");
+            Ok(out)
+        },
+    )
+}
+
+/// One Quick Export file: `doc` written to `path` as `fmt` with Export Preferences `prefs`.
+fn export_quick(doc: &photocraft_doc::Document, path: &str, fmt: &str, prefs: &crate::prefs::Export, cmd: &str) -> Result<Value> {
     if fmt == "exr" {
         // EXR keeps floating-point scene values. The ordinary exporter converts to linear
         // light; the web/sRGB pipeline would instead clamp HDR and negative values.
         let opts = photocraft_io::ExportOptions { xmp: photocraft_io::XmpEmbed::None, ..Default::default() };
-        let out = photocraft_io::export(&doc, "exr", &opts).map_err(other)?;
-        write_file(&path, &out.bytes)?;
-        crate::automate_cmds::fire_event(s, "export");
+        let out = photocraft_io::export(doc, "exr", &opts).map_err(other)?;
+        write_file(path, &out.bytes)?;
         return Ok(json!({"path": path, "format": fmt, "bytes": out.bytes.len(), "warnings": out.warnings}));
     }
     let metadata = serde_json::to_value(prefs.metadata).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
@@ -102,7 +128,7 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
     o.insert("convertToSrgb".into(), json!(prefs.convert_to_srgb));
     o.insert("transparency".into(), json!(true));
     o.insert("matte".into(), json!("#ffffff"));
-    match fmt.as_str() {
+    match fmt {
         "jpg" => {
             o.insert("format".into(), json!("jpeg"));
             o.insert("quality".into(), json!(prefs.jpeg_quality.min(100)));
@@ -118,14 +144,13 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
             // 0–12 save scale: invert that mapping so the codec receives the chosen 1–100.
             // Keeping quality absent preserves the historical lossless Quick Export behavior.
             let st = WebSettings::from_params(&Value::Object(o.clone()), cmd)?;
-            let (mut wdoc, _, _) = web_document(&doc, &json!({}), &st)?;
+            let (mut wdoc, _, _) = web_document(doc, &json!({}), &st)?;
             // The regular exporter embeds the document's XMP and EXIF as they are: give it only
             // what the metadata choice keeps, as the Save for Web formats get.
-            wdoc.metadata.xmp = web_xmp(&doc, st.metadata).map(std::sync::Arc::from);
-            wdoc.metadata.exif = web_exif(&doc, st.metadata).map(|e| std::sync::Arc::new(e.to_vec()));
+            wdoc.metadata.xmp = web_xmp(doc, st.metadata).map(std::sync::Arc::from);
+            wdoc.metadata.exif = web_exif(doc, st.metadata).map(|e| std::sync::Arc::new(e.to_vec()));
             let quality = if prefs.webp_lossless { None } else { Some((f64::from(prefs.webp_quality.clamp(1, 100)) - 1.0) * 12.0 / 99.0) };
-            let warnings = crate::file_cmds::save_doc(&wdoc, &path, quality)?;
-            crate::automate_cmds::fire_event(s, "export");
+            let warnings = crate::file_cmds::save_doc(&wdoc, path, quality)?;
             return Ok(json!({"path": path, "format": fmt, "warnings": warnings}));
         }
         _ => {
@@ -134,10 +159,10 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let q = Value::Object(o);
     let st = WebSettings::from_params(&q, cmd)?;
-    let (wdoc, _, _) = web_document(&doc, &json!({}), &st)?;
+    let (wdoc, _, _) = web_document(doc, &json!({}), &st)?;
     let buf = photocraft_compose::flatten(&wdoc);
-    let xmp = web_xmp(&doc, st.metadata);
-    let exif = web_exif(&doc, st.metadata);
+    let xmp = web_xmp(doc, st.metadata);
+    let exif = web_exif(doc, st.metadata);
     let opt = optimize(
         &buf.px,
         wdoc.size.width as usize,
@@ -149,11 +174,84 @@ pub(super) fn quick_export(s: &mut Session, p: &Value) -> Result<Value> {
         wdoc.resolution_dpi,
         false,
     )?;
-    write_file(&path, &opt.bytes)?;
-    crate::automate_cmds::fire_event(s, "export");
+    write_file(path, &opt.bytes)?;
     Ok(json!({"path": path, "format": fmt, "bytes": opt.bytes.len(), "warnings": web_warnings(&st, exif, wdoc.resolution_dpi)}))
 }
 
+/// [`quick_export`] of a document with artboards (#12902): each artboard with pixels becomes
+/// `<artboard name>.<format>` in one folder, top board of the Layers panel first. Names an earlier
+/// board took (letter case ignored) get `-2`, `-3`…, as Artboards to Files numbers them. Every
+/// board is made before the first file is written, and the document's own file is never replaced.
+/// The boards are made and written in a job, a progress step per board.
+/// `{dir?, path?}` → `{files: [{path, format, …}], format}`.
+fn quick_export_artboards(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "file.export.quickExport";
+    let prefs = s.prefs().export.clone();
+    let named = |key: &str| p.get(key).and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string);
+    let path_dir = |path: &str| std::path::Path::new(path).parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    let (dir, fmt) = match (named("dir"), named("path")) {
+        (Some(dir), _) => (dir, quick_export_ext(s)),
+        // A file named in the save dialog: its folder, and its extension's format.
+        (None, Some(path)) => {
+            let fmt = match crate::file_cmds::extension(&path).as_deref() {
+                None => quick_export_ext(s),
+                Some("jpg" | "jpeg") => "jpg".into(),
+                Some(e @ ("png" | "gif" | "webp" | "exr")) => e.into(),
+                Some(e) => return Err(bad(cmd, format!("Quick Export writes PNG, JPEG, GIF, WebP or EXR, not .{e}; use Export As"))),
+            };
+            (path_dir(&path), fmt)
+        }
+        (None, None) => match quick_export_target(s) {
+            Some(target) => (path_dir(&target), quick_export_ext(s)),
+            None => return Err(bad(cmd, "missing `dir` (Export Preferences › Location is \"ask\", or the document was never saved)")),
+        },
+    };
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let doc = d.doc.clone();
+    let own = d.path.clone();
+    crate::jobs::run(
+        s,
+        "Quick Export",
+        false,
+        move |ctx| {
+            ctx.progress(0.0, "Quick Export");
+            // Top board of the Layers panel first, as Artboards to Files writes them.
+            let boards: Vec<photocraft_doc::Document> = doc
+                .artboards()
+                .into_iter()
+                .rev()
+                .filter_map(|(id, _, _)| crate::artboard_cmds::artboard_document(&doc, id).transpose())
+                .collect::<Result<_>>()?;
+            if boards.is_empty() {
+                return Err(bad(cmd, "the artboards are empty"));
+            }
+            let names: Vec<&str> = boards.iter().map(|b| b.name.as_str()).collect();
+            let paths: Vec<String> =
+                crate::artboard_cmds::artboard_file_stems("", &names, false).into_iter().map(|stem| join(&dir, &format!("{stem}.{fmt}"))).collect();
+            if let Some(own) = own.as_deref()
+                && let Some(path) = paths.iter().find(|path| crate::file_cmds::same_file(path, own))
+            {
+                return Err(bad(cmd, format!("the export would replace the document's own file {path}; rename that artboard or choose another folder")));
+            }
+            let n = boards.len();
+            let mut files = Vec::new();
+            for (i, (board, path)) in boards.iter().zip(&paths).enumerate() {
+                ctx.check()?;
+                ctx.progress(i as f32 / n as f32, &format!("Artboard {} of {n}", i + 1));
+                files.push(export_quick(board, path, &fmt, &prefs, cmd)?);
+            }
+            Ok(json!({"files": files, "format": fmt}))
+        },
+        |s, out| {
+            crate::automate_cmds::fire_event(s, "export");
+            Ok(out)
+        },
+    )
+}
+
+#[cfg(test)]
+#[path = "quick_artboards_tests.rs"]
+mod quick_artboards_tests;
 #[cfg(test)]
 #[path = "quick_jpg_progressive_tests.rs"]
 mod quick_jpg_progressive_tests;

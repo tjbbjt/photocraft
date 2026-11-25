@@ -667,6 +667,14 @@ fn on_event(app: &mut PhotocraftApp, ctx: &egui::Context, e: JobEvent) {
     if crate::camera_raw_ui::on_redevelop_event(app, &e) {
         return;
     }
+    // Quick Export says what it wrote: one file, or one per artboard (#12902).
+    if e.command == "file.export.quickExport"
+        && let JobOutcome::Done(result) = &e.outcome
+    {
+        app.sync_views();
+        crate::export_dialog::quick_export_done(app, result);
+        return;
+    }
     if app.jobs.place.as_ref().is_some_and(|p| p.job == e.id)
         && let Some(place) = app.jobs.place.take()
     {

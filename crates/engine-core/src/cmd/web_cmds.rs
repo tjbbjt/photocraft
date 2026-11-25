@@ -98,7 +98,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Quick Export",
             &[],
             None,
-            r##"{"path":str? (required unless Export Preferences › Location is "sameFolder" and the document is saved)} → {path, format, bytes, warnings}"##,
+            r##"{"path":str? (required unless Export Preferences › Location is "sameFolder" and the document is saved),"dir":folder? (a document with artboards)} → {path, format, bytes, warnings}; with artboards one file per board, "<artboard name>.<format>" in `dir` (else the folder of `path`, else the location) → {files: [{path, format, bytes, warnings}], format}"##,
             native_doc,
             quick_export
         ),
