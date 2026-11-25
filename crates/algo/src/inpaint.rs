@@ -61,6 +61,13 @@ mod solver;
 mod sources;
 mod synthesis;
 
+/// The sky rule ([`sky::SkyRule`]) lays out where cloud and sky go at the coarse levels, up to
+/// this many pixels across; the finer levels only refine that layout, free to copy what matches
+/// best. Held at every level, a full-size panorama ran out of cloud to copy where a cloud is
+/// finished (one copy repeated past the border), and the rule's own work over the whole picture
+/// at each level tripled the matching time.
+const SKY_RULE_MAX_W: usize = 1280;
+
 use cells::Cells;
 #[cfg(test)]
 use common::Bounds;
@@ -519,7 +526,7 @@ fn complete_cow<'a>(
                 };
                 let mut d = Depth::new(&valid, lw, lh, reach, p.patch_radius as i32, SAME_DEPTH_PER_ROW, &horizon);
                 // Above the horizon: cut clouds go on, no new cloud where the edge is sky.
-                if !horizon.is_empty() {
+                if !horizon.is_empty() && lw <= SKY_RULE_MAX_W {
                     d.sky = sky::SkyRule::new(&limg, &lpx, lw, lh, ch, |x| d.horizon_at(x), p.patch_radius);
                 }
                 d
