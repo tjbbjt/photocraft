@@ -56,6 +56,7 @@ mod common;
 mod horizon;
 mod levels;
 mod seams;
+mod sky;
 mod solver;
 mod sources;
 mod synthesis;
@@ -516,7 +517,12 @@ fn complete_cow<'a>(
                         .collect(),
                     _ => Vec::new(),
                 };
-                Depth::new(&valid, lw, lh, reach, p.patch_radius as i32, SAME_DEPTH_PER_ROW, &horizon)
+                let mut d = Depth::new(&valid, lw, lh, reach, p.patch_radius as i32, SAME_DEPTH_PER_ROW, &horizon);
+                // Above the horizon: cut clouds go on, no new cloud where the edge is sky.
+                if !horizon.is_empty() {
+                    d.sky = sky::SkyRule::new(&limg, &lpx, lw, lh, ch, |x| d.horizon_at(x), p.patch_radius);
+                }
+                d
             } else {
                 Depth::new(&valid, lw, lh, reach, reach as i32, 0.0, &[])
             }

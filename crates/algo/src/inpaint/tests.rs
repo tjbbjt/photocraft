@@ -1123,3 +1123,49 @@ fn relit_edge_stays_near_the_hole() {
     super::seams::relight(&mut tex, &px, (w, h, 1), &vec![false; w * h], radius, band, cap);
     assert!(tex.iter().zip(&tex0).all(|(a, b)| (a - b).abs() < 1e-3));
 }
+
+/// The sky rule ([`super::sky::SkyRule`]): a cloud the hole's edge cuts goes on into the hole;
+/// over one whose top only grazes the edge, and over sky, the fill copies no cloud. Clear or
+/// mostly cloudy skies have no rule.
+#[test]
+fn a_cut_cloud_goes_on_and_a_grazing_one_gets_sky_above_it() {
+    let (w, h, ch, horizon) = (96usize, 96usize, 3usize, 70usize);
+    let (sky, cloud, ground) = ([0.2f32, 0.27, 0.42], [0.82f32, 0.82, 0.84], [0.35f32, 0.3, 0.25]);
+    let scene = |cut: bool, disc: bool| -> Vec<f32> {
+        (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = ((i % w) as f32, (i / w) as f32);
+                if i / w >= horizon {
+                    ground
+                } else if (cut && x < 20.0 && y < 40.0) || (disc && (x - 60.0).powi(2) + (y - 30.0).powi(2) <= 24.0 * 24.0) {
+                    cloud
+                } else {
+                    sky
+                }
+            })
+            .collect()
+    };
+    // The hole: a strip along the top, rows 0..6 (the disc's top touches it at row 6).
+    let px: Vec<Px> = (0..w * h).map(|i| if i / w < 6 { Px::Hole } else { Px::Source }).collect();
+    let img = scene(true, true);
+    let k = super::sky::SkyRule::new(&img, &px, w, h, ch, |_| horizon as i32, 1).expect("a sky rule");
+    assert!(k.allows((8, 4), (10, 20), w), "over the cut cloud, the cloud goes on");
+    assert!(!k.allows((4, 3), (92, 60), w), "with cloud, not sky");
+    assert!(!k.allows((60, 3), (60, 30), w), "over the grazing cloud, no cloud");
+    assert!(k.allows((60, 3), (92, 60), w), "but sky");
+    assert!(!k.allows((90, 3), (10, 20), w), "over sky, no cloud");
+    assert!(super::sky::SkyRule::new(&scene(false, false), &px, w, h, ch, |_| horizon as i32, 1).is_none(), "a clear sky has no rule");
+    // A sky that is mostly cloud, with a few gaps of blue: no rule (its gaps are too small to copy).
+    let overcast: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            if i / w >= horizon {
+                ground
+            } else if (i % w) % 16 < 3 {
+                sky
+            } else {
+                cloud
+            }
+        })
+        .collect();
+    assert!(super::sky::SkyRule::new(&overcast, &px, w, h, ch, |_| horizon as i32, 1).is_none(), "a mostly cloudy sky has no rule");
+}

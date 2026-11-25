@@ -143,7 +143,10 @@ impl Solver<'_> {
     /// about its depth, for one at the same depth.
     #[inline]
     pub(super) fn allowed(&self, t: (i32, i32), s: (i32, i32)) -> bool {
-        self.reach <= 0 || ((s.0 - t.0).abs() <= self.reach && self.depth_step(t, s).abs() <= self.rows_of(t))
+        self.reach <= 0
+            || ((s.0 - t.0).abs() <= self.reach
+                && self.depth_step(t, s).abs() <= self.rows_of(t)
+                && self.depth.as_ref().and_then(|d| d.sky.as_ref()).is_none_or(|k| k.allows(t, s, self.w)))
     }
 
     /// What copying `s` costs on top of the patch distance: [`Uses::factor`], 1 without.
@@ -1155,6 +1158,8 @@ pub(super) struct Depth {
     to_sources: Vec<(u16, (i32, i32))>,
     /// Blocks across.
     bw: usize,
+    /// Above the horizon: which targets copy only sky ([`super::sky::SkyRule`]).
+    pub(super) sky: Option<super::sky::SkyRule>,
 }
 
 /// The block [`Depth`] measures in, px.
@@ -1227,7 +1232,7 @@ impl Depth {
             k.0 = k.0.saturating_mul(DEPTH_BLOCK as u16);
         }
         let horizon = horizon.iter().map(|v| v.round() as i32).collect();
-        Self { least: least.max(1), per_row, horizon, to_sources, bw }
+        Self { least: least.max(1), per_row, horizon, to_sources, bw, sky: None }
     }
 
     #[inline]
