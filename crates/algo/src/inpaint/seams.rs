@@ -515,9 +515,9 @@ impl Level {
         let half = |src: &[f32], dst: &mut [f32], parity: usize| {
             par::chunks_mut(dst, self.w, par, |y, row| {
                 for &(a, e) in &self.spans[y] {
-                    for x in a..e {
+                    for (x, out) in row.iter_mut().enumerate().take(e).skip(a) {
                         let p = y * self.w + x;
-                        row[x] = if (x + y) % 2 == parity { (b[p] + self.nbr_sum(x, y, src)) / self.diag[p] } else { src[p] };
+                        *out = if (x + y) % 2 == parity { (b[p] + self.nbr_sum(x, y, src)) / self.diag[p] } else { src[p] };
                     }
                 }
             });
@@ -822,15 +822,15 @@ pub(super) fn relight(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
                     r.holes[b] = true;
                 }
                 if pic {
-                    for c in 0..ch {
-                        r.psum[b * ch + c] += f64::from(v[c]);
-                        r.psq[b] += f64::from(v[c]) * f64::from(v[c]);
+                    for (sum, &x) in r.psum[b * ch..(b + 1) * ch].iter_mut().zip(v) {
+                        *sum += f64::from(x);
+                        r.psq[b] += f64::from(x) * f64::from(x);
                     }
                     r.pcount[b] += 1;
                 }
                 if pic || active[p] {
-                    for c in 0..ch {
-                        r.asum[b * ch + c] += f64::from(v[c]);
+                    for (sum, &x) in r.asum[b * ch..(b + 1) * ch].iter_mut().zip(v) {
+                        *sum += f64::from(x);
                     }
                     r.acount[b] += 1;
                 }
