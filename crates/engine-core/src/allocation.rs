@@ -39,10 +39,20 @@ pub(crate) fn capacity<T>(len: usize, purpose: &str) -> Result<Vec<T>> {
     if failpoint_hits() {
         return Err(error(purpose, "not enough memory"));
     }
+    // On Linux the system grants nearly any request and the out-of-memory killer ends the
+    // process once the pages are used, so asking alone protects nothing: a large buffer first
+    // makes room against PhotoCraft's own memory limit, moving image tiles to the scratch disk,
+    // and is refused only when that can't free enough.
+    if bytes >= ADMIT_FROM_BYTES {
+        photocraft_raster::memory::make_room(bytes as u64).map_err(|why| error(purpose, &why))?;
+    }
     let mut out = Vec::new();
     out.try_reserve_exact(len).map_err(|_| error(purpose, &format!("not enough memory for {bytes} bytes")))?;
     Ok(out)
 }
+
+/// Buffers from this size up make room under the memory limit before they are allocated.
+const ADMIT_FROM_BYTES: usize = 16 << 20;
 
 /// `Vec::push` that reports an allocation failure instead of aborting; each call is one
 /// attempt for the test failpoints.

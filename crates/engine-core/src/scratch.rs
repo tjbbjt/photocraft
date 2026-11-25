@@ -59,6 +59,9 @@ mod native {
                         if measured.elapsed() >= Duration::from_secs(2) {
                             photocraft_raster::memory::refresh();
                             measured = Instant::now();
+                        } else {
+                            // Between measurements the budget follows the heap's live count.
+                            photocraft_raster::memory::refresh_fast();
                         }
                         photocraft_raster::spill::maintain_budget();
                     }
@@ -137,11 +140,20 @@ mod native {
     }
 }
 
+/// The ceiling Auto Memory Usage asks for: the most `memory::budgets` takes, so what the system
+/// has free (with its own safety margin) is the limit.
+const AUTO_PERCENT: u8 = 95;
+
 pub(crate) fn configure(prefs: &Preferences) {
     #[cfg(all(test, not(target_arch = "wasm32")))]
     photocraft_raster::spill::use_test_volume_space();
+    // Memory Usage left at its default means Auto: only the hardware bounds the process (the
+    // RAM the system has free, less a safety margin for everything else; see `memory::budgets`),
+    // not a fixed 8 GB on a machine with 32 or 128. A percentage or size the user chose is a cap
+    // below that, as Photoshop's Memory Usage is.
+    let auto = prefs.performance.memory_usage_percent.is_none() && prefs.performance.memory_usage_mb == crate::prefs::DEFAULT_MEMORY_USAGE_MB;
     let budget = photocraft_raster::memory::configure(photocraft_raster::memory::Policy {
-        percent: prefs.performance.memory_usage_percent,
+        percent: if auto { Some(AUTO_PERCENT) } else { prefs.performance.memory_usage_percent },
         // The web build's cap applies here too (effective_memory_usage_mb).
         absolute_bytes: u64::from(prefs.performance.effective_memory_usage_mb()).saturating_mul(1 << 20),
     });
