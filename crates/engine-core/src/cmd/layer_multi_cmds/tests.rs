@@ -573,6 +573,43 @@ fn select_all(s: &mut Session, ids: &[LayerId]) {
     }
 }
 
+/// From the desktop app ([`Session::start`]) Merge Down, Merge Layers (⌘E) and Merge Group
+/// composite on a worker: each returns a job, and the merge lands as one undoable step once it
+/// ends. On a 1.1-gigapixel storyboard Merge Down took up to 1.7 s on the UI thread.
+#[test]
+fn merges_run_as_background_jobs() {
+    let start = |s: &mut Session, id: &str, p: serde_json::Value| match s.start(id, p).unwrap() {
+        crate::jobs::Started::Job(job) => s.wait_job(job).unwrap(),
+        crate::jobs::Started::Done(_) => panic!("{id} runs on a worker"),
+    };
+    let mut s = session(8);
+    let a = rect_layer(&mut s, Rect::new(0, 0, 4, 4));
+    let b = rect_layer(&mut s, Rect::new(4, 4, 8, 8));
+    start(&mut s, "layer.mergeDown", json!({"layer": b.0}));
+    assert!(doc(&s).layer(b).is_none(), "the upper layer is merged");
+    assert_eq!(bounds(&s, a), Rect::new(0, 0, 8, 8));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(doc(&s).layer(b).is_some(), "one undo puts both layers back");
+    // ⌘E with one layer selected is Merge Down, on a worker too.
+    s.execute("layer.select", json!({"layer": b.0})).unwrap();
+    start(&mut s, "layer.mergeLayers", json!({}));
+    assert!(doc(&s).layer(b).is_none() && doc(&s).layer(a).is_some());
+    s.execute("edit.undo", json!({})).unwrap();
+    // Several layers.
+    let c = rect_layer(&mut s, Rect::new(10, 10, 12, 12));
+    select_all(&mut s, &[a, c]);
+    let merged = LayerId(start(&mut s, "layer.mergeLayers", json!({}))["layer"].as_u64().unwrap());
+    assert!(doc(&s).layer(a).is_none() && doc(&s).layer(c).is_none() && doc(&s).layer(b).is_some());
+    assert_eq!(bounds(&s, merged), Rect::new(0, 0, 12, 12));
+    assert_eq!(sel(&s), [merged]);
+    // A group.
+    let inside = rect_layer(&mut s, Rect::new(20, 20, 24, 24));
+    s.execute("layer.select", json!({"layer": inside.0})).unwrap();
+    let g = LayerId(s.execute("layer.groupLayers", json!({})).unwrap()["layer"].as_u64().unwrap());
+    start(&mut s, "layer.mergeGroup", json!({"layer": g.0}));
+    assert!(matches!(doc(&s).layer(g).unwrap().content, LayerContent::Raster(_)), "the group is one raster layer");
+}
+
 #[test]
 fn toggle_and_range_selection() {
     let mut s = session(8);

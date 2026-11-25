@@ -167,7 +167,7 @@ pub(crate) use enabled::{always, check_all_unlocked, check_pixels_unlocked, has_
 use enabled::{can_redo, can_undo, has_doc, has_layer, has_pixel_or_channel, has_selection};
 pub(crate) use layer_params::{NEW_LAYER_PATH, explicit_layer, layer_listing, layer_panel_option, layer_param, mask_at_depth, mask_new_layer, selection_mask};
 pub(crate) use layer_references::{recorded_drop, recorded_layer};
-use ops::{arrange, merge_group, move_mask, set_mask, set_mask_and_deselect};
+use ops::{arrange, merge_down, merge_group, move_mask, set_mask, set_mask_and_deselect};
 pub(crate) use ops::{layer_copy, translate_layer, translate_layer_wrapped};
 use params::{bad, set_clipped};
 pub(crate) use params::{check_f32_values, cmyk_param, color_param, int, int_i32, parse_hex, u32_id, u32_id_param};

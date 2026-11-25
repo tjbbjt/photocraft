@@ -1,7 +1,7 @@
 use crate::cmd::{
     Adjustment, Color, ColorMode, CommandSpec, EngineError, Fill, Layer, LayerContent, LayerId, LayerMask, Result, Session, Value, adjustment_kind, arrange,
-    bad, cmyk_param, color_param, has_doc, has_layer, has_selection, json, layer_copy, layer_panel_option, layer_param, mask_new_layer, merge_group, move_mask,
-    parse_blend, pixels, set_clipped, set_mask, set_mask_and_deselect,
+    bad, cmyk_param, color_param, has_doc, has_layer, has_selection, json, layer_copy, layer_panel_option, layer_param, mask_new_layer, merge_down,
+    merge_group, move_mask, parse_blend, set_clipped, set_mask, set_mask_and_deselect,
 };
 use photocraft_color::BlendMode;
 
@@ -263,23 +263,7 @@ fn merging() -> Vec<CommandSpec> {
     vec![
         cmd!("layer.mergeDown", "Merge Down", ["Layer"], None, r##"{"layer":id?}"##, has_layer, |s, p| {
             let id = layer_param(s, p)?;
-            s.edit("Merge Down", |doc, active| {
-                let path = doc.path_of(id).ok_or(EngineError::NoLayer(id))?;
-                let Some((&idx, parent)) = path.split_last() else { return Err(EngineError::NoLayer(id)) };
-                if idx == 0 {
-                    return Err(EngineError::Other("no layer below to merge into".into()));
-                }
-                let mut below = parent.to_vec();
-                below.push(idx - 1);
-                let lower = doc.layer_at(&below).ok_or(EngineError::NoLayer(id))?.clone();
-                let upper = doc.layer(id).ok_or(EngineError::NoLayer(id))?.clone();
-                let merged = pixels::merge_down(doc, &lower, &upper);
-                doc.remove(id);
-                *doc.layer_at_mut(&below).ok_or(EngineError::NoLayer(lower.id))? = merged;
-                *active = Some(lower.id);
-                Ok(())
-            })?;
-            Ok(Value::Null)
+            merge_down(s, id)
         }),
         cmd!("layer.mergeGroup", "Merge Group", ["Layer"], None, r##"{"layer":id?}"##, has_layer, |s, p| {
             let id = layer_param(s, p)?;
