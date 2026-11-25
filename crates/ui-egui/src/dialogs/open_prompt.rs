@@ -20,6 +20,10 @@ use crate::PhotocraftApp;
 /// Tags the damaged-file prompt: the front of `held_opens` is the damaged file.
 pub(crate) struct DamageTag;
 
+/// The high-memory prompt's "Don't show again", under `Preferences::dialogs`: once ticked, files
+/// that would ask open as if "Open" was chosen. The hard limit still refuses what can't fit.
+pub const MEMORY_PREF: &str = "file.open.highMemory";
+
 /// Tags a high-memory prompt with the preflight it asks about, so an answer that arrives after the
 /// queue moved on is not applied to another file.
 pub(crate) struct MemoryTag {
@@ -149,6 +153,9 @@ pub(crate) fn answer_prompt(app: &mut PhotocraftApp, _ctx: &egui::Context, answe
     if let Some(MemoryTag { id }) = answer.take_tag::<MemoryTag>() {
         // `answer_memory` reports its own failures in the status bar.
         if app.held_memory_prompts.front().map(|m| m.id) == Some(id) {
+            if accept && answer.skip {
+                alerts::remember_skip(app, MEMORY_PREF);
+            }
             let _ = answer_memory(app, accept);
         }
         return true;
@@ -171,6 +178,12 @@ pub fn advance(app: &mut PhotocraftApp) {
             None => return,
             Some(PromptKind::Memory) => {
                 if let Some(front) = app.held_memory_prompts.front().cloned() {
+                    // "Don't show again" was ticked: open it as "Open" would (which goes on down
+                    // the queue itself).
+                    if alerts::dismissed(app, MEMORY_PREF) {
+                        let _ = answer_memory(app, true);
+                        return;
+                    }
                     show_memory(app, &front);
                     return;
                 } else {
@@ -431,6 +444,7 @@ fn show_memory(app: &mut PhotocraftApp, prompt: &MemoryPrompt) {
         .title(tl!("High Memory Photoshop Document"))
         .button(PromptChoice::Proceed, tl!("Open"))
         .button(PromptChoice::Cancel, tl!("Cancel"))
+        .dont_show_again()
         .tag(MemoryTag { id: prompt.id });
     let _ = alerts::open_prompt(app, shown);
 }
