@@ -1463,10 +1463,14 @@ fn done_keeps_the_raws_open_when_a_sidecar_write_fails() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Runs frames until `done` holds (at most 15 s); whether it did.
+/// Polls the background jobs, lets the dialog take the raws that landed and runs a frame, until
+/// `done` holds (at most 15 s); whether it did. A test frame doesn't poll the jobs itself.
 fn frames_until(app: &mut PhotocraftApp, done: impl Fn(&PhotocraftApp) -> bool) -> bool {
+    let ctx = app.ctx().clone();
     let t = std::time::Instant::now();
     while t.elapsed() < std::time::Duration::from_secs(15) {
+        crate::jobs_ui::tick(app, &ctx);
+        take(app, &ctx);
         frame(app);
         if done(app) {
             return true;
