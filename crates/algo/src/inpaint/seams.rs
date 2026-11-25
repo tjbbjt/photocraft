@@ -21,6 +21,9 @@ const MISSING: f32 = 1.0;
 /// Pixels from which the rows are relaxed in parallel.
 const PAR_MIN: usize = 1 << 16;
 
+/// The most channels a feathered pixel has (CMYK with alpha is 5).
+const MAX_CH: usize = 8;
+
 /// The picture as the copies see it.
 #[derive(Clone, Copy)]
 struct View<'a> {
@@ -159,7 +162,7 @@ pub(super) fn cut(img: &mut [f32], px: &[Px], w: usize, h: usize, ch: usize, act
 /// farther from any seam keep their copy as it is.
 pub(super) fn feather(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), active: &[bool], labels: &[(i32, i32)], f: usize) {
     let (w, h, ch) = dims;
-    if f == 0 {
+    if f == 0 || ch > MAX_CH {
         return;
     }
     let seam: Vec<bool> = (0..w * h)
@@ -172,18 +175,23 @@ pub(super) fn feather(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
     let near = dilate_box(&seam, w, h, f);
     let par = w * h >= PAR_MIN;
     let view = View { img: &*img, px, w, h, ch };
+    // The neighbourhood is sampled every `step` pixels: a wide feather reads about the same
+    // 9 × 9 samples as a narrow one, not (2f + 1)², and gives the same blend (the copies change
+    // over whole patches, not single pixels). At f = 8 that was 289 reads per pixel near a seam.
+    let step = f.div_ceil(4).max(1);
     let rows = par::map(h, par, |y| {
-        let mut out: Vec<(usize, Vec<f32>)> = Vec::new();
+        let mut out: Vec<(usize, [f32; MAX_CH])> = Vec::new();
         // Each copy near: its weight, and what [`fuse`] added to it.
-        let mut copies: Vec<((i32, i32), f32, Vec<f32>)> = Vec::new();
+        let mut copies: Vec<((i32, i32), f32, [f32; MAX_CH])> = Vec::new();
         for x in 0..w {
             let p = y * w + x;
             if !active[p] || !near[p] {
                 continue;
             }
             copies.clear();
-            for qy in y.saturating_sub(f)..(y + f + 1).min(h) {
-                for qx in x.saturating_sub(f)..(x + f + 1).min(w) {
+            let (ylo, xlo) = (y - (y.min(f) / step) * step, x - (x.min(f) / step) * step);
+            for qy in (ylo..(y + f + 1).min(h)).step_by(step) {
+                for qx in (xlo..(x + f + 1).min(w)).step_by(step) {
                     let q = qy * w + qx;
                     if !active[q] {
                         continue;
@@ -195,7 +203,7 @@ pub(super) fn feather(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
                         None => {
                             // What [`fuse`] added to this copy, read where it was first met (it
                             // varies slowly within a copy).
-                            let mut add = vec![0.0f32; ch];
+                            let mut add = [0.0f32; MAX_CH];
                             if let Some(own) = view.at(qx, qy, labels[q]) {
                                 add.iter_mut().zip(&view.img[q * ch..(q + 1) * ch]).zip(own).for_each(|((a, now), o)| *a = now - o);
                             }
@@ -206,7 +214,7 @@ pub(super) fn feather(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
                     copies[i].1 += wt;
                 }
             }
-            let mut acc = vec![0.0f32; ch];
+            let mut acc = [0.0f32; MAX_CH];
             let mut sum = 0.0f32;
             for (l, wt, cs) in &copies {
                 if let Some(v) = view.at(x, y, *l) {
@@ -224,7 +232,7 @@ pub(super) fn feather(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
         out
     });
     for (p, v) in rows.into_iter().flatten() {
-        img[p * ch..(p + 1) * ch].copy_from_slice(&v);
+        img[p * ch..(p + 1) * ch].copy_from_slice(&v[..ch]);
     }
 }
 

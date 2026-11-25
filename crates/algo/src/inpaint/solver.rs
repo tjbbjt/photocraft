@@ -520,22 +520,28 @@ impl Solver<'_> {
         }
         // A pixel without a match of its own stays as voted.
         let active: Vec<bool> = active.iter().zip(&matched).map(|(a, m)| *a && *m).collect();
+        let mut times = super::StageTimes::new();
         super::seams::cut(&mut self.img[..], self.px, w, h, self.ch, &active, &mut labels);
         // The copies are written; the picture beside the hole is put back as it was before it was
         // relit, so the fill is evened out against, and lit like, the picture it really sits in.
         relit.put_back(&mut self.img[..], self.ch);
+        times.mark("cut");
         let dims = (w, h, self.ch);
         // Then evened out with their neighbours and the picture over their whole size, keeping
         // each copy's own texture.
         if super::fuse_on() {
             super::seams::fuse(&mut self.img[..], self.px, dims, &active, &labels);
         }
+        times.mark("fuse");
         // Then cross-faded, so no seam is left hard.
         let f = super::seam_feather(self.r.max(1) as usize, w, h);
         super::seams::feather(&mut self.img[..], self.px, dims, &active, &labels, f);
+        times.mark("feather");
         // And relit: shading copied from elsewhere doesn't repeat in the hole.
         let (radius, band, cap) = super::relight_params(self.r.max(1) as usize, w, h);
         super::seams::relight(&mut self.img[..], self.px, dims, &active, radius, band, cap);
+        times.mark("relight");
+        times.report(w, h);
         if !super::fuse_on() {
             // Without the fusion, brought to the picture where they meet, fading in over about
             // four patches.

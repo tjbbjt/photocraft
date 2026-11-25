@@ -104,6 +104,30 @@ fn edge_fade(r: usize) -> usize {
     FADE.get_or_init(|| std::env::var("PHOTOCRAFT_CAF_EDGE_FADE").ok().and_then(|v| v.parse().ok())).unwrap_or(4 * r)
 }
 
+/// How long each finishing stage of a cut fill took, printed on one line (stderr, so it lands in
+/// the run log beside the app's own lines): which stage to make faster on a large fill.
+pub(crate) struct StageTimes {
+    last: std::time::Instant,
+    parts: Vec<(&'static str, f32)>,
+}
+
+impl StageTimes {
+    pub(crate) fn new() -> Self {
+        Self { last: std::time::Instant::now(), parts: Vec::new() }
+    }
+
+    pub(crate) fn mark(&mut self, stage: &'static str) {
+        let now = std::time::Instant::now();
+        self.parts.push((stage, (now - self.last).as_secs_f32()));
+        self.last = now;
+    }
+
+    pub(crate) fn report(&self, w: usize, h: usize) {
+        let parts: Vec<String> = self.parts.iter().map(|(s, t)| format!("{s} {t:.1} s")).collect();
+        eprintln!("content-aware fill stages at {w}x{h}: {}", parts.join(", "));
+    }
+}
+
 /// Whether a cut fill is fused with its neighbours and the picture ([`seams::fuse`]): on unless
 /// `PHOTOCRAFT_CAF_FUSE=off`, to compare on the quality test.
 fn fuse_on() -> bool {
@@ -394,6 +418,7 @@ fn complete_cow<'a>(
     // a stitched or cut-out edge is often darker, lighter or fringed there.
     // The relit picture pixels go back as they were once the fill is done: only the fill changes.
     let mut relit = seams::Relit::default();
+    let mut times = StageTimes::new();
     let (img, lpx0): (Cow<'a, [f32]>, Cow<'a, [Px]>) = if (guide.is_some() || p.nearby) && seams_on() {
         let mut img = img.into_owned();
         let (radius, band, cap) = relight_params(r, w, h);
@@ -402,8 +427,10 @@ fn complete_cow<'a>(
     } else {
         (img, Cow::Borrowed(px))
     };
+    times.mark("edge relight");
     let put_back = |v: &mut [f32]| relit.put_back(v, ch);
     let Pyramid { mut levels, boxes, exts, thin, thickness } = build_pyramid(Level { w, h, img, px: lpx0 }, ch, hb0, psz, ctl)?;
+    times.mark("pyramid");
     let nlev = levels.len();
     // The guide at each level's size, finest first, and how much softer than that level it is.
     // A guide that only lays out the coarsest level keeps only that level.
@@ -585,6 +612,8 @@ fn complete_cow<'a>(
         ctl.progress(done_px as f32 / total_px.max(1) as f32);
         prev = Some(Coarser { w: lw, h: lh, img: limg, field, cells });
     }
+    times.mark("levels (matching, voting, finishing)");
+    times.report(w, h);
     Ok(prev
         .map(|c| {
             let mut v = c.img;
