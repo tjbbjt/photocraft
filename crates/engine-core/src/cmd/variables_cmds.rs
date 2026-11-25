@@ -465,22 +465,48 @@ fn split_csv(line: &str, delim: u8) -> Vec<String> {
 }
 
 /// Apply each data set in turn and export the flattened document, restoring the original after.
-/// `{dir, format?("png"), dataSets?[names]}` → `{files:[…],count}`.
+/// `{dir, format?("png"), dataSets?[names]}` → `{files:[…],count}`. From the desktop app
+/// ([`Session::start`]) the files are made and written on a worker, with progress ("Exporting Data
+/// Set 2 of 40: Spring") and Cancel between data sets (#13768); the files written before a cancel
+/// stay, and none is left half written (each is written whole, then moved into place). Each one is
+/// a flattened export of the whole document, seconds each on a large one, and the window froze
+/// for all of them.
 fn export_as_files(s: &mut Session, p: &Value) -> Result<Value> {
     let dir = p.get("dir").and_then(Value::as_str).ok_or_else(|| bad("file.export.dataSetsAsFiles", "need `dir`"))?.to_string();
-    // The directory appears only once the batch has been planned, as it always did, so a batch
-    // rejected for colliding names still leaves no directory behind.
-    let mut made_dir = false;
-    let names = export_data_sets_with(s, p, |name, bytes| {
-        if !made_dir {
-            std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("mkdir `{dir}`: {e}")))?;
-            made_dir = true;
-        }
-        crate::file_cmds::write_file(&format!("{dir}/{name}"), bytes)
-    })?;
-    let files: Vec<String> = names.iter().map(|name| format!("{dir}/{name}")).collect();
-    let count = files.len();
-    Ok(json!({"files": files, "count": count}))
+    // Planned here, before the job starts: a batch with colliding names or a refused image path
+    // fails at once and writes nothing.
+    let export = DataSetExport::plan(s, p)?;
+    let label = "Export Data Sets as Files";
+    crate::jobs::run(
+        s,
+        label,
+        false,
+        move |ctx| {
+            ctx.progress(0.0, label);
+            let n = export.len();
+            // The directory appears only once the batch has been planned, as it always did, so a
+            // batch rejected for colliding names still leaves no directory behind.
+            let mut made_dir = false;
+            let names = export.run(
+                |i, name| {
+                    ctx.check()?;
+                    ctx.progress(i as f32 / n.max(1) as f32, &format!("Exporting Data Set {} of {n}: {name}", i + 1));
+                    Ok(())
+                },
+                |name, bytes| {
+                    if !made_dir {
+                        std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("mkdir `{dir}`: {e}")))?;
+                        made_dir = true;
+                    }
+                    crate::file_cmds::write_file(&format!("{dir}/{name}"), bytes)
+                },
+            )?;
+            let files: Vec<String> = names.iter().map(|name| format!("{dir}/{name}")).collect();
+            let count = files.len();
+            Ok(json!({"files": files, "count": count}))
+        },
+        |_, v| Ok(v),
+    )
 }
 
 /// The bodies of `file.export.dataSetsAsFiles`, streamed to `write` as a single-component
@@ -488,67 +514,102 @@ fn export_as_files(s: &mut Session, p: &Value) -> Result<Value> {
 /// so colliding names are rejected before any file is written, and automation writes exactly
 /// these bytes beneath its write root (#3216) — the two paths cannot drift. Returns the
 /// filenames written, in order.
-pub fn export_data_sets_with(s: &Session, p: &Value, mut write: impl FnMut(&str, &[u8]) -> Result<()>) -> Result<Vec<String>> {
-    let format = p.get("format").and_then(Value::as_str).unwrap_or("png");
-    let st = s.active().ok_or(EngineError::NoDocument)?;
-    let original = st.doc.clone();
-    let vars = original.variables.clone();
-    let wanted: Option<Vec<String>> = p.get("dataSets").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
-    let sets: Vec<DataSet> = vars.data_sets.iter().filter(|d| wanted.as_ref().is_none_or(|w| w.contains(&d.name))).cloned().collect();
-    if sets.is_empty() {
-        return Err(bad("file.export.dataSetsAsFiles", "no data sets to export"));
-    }
-    // Judge every image path before anything is written, as Apply Data Set does.
-    for set in &sets {
-        authorize_pixel_paths(s, set)?;
-    }
-    // Filename template: `{name}` (sanitised data-set name), `{index}` (1-based). Default `{name}`.
-    let template = p.get("naming").and_then(Value::as_str).unwrap_or("{name}");
-    // A document name is not a path: a separator in it, or a stem of `.` / `..` before a `/` in
-    // the template, must not leave `dir`.
-    let doc_stem: String = original
-        .name
-        .rsplit_once('.')
-        .map_or(original.name.as_str(), |(a, _)| a)
-        .chars()
-        .map(|c| if c.is_control() || "/\\<>:\"|?*".contains(c) { '_' } else { c })
-        .collect();
-    let doc_stem = if matches!(doc_stem.as_str(), "" | "." | "..") { "_".to_string() } else { doc_stem };
-    // Plan the whole batch before writing: sanitised names or a constant template may collide.
-    // Match the case-insensitive comparison used by the other batch exporters.
-    let mut claimed = std::collections::HashMap::new();
-    let mut names = Vec::new();
-    for (n, set) in sets.iter().enumerate() {
-        let safe: String = set.name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-        let stem = template.replace("{name}", &safe).replace("{index}", &format!("{:03}", n + 1)).replace("{document}", &doc_stem);
-        // Each folder the template makes is checked too: `{document}/{name}` of `nul.psd` would
-        // otherwise write into the `nul` device.
-        let name: String = format!("{stem}.{format}")
-            .split_inclusive(['/', '\\'])
-            .map(|part| {
-                let sep = ["/", "\\"].into_iter().find(|s| part.ends_with(s)).unwrap_or("");
-                crate::file_cmds::portable_device_name(part.strip_suffix(sep).unwrap_or(part).to_string()) + sep
-            })
-            .collect();
-        if let Some(first) = claimed.insert(name.to_lowercase(), &set.name) {
-            return Err(bad(
-                "file.export.dataSetsAsFiles",
-                format!("data sets `{first}` and `{}` resolve to the same output `{name}`; include {{index}} in `naming` to use distinct filenames", set.name),
-            ));
+pub fn export_data_sets_with(s: &Session, p: &Value, write: impl FnMut(&str, &[u8]) -> Result<()>) -> Result<Vec<String>> {
+    DataSetExport::plan(s, p)?.run(|_, _| Ok(()), write)
+}
+
+/// A planned `file.export.dataSetsAsFiles`: the data sets to export from a snapshot of the
+/// document, each with its file name, checked and named before anything is written. Runs on any
+/// thread ([`DataSetExport::run`]).
+struct DataSetExport {
+    original: Arc<Document>,
+    vars: Variables,
+    sets: Vec<DataSet>,
+    names: Vec<String>,
+    format: String,
+    /// An untrusted session's PSD export embeds no file a linked smart object names.
+    read_linked_files: bool,
+}
+
+impl DataSetExport {
+    fn plan(s: &Session, p: &Value) -> Result<Self> {
+        let format = p.get("format").and_then(Value::as_str).unwrap_or("png").to_string();
+        let st = s.active().ok_or(EngineError::NoDocument)?;
+        let original = st.doc.clone();
+        let vars = original.variables.clone();
+        let wanted: Option<Vec<String>> =
+            p.get("dataSets").and_then(Value::as_array).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect());
+        let sets: Vec<DataSet> = vars.data_sets.iter().filter(|d| wanted.as_ref().is_none_or(|w| w.contains(&d.name))).cloned().collect();
+        if sets.is_empty() {
+            return Err(bad("file.export.dataSetsAsFiles", "no data sets to export"));
         }
-        names.push(name);
+        // Judge every image path before anything is written, as Apply Data Set does.
+        for set in &sets {
+            authorize_pixel_paths(s, set)?;
+        }
+        // Filename template: `{name}` (sanitised data-set name), `{index}` (1-based). Default `{name}`.
+        let template = p.get("naming").and_then(Value::as_str).unwrap_or("{name}");
+        // A document name is not a path: a separator in it, or a stem of `.` / `..` before a `/` in
+        // the template, must not leave `dir`.
+        let doc_stem: String = original
+            .name
+            .rsplit_once('.')
+            .map_or(original.name.as_str(), |(a, _)| a)
+            .chars()
+            .map(|c| if c.is_control() || "/\\<>:\"|?*".contains(c) { '_' } else { c })
+            .collect();
+        let doc_stem = if matches!(doc_stem.as_str(), "" | "." | "..") { "_".to_string() } else { doc_stem };
+        // Plan the whole batch before writing: sanitised names or a constant template may collide.
+        // Match the case-insensitive comparison used by the other batch exporters.
+        let mut claimed = std::collections::HashMap::new();
+        let mut names = Vec::new();
+        for (n, set) in sets.iter().enumerate() {
+            let safe: String = set.name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+            let stem = template.replace("{name}", &safe).replace("{index}", &format!("{:03}", n + 1)).replace("{document}", &doc_stem);
+            // Each folder the template makes is checked too: `{document}/{name}` of `nul.psd` would
+            // otherwise write into the `nul` device.
+            let name: String = format!("{stem}.{format}")
+                .split_inclusive(['/', '\\'])
+                .map(|part| {
+                    let sep = ["/", "\\"].into_iter().find(|s| part.ends_with(s)).unwrap_or("");
+                    crate::file_cmds::portable_device_name(part.strip_suffix(sep).unwrap_or(part).to_string()) + sep
+                })
+                .collect();
+            if let Some(first) = claimed.insert(name.to_lowercase(), &set.name) {
+                return Err(bad(
+                    "file.export.dataSetsAsFiles",
+                    format!(
+                        "data sets `{first}` and `{}` resolve to the same output `{name}`; include {{index}} in `naming` to use distinct filenames",
+                        set.name
+                    ),
+                ));
+            }
+            names.push(name);
+        }
+        Ok(Self { original, vars, sets, names, format, read_linked_files: s.authorize.is_none() })
     }
-    let mut written = Vec::new();
-    for (set, name) in sets.iter().zip(&names) {
-        let mut doc = (*original).clone();
-        apply_to_doc(&mut doc, &vars, set)?;
-        // An untrusted session's PSD export embeds no file a linked smart object names.
-        let opts = photocraft_io::ExportOptions { read_linked_files: s.authorize.is_none(), ..Default::default() };
-        let bytes = photocraft_io::export(&doc, format, &opts).map(|r| r.bytes).map_err(|e| EngineError::Other(format!("export `{}`: {e}", set.name)))?;
-        write(name, &bytes)?;
-        written.push(name.clone());
+
+    /// How many files the export writes.
+    fn len(&self) -> usize {
+        self.sets.len()
     }
-    Ok(written)
+
+    /// Exports each data set in turn: `before_each` gets its index and name first (a job checks
+    /// for a cancel and reports progress there), then `write` its file name and bytes.
+    fn run(&self, mut before_each: impl FnMut(usize, &str) -> Result<()>, mut write: impl FnMut(&str, &[u8]) -> Result<()>) -> Result<Vec<String>> {
+        let mut written = Vec::new();
+        for (i, (set, name)) in self.sets.iter().zip(&self.names).enumerate() {
+            before_each(i, &set.name)?;
+            let mut doc = (*self.original).clone();
+            apply_to_doc(&mut doc, &self.vars, set)?;
+            let opts = photocraft_io::ExportOptions { read_linked_files: self.read_linked_files, ..Default::default() };
+            let bytes =
+                photocraft_io::export(&doc, &self.format, &opts).map(|r| r.bytes).map_err(|e| EngineError::Other(format!("export `{}`: {e}", set.name)))?;
+            write(name, &bytes)?;
+            written.push(name.clone());
+        }
+        Ok(written)
+    }
 }
 
 fn list(s: &mut Session) -> Result<Value> {
