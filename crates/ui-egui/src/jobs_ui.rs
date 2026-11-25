@@ -581,9 +581,62 @@ pub fn try_cancel(app: &mut PhotocraftApp, id: JobId) -> Result<(), CancelRefuse
 
 /// Handles one finished job: optional completion beep, waiting control replies, and the
 /// command-specific open, save, transform and recovery paths.
+/// The log's lines for a background Content-Aware Fill: its size, how long it took and by which
+/// method, and the process's memory after each of its stages (and the most during each).
+fn log_content_aware_fill(outcome: &JobOutcome) {
+    match outcome {
+        JobOutcome::Done(v) => {
+            let size = |key: &str| {
+                let a = v.get(key).and_then(Value::as_array);
+                let at = |i: usize| a.and_then(|a| a.get(i)).and_then(Value::as_u64).unwrap_or(0);
+                (at(2), at(3))
+            };
+            let ((ww, wh), (bw, bh)) = (size("window"), size("fillBounds"));
+            let filled = v.get("filled").and_then(Value::as_u64).unwrap_or(0);
+            let ms = v.get("ms").and_then(Value::as_u64).unwrap_or(0);
+            let method = v.get("method").and_then(Value::as_str).unwrap_or("?");
+            log::info!(
+                "content-aware fill: {filled} px ({:.1} MP) filled in {ms} ms by {method}; window {ww}x{wh} ({:.1} MP), fill area bounds {bw}x{bh}",
+                filled as f64 / 1e6,
+                (ww * wh) as f64 / 1e6
+            );
+            let stages: Vec<String> = v
+                .get("memory")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .map(|m| {
+                            let gb = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0) as f64 / 1024.0;
+                            format!("{} {:.1} GB (peak {:.1} GB)", m.get("stage").and_then(Value::as_str).unwrap_or("?"), gb("mb"), gb("peakMb"))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !stages.is_empty() {
+                log::info!("content-aware fill memory: {}", stages.join(", "));
+            }
+        }
+        JobOutcome::Failed(err) => log::info!("content-aware fill: failed: {err}"),
+        JobOutcome::Cancelled => log::info!("content-aware fill: cancelled"),
+    }
+}
+
 fn on_event(app: &mut PhotocraftApp, ctx: &egui::Context, e: JobEvent) {
     let cancelled_batch =
         e.command == "file.automate.batch" && matches!(&e.outcome, JobOutcome::Done(result) if result.get("cancelled").and_then(Value::as_bool) == Some(true));
+    // Every finished job in the log, with how long it ran, so a log shows what took the time
+    // (Edit ▸ Fill's Content-Aware too, which logs nothing of its own).
+    let ran =
+        app.session.jobs_with_recent().into_iter().rev().find(|j| j.id == e.id).map(|j| format!(" after {:.1} s", j.elapsed_ms / 1000.0)).unwrap_or_default();
+    let how = match &e.outcome {
+        JobOutcome::Done(_) => "done".to_string(),
+        JobOutcome::Failed(err) => format!("failed: {err}"),
+        JobOutcome::Cancelled => "cancelled".to_string(),
+    };
+    log::info!("job {} ({}): {how}{ran}", e.command, e.label);
+    if e.command == "edit.contentAwareFill" {
+        log_content_aware_fill(&e.outcome);
+    }
     // Preferences ▸ General ▸ Beep When Done (off by default): a finished operation beeps, like
     // Photoshop's cue. Cancelling is the user's own action and stays silent.
     if matches!(e.outcome, JobOutcome::Done(_))

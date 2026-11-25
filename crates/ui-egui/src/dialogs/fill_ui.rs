@@ -3,6 +3,11 @@
 //! Contents (Foreground, Background, Color, Content-Aware, Pattern, History, Black, 50% Gray,
 //! White) with the content's own options, then Blending: Mode, Opacity and Preserve
 //! Transparency. OK remembers the choices in the saved tier.
+//!
+//! Content-Aware has a PhotoCraft / Parity choice. Parity is Photoshop's (`edit.fill`, on the
+//! spot); PhotoCraft runs the Content-Aware Fill command in the background with the same
+//! sampling, and adds its fill methods (LaMa, MI-GAN, their mix, each optionally stamped with
+//! Classic) and the edge band that blends the fill into the picture.
 
 use craft::ui::contract::Bind;
 use craft::ui::dialog::DialogId;
@@ -33,6 +38,19 @@ pub const CONTENTS: [(&str, &str); 9] = [
     ("white", "White"),
 ];
 
+/// Content-Aware's behaviours: (param, label).
+pub const FILL_MODES: [(&str, &str); 2] = [("photocraft", "PhotoCraft"), ("parity", "Parity")];
+
+/// Content-Aware's methods: (param, label).
+pub const METHODS: [(&str, &str); 5] =
+    [("classic", "Classic"), ("classicDepth", "Classic + Depth"), ("lama", "LaMa"), ("migan", "MI-GAN"), ("mix", "Mix (LaMa + MI-GAN)")];
+
+/// The edge band PhotoCraft starts with, in px: grown outright, then feathered.
+pub const EDGE_GROW: f64 = 2.0;
+pub const EDGE_FEATHER: f64 = 8.0;
+/// The most either may be (the engine's `Edge::MAX`).
+pub const EDGE_MAX: f64 = 256.0;
+
 /// `#rrggbb` of an sRGB colour: the form the engine's colour params take.
 pub(crate) fn hex(c: [f32; 3]) -> String {
     let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -48,6 +66,28 @@ fn rows(foreground: [f32; 3], first_pattern: Option<String>) -> Vec<Param> {
         Param::new("pattern", tl!("Custom Pattern:"), ParamKind::pattern(first_pattern)).visible_when("contents", "pattern"),
         Param::new("colorAdaptation", tl!("Color Adaptation"), ParamKind::bool(true)).visible_when("contents", "contentAware"),
     ];
+    // PhotoCraft's Content-Aware: its behaviour, then its method and edge band (Parity greys them).
+    let modes = FILL_MODES.iter().map(|(k, l)| (k.to_string(), Label::from(tl!(l)))).collect();
+    let methods = METHODS.iter().map(|(k, l)| (k.to_string(), Label::from(tl!(l)))).collect();
+    let photocraft = |row: Param| row.visible_when("contents", "contentAware").enabled_when("fillMode", "photocraft");
+    rows.extend([
+        Param::new("fillMode", tl!("Behavior:"), ParamKind::radio(modes, Some("photocraft".into())))
+            .options_in_row()
+            .visible_when("contents", "contentAware")
+            .tooltip(tl!("PhotoCraft: Content-Aware gets fill methods and the edge band, and runs in the background. Parity: Fill as in Photoshop.")),
+        photocraft(Param::new("method", tl!("Method:"), ParamKind::choice(methods, Some("classic".into())))),
+        photocraft(
+            Param::new("stamp", tl!("Stamp with Classic"), ParamKind::bool(true))
+                .tooltip(tl!("LaMa, MI-GAN and Mix: Classic fills around the model's layout.")),
+        ),
+        photocraft(
+            Param::new("matchDepth", tl!("Match Depth"), ParamKind::bool(true))
+                .tooltip(tl!("Stamped fills copy from the same depth (Classic + Depth always does).")),
+        ),
+        photocraft(Param::new("detail", tl!("Rebuild Detail from the Photo"), ParamKind::bool(true)).tooltip(tl!("LaMa, MI-GAN and Mix without stamping."))),
+        photocraft(Param::new("edgeGrow", tl!("Edge Grow:"), ParamKind::number(Some(0.0), Some(EDGE_MAX), EDGE_GROW, 1.0, 0))),
+        photocraft(Param::new("edgeFeather", tl!("Edge Feather:"), ParamKind::number(Some(0.0), Some(EDGE_MAX), EDGE_FEATHER, 1.0, 0))),
+    ]);
     rows.extend(blending_rows());
     rows
 }
@@ -61,6 +101,13 @@ fn defaults(foreground: [f32; 3], first_pattern: Option<String>) -> DialogFields
         f.set("pattern", id);
     }
     f.set("colorAdaptation", true);
+    f.set("fillMode", "photocraft");
+    f.set("method", "classic");
+    f.set("stamp", true);
+    f.set("matchDepth", true);
+    f.set("detail", true);
+    f.set("edgeGrow", EDGE_GROW);
+    f.set("edgeFeather", EDGE_FEATHER);
     f.set("mode", BlendMode::Normal.key().to_string());
     f.set("opacity", 100.0);
     f.set("preserveTransparency", false);
@@ -124,6 +171,34 @@ pub fn params(f: &DialogFields, held: &Value) -> Value {
     Value::Object(p)
 }
 
+/// Content-Aware the PhotoCraft way: the Content-Aware Fill command's params (sampling the whole
+/// window, as Fill does), or `None` when Fill itself runs (Parity, other contents, or a target
+/// that is not layer pixels, which Fill refuses with its own message).
+pub fn photocraft_params(f: &DialogFields, held: &Value) -> Option<Value> {
+    if f.text("contents") != Some("contentAware") || f.text("fillMode").unwrap_or("photocraft") != "photocraft" {
+        return None;
+    }
+    if held.get("target").is_some_and(|t| t.as_str() != Some("pixels")) {
+        return None;
+    }
+    let px = |k: &str, d: f64| f.number(k).unwrap_or(d).clamp(0.0, EDGE_MAX).round();
+    let mut p = json!({
+        "sampling": "rectangular",
+        "colorAdaptation": if f.bool("colorAdaptation").unwrap_or(true) { "default" } else { "none" },
+        "method": f.text("method").unwrap_or("classic"),
+        "detail": f.bool("detail").unwrap_or(true),
+        "stamp": f.bool("stamp").unwrap_or(true),
+        "matchDepth": f.bool("matchDepth").unwrap_or(true),
+        "edgeGrow": px("edgeGrow", EDGE_GROW),
+        "edgeFeather": px("edgeFeather", EDGE_FEATHER),
+        "output": "current",
+    });
+    if let Some(layer) = held.get("layer").filter(|l| l.is_u64()) {
+        p["layer"] = layer.clone();
+    }
+    Some(p)
+}
+
 /// Whether the dialog `key` is the Fill dialog.
 pub(crate) fn owns(key: &str) -> bool {
     key == COMMAND
@@ -142,7 +217,11 @@ pub(crate) fn check(app: &mut PhotocraftApp, result: &ParamResult) -> Result<(),
 /// Fill with the confirmed choices; they are remembered only when the fill succeeded.
 pub(crate) fn run(app: &mut PhotocraftApp, ctx: &egui::Context, result: ParamResult) {
     let captured = captured(app, &result.key);
-    match app.run(COMMAND, params(&result.fields, &captured)) {
+    let ran = match photocraft_params(&result.fields, &captured) {
+        Some(p) => app.run("edit.contentAwareFill", p),
+        None => app.run(COMMAND, params(&result.fields, &captured)),
+    };
+    match ran {
         Ok(_) => result.remember(ctx),
         Err(e) => crate::notices::error(app, e),
     }

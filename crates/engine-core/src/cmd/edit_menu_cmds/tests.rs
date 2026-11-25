@@ -938,3 +938,163 @@ fn tool_preset_import_is_validated_before_mutation_and_accepts_old_files() {
     let result = s.execute("edit.presets.exportImportPresets", json!({"action":"import", "data":{"format":PRESET_FORMAT, "version":1}})).unwrap();
     assert_eq!(result["tools"], 0);
 }
+
+/// A fill area along all four borders (a panorama's empty edges) has bounds as large as the
+/// canvas: only the ring changes, the middle keeps its pixels, and the result names the bounds.
+#[test]
+fn content_aware_fill_of_a_border_ring_changes_only_the_ring() {
+    let mut s = blob_session(8);
+    s.execute("select.all", json!({})).unwrap();
+    s.execute("select.rect", json!({"x": 4, "y": 4, "width": 56, "height": 40, "mode": "subtract"})).unwrap();
+    let id = s.active().unwrap().active_layer.unwrap();
+    let read = |s: &Session| s.active().unwrap().doc.layer(id).unwrap().surface().unwrap().read_region(Rect::new(0, 0, 64, 48));
+    let before = read(&s);
+    let result = s.execute("edit.contentAwareFill", json!({"colorAdaptation": "none"})).unwrap();
+    assert_eq!(result["filled"], 64 * 48 - 56 * 40);
+    assert_eq!(result["fillBounds"], json!([0, 0, 64, 48]));
+    assert!(result["ms"].is_u64());
+    let after = read(&s);
+    let n = before.len() / (64 * 48);
+    let (mut kept, mut changed) = (true, 0);
+    for y in 0..48 {
+        for x in 0..64 {
+            let i = (y * 64 + x) * n;
+            let same = before[i..i + n] == after[i..i + n];
+            if (4..60).contains(&x) && (4..44).contains(&y) {
+                kept &= same;
+            } else {
+                changed += usize::from(!same);
+            }
+        }
+    }
+    assert!(kept, "the middle keeps its pixels");
+    assert!(changed > 0, "the ring is filled");
+}
+
+/// The edge band (`edgeGrow`, `edgeFeather`) widens the fill area: the grown pixels take all of
+/// the fill, the feathered ones part of it, fading with the distance, and pixels past the band
+/// stay out. Without it the fill area is the selection's.
+#[test]
+fn the_edge_band_widens_the_fill_area_and_fades_it_out() {
+    let mut s = blob_session(8);
+    s.execute("select.rect", json!({"x": 24, "y": 16, "width": 16, "height": 16})).unwrap();
+    let st = s.active().unwrap();
+    let id = st.active_layer.unwrap();
+    let plan = |p: Value| content_aware_plan(&st.doc, id, &p, "edit.contentAwareFill").unwrap();
+    let (plain, banded) = (plan(json!({})), plan(json!({"edgeGrow": 2, "edgeFeather": 4})));
+    let at = |plan: &CafPlan, x: i32, y: i32| {
+        let i = (y - plan.rect.y0) as usize * plan.rect.width() as usize + (x - plan.rect.x0) as usize;
+        (plan.hole[i], plan.cover[i])
+    };
+    assert_eq!(at(&plain, 24, 20), (true, 1.0));
+    assert_eq!(at(&plain, 22, 20), (false, 0.0));
+    assert_eq!(at(&banded, 24, 20), (true, 1.0), "inside");
+    assert_eq!(at(&banded, 22, 20), (true, 1.0), "2 px out: grown");
+    let (inside, part) = at(&banded, 20, 20);
+    assert!(inside && part > 0.3 && part < 0.9, "4 px out: feathered ({part})");
+    assert!(at(&banded, 19, 20).1 < part, "fading outwards");
+    assert_eq!(at(&banded, 17, 20), (false, 0.0), "7 px out: past the band");
+    assert!(content_aware_plan(&st.doc, id, &json!({"edgeGrow": 300}), "edit.contentAwareFill").is_err());
+}
+
+/// A model's fill guides the fill (`detail`): the hole takes the guide's layout, red where it says
+/// red and blue where it says blue, in pixels copied from the picture; without `detail` it takes
+/// the guide as it is. Nothing outside the hole changes. (No model runs: the guide is given.)
+#[test]
+fn a_model_guide_lays_out_the_fill() {
+    let (w, h) = (96usize, 64usize);
+    let fmt = PixelFormat::RGBA32F;
+    // Top half red, bottom half blue, with a little texture; the hole a band down the middle.
+    let img: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            let n = ((x * 7 + y * 13) % 5) as f32 * 0.02;
+            if y < h / 2 { [0.8 + n, 0.1, 0.1, 1.0] } else { [0.1, 0.1, 0.8 + n, 1.0] }
+        })
+        .collect();
+    let hole: Vec<bool> = (0..w * h).map(|i| (40..56).contains(&(i % w))).collect();
+    let source: Vec<bool> = hole.iter().map(|h| !h).collect();
+    // The guide at a third of the size: red above row 32, blue below.
+    let (gw, gh) = (32usize, 22usize);
+    let rgb: Vec<u8> = (0..gw * gh).flat_map(|j| if j / gw < 11 { [204, 26, 26] } else { [26, 26, 204] }).collect();
+    let guide = ModelGuide { w: gw, h: gh, rgb };
+    let opts = photocraft_algo::content_aware::FillOptions::default();
+    let none = photocraft_raster::Interrupt::NONE;
+    for detail in [true, false] {
+        let model = FillModel { method: "lama".into(), detail };
+        let out = caf_fill(w, h, &fmt, img.clone(), &hole, &source, &opts, Some((&model, &guide)), &none).unwrap();
+        let px = |x: usize, y: usize| &out[(y * w + x) * 4..(y * w + x) * 4 + 4];
+        assert!(px(48, 10)[0] > 0.6 && px(48, 10)[2] < 0.3, "detail {detail}: red above, got {:?}", px(48, 10));
+        assert!(px(48, 54)[2] > 0.6 && px(48, 54)[0] < 0.3, "detail {detail}: blue below, got {:?}", px(48, 54));
+        assert_eq!(px(48, 10)[3], 1.0, "the fill is opaque");
+        for i in (0..w * h).filter(|i| !hole[*i]) {
+            assert_eq!(out[i * 4..i * 4 + 4], img[i * 4..i * 4 + 4]);
+        }
+        // With detail the fill has the picture's texture; without it the guide's flat colour.
+        let rough = (5..25).flat_map(|y| (40..55).map(move |x| (x, y))).map(|(x, y)| (px(x, y)[0] - px(x + 1, y)[0]).abs()).sum::<f32>() / 300.0;
+        if detail {
+            assert!(rough > 0.005, "textured, got {rough}");
+        } else {
+            assert!(rough < 0.001, "flat, got {rough}");
+        }
+    }
+}
+
+/// `method` takes classic, classicDepth, lama, migan or mix; anything else is refused before any work.
+#[test]
+fn content_aware_fill_refuses_an_unknown_method() {
+    let mut s = blob_session(8);
+    let e = s.execute("edit.contentAwareFill", json!({"method": "dall-e"})).unwrap_err().to_string();
+    assert!(e.contains("unknown method"), "{e}");
+    s.execute("edit.contentAwareFill", json!({"method": "classic", "colorAdaptation": "none"})).unwrap();
+}
+
+/// `stamp` with a model: Classic fills, copying from near the hole, around the model's layout:
+/// the model fills, its fill only lays the hole out, and the detail is always rebuilt;
+/// `matchDepth` with it copies from about the same rows.
+/// A nearby fill keeps a transparent edge's fringe (alpha below 1, and 4 px past it) out of
+/// its sources; Classic samples as it did.
+#[test]
+fn a_nearby_fill_keeps_a_transparent_edges_fringe_out_of_its_sources() {
+    let mut s = blob_session(8);
+    s.edit("edge", |doc, active| {
+        let surf = doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap();
+        surf.fill_rect(Rect::new(0, 0, 10, 48), &[0.0, 0.0, 0.0, 0.0]);
+        surf.fill_rect(Rect::new(10, 0, 12, 48), &[1.0, 0.0, 1.0, 0.5]);
+        Ok(())
+    })
+    .unwrap();
+    s.execute("select.rect", json!({"x": 0, "y": 0, "width": 10, "height": 48})).unwrap();
+    let st = s.active().unwrap();
+    let id = st.active_layer.unwrap();
+    let plan = |m: &str| content_aware_plan(&st.doc, id, &json!({"method": m, "sampling": "rectangular"}), "edit.contentAwareFill").unwrap();
+    let at = |p: &CafPlan, x: i32, y: i32| p.source[(y - p.rect.y0) as usize * p.rect.width() as usize + (x - p.rect.x0) as usize];
+    let depth = plan("classicDepth");
+    assert!(!at(&depth, 11, 20) && !at(&depth, 15, 20) && at(&depth, 17, 20), "the fringe is left out");
+    assert!(at(&plan("classic"), 11, 20), "Classic as it was");
+}
+
+#[test]
+fn a_stamped_model_fill_is_classic_nearby_around_the_models_layout() {
+    let mut s = blob_session(8);
+    s.execute("select.rect", json!({"x": 24, "y": 16, "width": 16, "height": 16})).unwrap();
+    let st = s.active().unwrap();
+    let id = st.active_layer.unwrap();
+    let plan = |p: Value| content_aware_plan(&st.doc, id, &p, "edit.contentAwareFill").unwrap();
+    for m in ["lama", "migan", "mix"] {
+        let stamped = plan(json!({"method": m, "stamp": true, "detail": false}));
+        assert_eq!(stamped.model, Some(FillModel { method: m.into(), detail: true }));
+        assert!(stamped.opts.nearby && stamped.opts.layout_only && !stamped.opts.same_depth, "{m}");
+        assert!(plan(json!({"method": m, "stamp": true, "matchDepth": true})).opts.same_depth, "{m}");
+        assert!(!plan(json!({"method": m, "matchDepth": true})).opts.same_depth, "{m}: only when stamping");
+        let own = plan(json!({"method": m, "detail": false}));
+        assert_eq!(own.model, Some(FillModel { method: m.into(), detail: false }));
+        assert!(!own.opts.nearby && !own.opts.layout_only, "{m}");
+    }
+    let classic = plan(json!({"method": "classic", "stamp": true, "matchDepth": true}));
+    assert!(classic.model.is_none() && !classic.opts.nearby && !classic.opts.same_depth, "Classic stays Classic");
+    let depth = plan(json!({"method": "classicDepth"}));
+    assert!(depth.model.is_none() && depth.opts.nearby && depth.opts.same_depth && !depth.opts.layout_only, "Classic + Depth");
+    assert_eq!(depth.opts.color_adaptation, photocraft_algo::inpaint::Adapt::NONE, "nearby fills adapt no colours");
+    assert_ne!(classic.opts.color_adaptation, photocraft_algo::inpaint::Adapt::NONE, "Classic keeps its colour adaptation");
+}

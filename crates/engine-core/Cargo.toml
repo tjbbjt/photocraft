@@ -57,6 +57,8 @@ craft = { workspace = true, features = ["automation", "color-ui", "keymap", "pla
 semver = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# LaMa and MI-GAN for Content-Aware Fill's fill models (no model on the web build).
+photocraft-inpaint-models = { path = "../inpaint-models" }
 tempfile = "3"
 # `clock`: the local time that names History Options' snapshot on save (#2966); already in the
 # tree through rmcp. The web build has no local clock here and names it "Snapshot N".

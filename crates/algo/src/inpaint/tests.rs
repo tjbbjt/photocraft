@@ -401,18 +401,24 @@ fn full_patches_measure_as_clipped_ones() {
     assert!(picks.len() > 5);
     for adapt in [Adapt::NONE, Adapt { gain: (0.8, 1.25), bias: 0.08 }] {
         for keep in [false, true] {
-            let targets = targets_around(w, r, &px, hb, tb);
+            let cells = Cells::around(w, r, &px, hb, tb);
             let mut s = Solver {
                 w,
                 h,
                 ch,
                 r: r as i32,
                 img: &mut img,
+                guide: None,
+                mimg: None,
+                coherence: 0.0,
+                stamp: false,
+                blend_edge: false,
+                reach: 0,
+                depth: None,
+                uses: None,
                 px: &px,
                 valid: valid.clone(),
-                targets,
-                hole_box: hb,
-                tbox: tb,
+                cells,
                 full: Vec::new(),
                 tmom: Vec::new(),
                 smom: Vec::new(),
@@ -420,15 +426,16 @@ fn full_patches_measure_as_clipped_ones() {
                 ctl: none,
             };
             s.prepare(keep);
-            let nnf = vec![picks[0]; tb.area()];
-            let mut cost = vec![f32::INFINITY; tb.area()];
+            let nnf = vec![picks[0]; s.cells.len()];
+            let mut cost = vec![f32::INFINITY; s.cells.len()];
             s.costs(&nnf, &mut cost).unwrap();
             let mut checked = 0;
-            for k in 0..tb.area() {
-                if !s.targets[k] || !s.full[k] {
+            let cells: Vec<(usize, usize, usize)> = s.cells.iter().collect();
+            for (k, x, y) in cells {
+                if !s.full[k] {
                     continue;
                 }
-                let t = ((tb.x0 + k % tb.width()) as i32, (tb.y0 + k / tb.width()) as i32);
+                let t = (x as i32, y as i32);
                 for &src in &picks {
                     if adapt.is_none() {
                         let exact = s.dist_clipped(t, src, f32::INFINITY);
@@ -481,4 +488,684 @@ fn synthesis_fills_hole_with_plausible_values() {
     let err = hole_rmse(&out, &clean, &hole, ch);
     assert!(err < 0.15, "{err}");
     assert!(out.iter().all(|v| v.is_finite()));
+}
+
+/// The target cells are the centres within the patch radius of a hole pixel, numbered in
+/// raster order, however ragged the hole.
+#[test]
+fn target_cells_are_the_centres_near_the_hole() {
+    let mut rng = Rng::new(5);
+    for (w, h, r) in [(41usize, 33usize, 3usize), (17, 60, 1), (64, 9, 2), (5, 5, 3)] {
+        let hole: Vec<bool> = (0..w * h).map(|i| (i % w + i / w).is_multiple_of(11) || rng.next().is_multiple_of(17)).collect();
+        let px = roles(w, h, &hole);
+        let hb = hole_bounds(w, h, &px).unwrap();
+        let tb = hb.grow(r, w, h);
+        let cells = Cells::around(w, r, &px, hb, tb);
+        let mut k = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let near = (y.saturating_sub(r)..(y + r + 1).min(h)).any(|yy| (x.saturating_sub(r)..(x + r + 1).min(w)).any(|xx| hole[yy * w + xx]));
+                assert_eq!(cells.index(x, y), near.then_some(k), "({x}, {y}) in {w}×{h}, r {r}");
+                k += usize::from(near);
+            }
+        }
+        assert_eq!(cells.len(), k);
+        assert!(cells.iter().enumerate().all(|(i, (n, x, y))| i == n && cells.index(x, y) == Some(n)));
+        for y in tb.y0..tb.y1 {
+            for x in tb.x0..tb.x1 {
+                let row: Vec<usize> = cells.iter().filter(|c| c.2 == y).map(|c| c.1).collect();
+                assert_eq!(cells.in_row(y, x, true), row.iter().filter(|c| **c < x).count());
+                assert_eq!(cells.in_row(y, x, false), row.iter().filter(|c| **c > x).count());
+            }
+            assert_eq!(cells.before_row(y + 1) - cells.before_row(y), cells.row(y).iter().map(|s| s.x1 - s.x0).sum::<usize>());
+        }
+    }
+}
+
+/// A fill area along all four borders (the selection of a panorama's empty edges) keeps its
+/// per-target tables to the ring, not to its bounds (the whole image).
+#[test]
+fn a_border_ring_has_targets_only_along_the_borders() {
+    let (w, h, r, band) = (400, 300, 3, 6);
+    let hole: Vec<bool> = (0..w * h)
+        .map(|i| {
+            let (x, y) = (i % w, i / w);
+            x < band || y < band || x >= w - band || y >= h - band
+        })
+        .collect();
+    let px = roles(w, h, &hole);
+    let hb = hole_bounds(w, h, &px).unwrap();
+    let cells = Cells::around(w, r, &px, hb, hb.grow(r, w, h));
+    let ring = w * h - (w - 2 * (band + r)) * (h - 2 * (band + r));
+    assert_eq!(cells.len(), ring);
+    assert!(cells.len() * 5 < hb.area(), "{} targets of {}", cells.len(), hb.area());
+    // And the ring fills from the image (deterministically, whatever the thread count).
+    let img = busy(w, h, 3, 8);
+    let p = CompleteParams { adapt: Adapt { gain: (0.8, 1.25), bias: 0.08 }, ..Default::default() };
+    let a = complete(w, h, 3, &img, &hole, &p).expect("filled");
+    let b = complete(w, h, 3, &img, &hole, &p).expect("filled");
+    assert_eq!(bits(&a), bits(&b));
+    assert!(a.iter().all(|v| v.is_finite()));
+}
+
+/// A guide decides the fill's layout: a hole across the line between a bright upper half and a
+/// dark lower one, guided by the picture as it was, comes out with the line where it was, and
+/// closer to the picture than the unguided fill. The pixels outside the hole stay as they are.
+#[test]
+fn a_guide_steers_the_fill_towards_it() {
+    let (w, h, ch) = (120, 96, 3);
+    let base = busy(w, h, ch, 6);
+    let truth: Vec<f32> = base.iter().enumerate().map(|(i, v)| if i / ch / w < 40 { (v + 0.4).min(1.0) } else { v * 0.5 }).collect();
+    let hole = disc(w, h, 60.0, 40.0, 22.0);
+    let px = roles(w, h, &hole);
+    let p = CompleteParams::default();
+    let none = photocraft_raster::Interrupt::NONE;
+    let plain = complete_masked_owned(w, h, ch, truth.clone(), &px, &p, &none).unwrap().unwrap();
+    let guided = complete_guided_owned(w, h, ch, truth.clone(), &px, &truth, 1.0, &p, &none).unwrap().unwrap();
+    // The layout, not the pixels: the fill stamps pieces of the texture, so compare 7 × 7 means.
+    let soft = |v: &[f32]| -> Vec<f32> {
+        (0..v.len())
+            .map(|i| {
+                let (x, y, c) = ((i / ch) % w, i / ch / w, i % ch);
+                let (x0, x1, y0, y1) = (x.saturating_sub(3), (x + 4).min(w), y.saturating_sub(3), (y + 4).min(h));
+                let n = ((x1 - x0) * (y1 - y0)) as f32;
+                (y0..y1).flat_map(|yy| (x0..x1).map(move |xx| (yy * w + xx) * ch + c)).map(|j| v[j]).sum::<f32>() / n
+            })
+            .collect()
+    };
+    let st = soft(&truth);
+    let (e_plain, e_guided) = (hole_rmse(&soft(&plain), &st, &hole, ch), hole_rmse(&soft(&guided), &st, &hole, ch));
+    assert!(e_guided < e_plain, "guided {e_guided} vs unguided {e_plain}");
+    // Bright above the line, dark below it, inside the hole too.
+    let mean = |y: usize| (40..80).map(|x| guided[(y * w + x) * ch]).sum::<f32>() / 40.0;
+    assert!(mean(30) > mean(50) + 0.2, "{} above vs {} below", mean(30), mean(50));
+    for (i, hh) in hole.iter().enumerate() {
+        if !*hh {
+            assert_eq!(bits(&guided[i * ch..(i + 1) * ch]), bits(&truth[i * ch..(i + 1) * ch]));
+        }
+    }
+}
+
+/// A soft guide (a model's fill scaled up) still decides the layout: guided by the picture
+/// blurred over 6 pixels and told so, the fill keeps the line between the bright and dark halves
+/// and comes out sharp, as textured as the picture rather than as soft as the guide.
+#[test]
+fn a_soft_guide_gives_the_layout_and_the_picture_the_detail() {
+    let (w, h, ch) = (120, 96, 3);
+    let base = busy(w, h, ch, 6);
+    let truth: Vec<f32> = base.iter().enumerate().map(|(i, v)| if i / ch / w < 40 { (v + 0.4).min(1.0) } else { v * 0.5 }).collect();
+    // The guide: 6 × 6 block means, scaled back up.
+    let mut soft = truth.clone();
+    for by in (0..h).step_by(6) {
+        for bx in (0..w).step_by(6) {
+            for c in 0..ch {
+                let cells: Vec<usize> = (by..(by + 6).min(h)).flat_map(|y| (bx..(bx + 6).min(w)).map(move |x| y * w + x)).collect();
+                let mean = cells.iter().map(|i| truth[i * ch + c]).sum::<f32>() / cells.len() as f32;
+                for i in cells {
+                    soft[i * ch + c] = mean;
+                }
+            }
+        }
+    }
+    let hole = disc(w, h, 60.0, 40.0, 22.0);
+    let px = roles(w, h, &hole);
+    let p = CompleteParams::default();
+    let none = photocraft_raster::Interrupt::NONE;
+    let guided = complete_guided_owned(w, h, ch, truth.clone(), &px, &soft, 6.0, &p, &none).unwrap().unwrap();
+    let mean = |y: usize| (40..80).map(|x| guided[(y * w + x) * ch]).sum::<f32>() / 40.0;
+    assert!(mean(30) > mean(50) + 0.2, "{} above vs {} below", mean(30), mean(50));
+    // Detail: neighbouring pixels in the hole differ about as much as in the picture, far more
+    // than in the guide.
+    let roughness = |v: &[f32]| {
+        let d: Vec<f32> = (0..w * h).filter(|&i| hole[i] && i % w + 1 < w && hole[i + 1]).map(|i| (v[i * ch] - v[(i + 1) * ch]).abs()).collect();
+        d.iter().sum::<f32>() / d.len() as f32
+    };
+    let (r_fill, r_truth, r_guide) = (roughness(&guided), roughness(&truth), roughness(&soft));
+    assert!(r_fill > 0.5 * r_truth && r_fill > 2.0 * r_guide, "fill {r_fill}, picture {r_truth}, guide {r_guide}");
+}
+
+/// A model's fill lighter and flatter than the picture around it takes the picture's tones; the
+/// picture itself is left alone.
+#[test]
+fn a_guide_lighter_than_the_picture_takes_its_tones() {
+    let (w, h, ch) = (96usize, 64usize, 3usize);
+    let hole: Vec<bool> = (0..w * h).map(|i| (32..64).contains(&(i % w))).collect();
+    // Rows alternate dark and light around the hole (mean 0.3); the guide in it is light and flat.
+    let mut g: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            let odd = ((i / w) % 2) as f32;
+            let v = if hole[i] { 0.6 + 0.02 * odd } else { 0.2 + 0.2 * odd };
+            [v, v, v]
+        })
+        .collect();
+    let before = g.clone();
+    match_guide_tones(w, h, ch, 3, &mut g, &hole, 16);
+    let hole_mean = (0..w * h).filter(|&i| hole[i]).map(|i| g[i * ch]).sum::<f32>() / (0..w * h).filter(|&i| hole[i]).count() as f32;
+    assert!((hole_mean - 0.3).abs() < 0.03, "the hole's mean {hole_mean}");
+    assert!(g.iter().zip(&before).enumerate().all(|(k, (a, b))| hole[k / ch] || a == b), "the picture is untouched");
+}
+
+/// Nearby: every match a search step gives is within reach of its target, also from a start
+/// out of reach (a random one, a coarser level's) and with the whole picture searched.
+#[test]
+fn a_nearby_fill_takes_matches_only_within_reach() {
+    let (w, h, ch, r) = (90, 60, 3, 3);
+    let mut img = busy(w, h, ch, 4);
+    let hole = disc(w, h, 45.0, 30.0, 8.0);
+    let px: Vec<Px> = hole.iter().map(|hh| if *hh { Px::Hole } else { Px::Source }).collect();
+    let none = photocraft_raster::Interrupt::NONE;
+    let hb = hole_bounds(w, h, &px).unwrap();
+    let valid = valid_sources(w, h, r, &px, &none).unwrap();
+    let far = Sources::new(&valid, w).all(&valid, w).into_iter().max_by_key(|p| (p.0 - 45).abs() + (p.1 - 30).abs()).unwrap();
+    let reach = 12;
+    let mut s = Solver {
+        w,
+        h,
+        ch,
+        r: r as i32,
+        img: &mut img,
+        guide: None,
+        mimg: None,
+        coherence: 0.0,
+        stamp: false,
+        blend_edge: false,
+        reach,
+        depth: Some(solver::Depth::new(&valid, w, h, reach as usize, reach, 0.0, &[])),
+        uses: None,
+        px: &px,
+        valid: valid.clone(),
+        cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
+        full: Vec::new(),
+        tmom: Vec::new(),
+        smom: Vec::new(),
+        adapt: Adapt::NONE,
+        ctl: none,
+    };
+    s.prepare(false);
+    assert!(!s.allowed((45, 30), far) && s.allowed((45, 30), (45 + reach, 30 - reach)));
+    let mut rng = Rng::new(9);
+    let cells: Vec<(usize, usize, usize)> = s.cells.iter().collect();
+    for (k, x, y) in cells {
+        let t = (x as i32, y as i32);
+        let (m, c) = s.pm_step(t, k, (far, 0.0), Some(far), Some(far), 1, &mut rng, w as i32);
+        assert!(s.allowed(t, m), "{t:?} took {m:?}");
+        assert!(c.is_finite());
+    }
+}
+
+/// Same depth: a target copies from about its own rows, more the farther it is from the
+/// horizon; one with no source within reach in its rows, as far again as the nearest rows that
+/// have one, twice over; and each block has a source to fall back on.
+#[test]
+fn a_same_depth_fill_copies_from_about_its_own_rows() {
+    let (w, h, reach) = (64, 64, 8);
+    // Sources only in the top 16 rows.
+    let valid: Vec<bool> = (0..w * h).map(|i| i / w < 16).collect();
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0, &[]);
+    assert_eq!(d.rows((30, 8)), 2, "a row with sources");
+    // Row 40 is in block row 5 (of 8 rows each); the nearest with sources is block row 1.
+    assert_eq!(d.rows((30, 40)), 2 + 2 * 32);
+    // From a horizon at row 40: half the distance to it.
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.5, &[40.0; 64]);
+    assert_eq!((d.rows((30, 10)), d.rows((30, 40))), (15, 2 + 2 * 32));
+    // Sources across the picture's top, and down its left 40 columns: block column 7 (columns
+    // 56..64) has none within 8 columns of all its pixels but in the top block row, 5 block rows
+    // up; block column 5 (40..48) has column 39.
+    let valid: Vec<bool> = (0..w * h).map(|i| i % w < 40 || i / w < 8).collect();
+    let d = solver::Depth::new(&valid, w, h, reach, 2, 0.0, &[]);
+    assert_eq!(d.rows((44, 40)), 2, "valid columns within reach");
+    assert_eq!(d.rows((60, 40)), 2 + 2 * 40);
+    for t in [(44, 40), (60, 40), (63, 63)] {
+        let s = d.fallback(t).unwrap();
+        assert!(valid[s.1 as usize * w + s.0 as usize] && (s.0 - t.0).abs() <= reach as i32 && (s.1 - t.1).abs() <= d.rows(t) + 8, "{t:?}: {s:?}");
+    }
+}
+
+/// Along a tilted horizon, the same depth is the same distance from it, not the same row: a
+/// source 10 columns on, where the horizon is 5 rows lower, matches a target 5 rows higher.
+#[test]
+fn the_same_depth_follows_a_tilted_horizon() {
+    let (w, h, ch, r) = (80, 60, 3, 3);
+    let mut img = busy(w, h, ch, 2);
+    let px: Vec<Px> = (0..w * h).map(|i| if i % w >= 64 { Px::Hole } else { Px::Source }).collect();
+    let none = photocraft_raster::Interrupt::NONE;
+    let hb = hole_bounds(w, h, &px).unwrap();
+    let valid = valid_sources(w, h, r, &px, &none).unwrap();
+    // The horizon sinks half a row per column.
+    let horizon: Vec<f32> = (0..w).map(|x| 20.0 + x as f32 / 2.0).collect();
+    let mut s = Solver {
+        w,
+        h,
+        ch,
+        r: r as i32,
+        img: &mut img,
+        guide: None,
+        mimg: None,
+        coherence: 0.0,
+        stamp: false,
+        blend_edge: false,
+        reach: 40,
+        depth: Some(solver::Depth::new(&valid, w, h, 40, 1, 0.0, &horizon)),
+        uses: None,
+        px: &px,
+        valid: valid.clone(),
+        cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
+        full: Vec::new(),
+        tmom: Vec::new(),
+        smom: Vec::new(),
+        adapt: Adapt::NONE,
+        ctl: none,
+    };
+    s.prepare(false);
+    assert!(s.allowed((70, 30), (60, 25)), "10 columns back, the horizon is 5 rows higher");
+    assert!(!s.allowed((70, 30), (60, 30)), "the same row is 5 rows deeper there");
+}
+
+/// A grey picture: smooth sky above row `at(x)`, busy ground below (no colour to go by).
+fn landscape(w: usize, h: usize, at: impl Fn(usize) -> f32) -> Vec<f32> {
+    let mut seed = 7u32;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as f32 / (1u32 << 24) as f32
+    };
+    (0..w * h).map(|i| if ((i / w) as f32) < at(i % w) { 0.62 + 0.01 * noise() } else { 0.35 + 0.25 * noise() }).collect()
+}
+
+/// The horizon is where the smooth sky meets the busy ground, found without colour; carried
+/// into a hole over the right of the picture on its own slope.
+#[test]
+fn the_horizon_is_found_by_its_edge_and_carried_on_its_slope() {
+    let (w, h) = (400, 200);
+    let at = |x: usize| 80.0 + x as f32 * 0.05;
+    let img = landscape(w, h, at);
+    let line = find_horizon(&img, &vec![false; w * h], w, h, 1, 1, None).expect("a horizon");
+    for x in [10, 200, 390] {
+        assert!((line[x] - at(x)).abs() <= 2.5, "column {x}: {} not {}", line[x], at(x));
+    }
+    let hole: Vec<bool> = (0..w * h).map(|i| i % w >= 300).collect();
+    let line = find_horizon(&img, &hole, w, h, 1, 1, None).expect("a horizon");
+    assert!((line[395] - at(395)).abs() <= 4.0, "carried on: {} not {}", line[395], at(395));
+}
+
+/// A picture with no line across it has no horizon.
+#[test]
+fn a_picture_without_a_line_across_has_no_horizon() {
+    let (w, h) = (300, 200);
+    let img = landscape(w, h, |_| -1.0);
+    assert_eq!(find_horizon(&img, &vec![false; w * h], w, h, 1, 1, None), None);
+}
+
+/// Two lines across (a bank of cloud's flat base and the horizon): a line the user drew picks
+/// which, and the horizon follows the picture's edge near it rather than the line as drawn.
+#[test]
+fn a_drawn_line_picks_the_horizon_and_the_edge_near_it_is_followed() {
+    let (w, h) = (400, 240);
+    let mut img = landscape(w, h, |_| 150.0);
+    // A bright, smooth bank down to row 60.
+    for v in img.iter_mut().take(60 * w) {
+        *v = 0.95;
+    }
+    let hint = |y: f32| Some(Hint { from: [0.0, y], to: [400.0, y + 4.0] });
+    let low = find_horizon(&img, &vec![false; w * h], w, h, 1, 1, hint(146.0)).unwrap();
+    assert!((low[200] - 150.0).abs() <= 2.5, "{}", low[200]);
+    let high = find_horizon(&img, &vec![false; w * h], w, h, 1, 1, hint(56.0)).unwrap();
+    assert!((high[200] - 60.0).abs() <= 2.5, "{}", high[200]);
+}
+
+/// Seamless levels: a fill lighter than the picture beside it is brought down to it, all the
+/// way across a strip along the picture's edge; a step too large to be a level (a cloud by sky)
+/// is left as it is.
+#[test]
+fn a_fill_takes_the_levels_of_the_picture_beside_it() {
+    let (w, h, ch) = (160, 64, 3);
+    let hole: Vec<bool> = (0..w * h).map(|i| i % w >= 96).collect();
+    let mut img: Vec<f32> = (0..w * h).flat_map(|i| if i % w >= 96 { [0.43; 3] } else { [0.4; 3] }).collect();
+    seamless_levels(&mut img, &hole, w, h, ch, 3);
+    for x in [100, 150] {
+        let v = img[(32 * w + x) * ch];
+        assert!((v - 0.4).abs() < 0.004, "column {x}: {v}");
+    }
+    assert_eq!(img[(32 * w + 20) * ch], 0.4, "the picture is kept");
+    let mut big: Vec<f32> = (0..w * h).flat_map(|i| if i % w >= 96 { [0.7; 3] } else { [0.4; 3] }).collect();
+    seamless_levels(&mut big, &hole, w, h, ch, 3);
+    assert_eq!(big[(32 * w + 120) * ch], 0.7);
+}
+
+/// A mask grown by r: each set pixel spreads r px across and down (a square), no farther.
+#[test]
+fn a_mask_grows_by_its_radius_each_way() {
+    let (w, h) = (30, 20);
+    let mut m = vec![false; w * h];
+    m[10 * w + 15] = true;
+    let g = dilate_mask(&m, w, h, 3);
+    for y in 0..h {
+        for x in 0..w {
+            let inside = (12..=18).contains(&x) && (7..=13).contains(&y);
+            assert_eq!(g[y * w + x], inside, "({x}, {y})");
+        }
+    }
+    assert_eq!(dilate_mask(&m, w, h, 0), m);
+}
+
+/// A transparent edge's fringe (alpha below 1) and the pixels within `fringe` of it are not
+/// sources; the opaque picture past them is.
+#[test]
+fn the_fringe_of_a_transparent_edge_is_not_copied() {
+    let (w, h, ch) = (20, 6, 4);
+    // Transparent left of x 5, half at x 5, opaque from x 6.
+    let img: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            let a = match i % w {
+                0..5 => 0.0,
+                5 => 0.5,
+                _ => 1.0,
+            };
+            [0.3, 0.6, 0.9, a]
+        })
+        .collect();
+    let mut source: Vec<bool> = (0..w * h).map(|i| i % w >= 5).collect();
+    drop_fringe(&mut source, &img, w, h, ch, 2);
+    for x in 0..w {
+        assert_eq!(source[2 * w + x], x >= 8, "x {x}");
+    }
+    // With nothing left it keeps the sources it had.
+    let mut thin: Vec<bool> = (0..w * h).map(|i| i % w == 6).collect();
+    drop_fringe(&mut thin, &img, w, h, ch, 2);
+    assert!(thin[2 * w + 6]);
+}
+
+/// The fallback source of a block with no source in its rows lies inside the sources by more
+/// than a block's shift, not on their edge.
+#[test]
+fn a_fallback_source_lies_inside_the_picture() {
+    let (w, h) = (64, 100);
+    // Sources below row 50 only: block row 6 (rows 48..56) has sources from row 50, and one
+    // inside them by more than 4 + 1 rows at row 55.
+    let valid: Vec<bool> = (0..w * h).map(|i| i / w >= 50).collect();
+    let d = Depth::new(&valid, w, h, 64, 2, 0.0, &[]);
+    let s = d.fallback((20, 4)).expect("a fallback");
+    assert_eq!(s.1, 55, "{s:?}");
+    assert_eq!(d.rows((20, 4)), 2 + 2 * 48, "the rows measured to the sources' edge");
+    assert!(valid[s.1 as usize * w + s.0 as usize]);
+}
+
+/// Uses: a block copied once (a stretch copied whole) costs nothing more; each further copy of
+/// it costs the weight times the patch distance more.
+#[test]
+fn a_part_copied_more_than_once_costs_more() {
+    let mut u = solver::Uses::new(20, 20, 2, 0.5);
+    // Block (0, 0) copied whole once: 4 targets, one per pixel.
+    let mut nnf = vec![(0, 0), (1, 0), (0, 1), (1, 1)];
+    u.count(&nnf);
+    assert_eq!(u.factor((0, 0)), 1.0);
+    // ... and three more times over: 16 targets in all.
+    nnf.extend(std::iter::repeat_n([(0, 0), (1, 0), (0, 1), (1, 1)], 3).flatten());
+    u.count(&nnf);
+    assert_eq!(u.factor((1, 1)), 1.0 + 0.5 * 3.0);
+    assert_eq!(u.factor((5, 5)), 1.0, "a block nobody copies");
+    assert_eq!(u.factor((-3, 2)), 1.0, "off the picture");
+}
+
+/// Same depth, in a search: every match a step gives is within the rows its target may copy
+/// from, also from a start out of them.
+#[test]
+fn a_same_depth_fill_takes_matches_only_from_its_rows() {
+    let (w, h, ch, r) = (120, 80, 3, 3);
+    let mut img = busy(w, h, ch, 5);
+    // A strip down the right edge, as along a panorama's border.
+    let px: Vec<Px> = (0..w * h).map(|i| if i % w >= 96 && i / w >= 10 { Px::Hole } else { Px::Source }).collect();
+    let none = photocraft_raster::Interrupt::NONE;
+    let hb = hole_bounds(w, h, &px).unwrap();
+    let valid = valid_sources(w, h, r, &px, &none).unwrap();
+    let reach = 40;
+    let depth = Some(solver::Depth::new(&valid, w, h, reach, 8, 0.0, &[]));
+    let mut s = Solver {
+        w,
+        h,
+        ch,
+        r: r as i32,
+        img: &mut img,
+        guide: None,
+        mimg: None,
+        coherence: 0.0,
+        stamp: false,
+        blend_edge: false,
+        reach: reach as i32,
+        depth,
+        uses: None,
+        px: &px,
+        valid: valid.clone(),
+        cells: Cells::around(w, r, &px, hb, hb.grow(r, w, h)),
+        full: Vec::new(),
+        tmom: Vec::new(),
+        smom: Vec::new(),
+        adapt: Adapt::NONE,
+        ctl: none,
+    };
+    s.prepare(false);
+    assert!(s.allowed((100, 40), (70, 46)) && !s.allowed((100, 40), (70, 60)), "8 rows up or down beside the strip");
+    let far = (3, 3);
+    let mut rng = Rng::new(4);
+    let cells: Vec<(usize, usize, usize)> = s.cells.iter().collect();
+    for (k, x, y) in cells {
+        let t = (x as i32, y as i32);
+        let (m, _) = s.pm_step(t, k, (far, 0.0), Some(far), Some(far), 1, &mut rng, w as i32);
+        assert!(s.allowed(t, m), "{t:?} took {m:?}");
+    }
+}
+
+/// Layout only: the guide decides where the bright and dark parts go, and the fill is Classic's
+/// otherwise: no guide colour is matched against, so the pieces are the picture's.
+#[test]
+fn a_layout_only_guide_lays_out_the_hole_and_classic_fills_it() {
+    let (w, h, ch) = (120, 96, 3);
+    let base = busy(w, h, ch, 6);
+    let truth: Vec<f32> = base.iter().enumerate().map(|(i, v)| if i / ch / w < 40 { (v + 0.4).min(1.0) } else { v * 0.5 }).collect();
+    let hole = disc(w, h, 60.0, 40.0, 22.0);
+    let px = roles(w, h, &hole);
+    let none = photocraft_raster::Interrupt::NONE;
+    // A guide that is the truth's layout in flat tones: bright above the line, dark below.
+    let flat: Vec<f32> = (0..w * h * ch).map(|i| if i / ch / w < 40 { 0.8 } else { 0.2 }).collect();
+    let p = CompleteParams { layout_only: true, nearby: true, ..Default::default() };
+    let out = complete_guided_owned(w, h, ch, truth.clone(), &px, &flat, 1.0, &p, &none).unwrap().unwrap();
+    let mean = |y: usize| (45..75).map(|x| out[(y * w + x) * ch]).sum::<f32>() / 30.0;
+    assert!(mean(30) > mean(50) + 0.2, "{} above vs {} below", mean(30), mean(50));
+    // Textured like the picture, not flat like the guide.
+    let spread = |y: usize| {
+        let m = mean(y);
+        ((45..75).map(|x| (out[(y * w + x) * ch] - m).powi(2)).sum::<f32>() / 30.0).sqrt()
+    };
+    assert!(spread(30) > 0.05 && spread(50) > 0.02, "spread {} / {}", spread(30), spread(50));
+}
+
+/// A nearby fill stamps: away from the picture its pixels are copies of the picture's, cross-faded
+/// only where two copies meet ([`super::seams::feather`]), so it keeps the picture's texture
+/// rather than greying it into a blend of near misses.
+#[test]
+fn a_nearby_fill_keeps_the_texture_away_from_the_picture() {
+    let (w, h, ch) = (96, 64, 3);
+    let img = busy(w, h, ch, 9);
+    let hole = disc(w, h, 48.0, 32.0, 14.0);
+    let px = roles(w, h, &hole);
+    let none = photocraft_raster::Interrupt::NONE;
+    let p = CompleteParams { nearby: true, ..Default::default() };
+    let out = complete_masked_owned(w, h, ch, img.clone(), &px, &p, &none).unwrap().unwrap();
+    let deep = disc(w, h, 48.0, 32.0, 8.0);
+    // Mean step to the right neighbour, over the given pixels.
+    let step = |a: &[f32], m: &dyn Fn(usize) -> bool| {
+        let v: Vec<f32> =
+            (0..w * h).filter(|i| i % w + 1 < w && m(*i)).map(|i| (0..ch).map(|c| (a[(i + 1) * ch + c] - a[i * ch + c]).abs()).sum::<f32>()).collect();
+        v.iter().sum::<f32>() / v.len().max(1) as f32
+    };
+    let ratio = step(&out, &|i| deep[i]) / step(&img, &|i| !hole[i]);
+    assert!(ratio > 0.6, "texture deep in the hole is {ratio} of the picture's");
+}
+
+/// A pixel from a copy that disagrees with its neighbours' copy takes theirs: the seams around
+/// it cost more than none.
+#[test]
+fn a_lone_copy_that_disagrees_takes_its_neighbours() {
+    // Rows 0 and 1: the picture (copy B shows row 0, copy A row 1, two rows down); row 2: the
+    // hole, copy A throughout except one pixel from B; row 3: the picture again.
+    let (w, h) = (8, 4);
+    let mut px = vec![Px::Source; w * h];
+    let mut img = vec![0.0f32; w * h];
+    for x in 0..w {
+        img[x] = if x % 2 == 0 { 0.0 } else { 1.0 };
+        img[w + x] = 0.5;
+        img[3 * w + x] = 0.5;
+    }
+    let mut active = vec![false; w * h];
+    let mut labels = vec![(0i32, 0i32); w * h];
+    for x in 0..w {
+        let i = 2 * w + x;
+        px[i] = Px::Hole;
+        active[i] = true;
+        labels[i] = if x == 5 { (0, -2) } else { (0, -1) };
+    }
+    super::seams::cut(&mut img, &px, w, h, 1, &active, &mut labels);
+    assert_eq!(labels[2 * w + 5], (0, -1));
+    assert!(img[2 * w..3 * w].iter().all(|v| *v == 0.5), "{:?}", &img[2 * w..3 * w]);
+}
+
+/// Fusing evens out two copies that disagree in brightness, over their whole size: a hole filled
+/// with its left half copied from a patch of the picture 6/255 brighter (a panorama's shading)
+/// than the right half's copy, beside a picture of the right half's brightness, comes out
+/// without a step at the seam or the hole's edges, and its texture (a ramp) is kept.
+#[test]
+fn fusing_evens_out_copies_of_different_brightness() {
+    let (w, h) = (100, 40);
+    // The picture: a ramp of 0.002 a column (period 10), columns 0..30 brighter by 6/255.
+    let ramp = |x: usize| 0.002 * (x % 10) as f32;
+    let mut img: Vec<f32> = (0..w * h).map(|i| ramp(i % w) + if i % w < 30 { 0.4 + 6.0 / 255.0 } else { 0.4 }).collect();
+    // The hole: columns 41..81; its left half copies from 40 px left (the bright part), its right
+    // half from 10 px right.
+    let hole: Vec<bool> = (0..w * h).map(|i| (41..81).contains(&(i % w)) && (5..35).contains(&(i / w))).collect();
+    let px: Vec<Px> = hole.iter().map(|o| if *o { Px::Hole } else { Px::Source }).collect();
+    let labels: Vec<(i32, i32)> = (0..w * h)
+        .map(|i| {
+            if !hole[i] {
+                (0, 0)
+            } else if i % w < 61 {
+                (-40, 0)
+            } else {
+                (10, 0)
+            }
+        })
+        .collect();
+    for i in (0..w * h).filter(|i| hole[*i]) {
+        let s = (i as i64 + i64::from(labels[i].0)) as usize;
+        img[i] = img[s];
+    }
+    let step = |img: &[f32], x: usize| img[20 * w + x] - img[20 * w + x - 1];
+    assert!(step(&img, 61).abs() > 0.02, "the copies differ by {}", step(&img, 61));
+    super::seams::fuse(&mut img, &px, (w, h, 1), &hole, &labels);
+    // Every step is the ramp's own again: at the seam, at both edges, inside a copy.
+    for x in [41, 52, 61, 81] {
+        assert!((step(&img, x) - 0.002).abs() < 0.004, "a step of {} at column {x}", step(&img, x));
+    }
+}
+
+/// Fusing leaves a big difference where two copies meet mostly as it is (a cloud's edge against
+/// sky): it doesn't lift or sink a whole copy to hide it.
+#[test]
+fn fusing_keeps_most_of_a_big_step_between_copies() {
+    let (w, h) = (90, 40);
+    let mut img: Vec<f32> = (0..w * h).map(|i| if i % w < 30 { 0.9 } else { 0.3 }).collect();
+    let hole: Vec<bool> = (0..w * h).map(|i| (40..80).contains(&(i % w)) && (5..35).contains(&(i / w))).collect();
+    let px: Vec<Px> = hole.iter().map(|o| if *o { Px::Hole } else { Px::Source }).collect();
+    let labels: Vec<(i32, i32)> = (0..w * h)
+        .map(|i| {
+            if !hole[i] {
+                (0, 0)
+            } else if i % w < 60 {
+                (-40, 0)
+            } else {
+                (10, 0)
+            }
+        })
+        .collect();
+    for i in (0..w * h).filter(|i| hole[*i]) {
+        img[i] = img[(i as i64 + i64::from(labels[i].0)) as usize];
+    }
+    super::seams::fuse(&mut img, &px, (w, h, 1), &hole, &labels);
+    let step = img[20 * w + 60] - img[20 * w + 59];
+    assert!(step < -0.4, "the bright copy's edge keeps most of its 0.6 step: {step}");
+}
+
+/// Relighting (before a fill) evens out a darker edge beside the hole: sky at 0.6 that darkens to 0.5 in the
+/// 15 px next to the hole (a panorama's stitched edge) is brought most of the way back up next
+/// to the hole, less farther out, and not at all past the band; a textured edge keeps its own.
+#[test]
+fn relit_edge_stays_near_the_hole() {
+    let (w, h) = (400, 300);
+    let hole: Vec<bool> = (0..w * h).map(|i| i % w < 100).collect();
+    let px: Vec<Px> = hole.iter().map(|o| if *o { Px::Hole } else { Px::Source }).collect();
+    let (_, band, cap) = super::relight_params(3, w, h);
+    assert!(band > 15, "{band}");
+    let sky = |x: usize| if x < 100 { 0.0 } else { 0.6 - 0.1 * (1.0 - ((x - 100) as f32 / 15.0).min(1.0)) };
+    let mut img: Vec<f32> = (0..w * h).map(|i| sky(i % w)).collect();
+    let before = img.clone();
+    let radius = band.div_ceil(8).max(3);
+    let relit = super::seams::relight(&mut img, &px, (w, h, 1), &vec![false; w * h], radius, band, cap);
+    let at = |v: &[f32], x: usize| v[150 * w + x];
+    assert!(at(&img, 101) - at(&before, 101) > 0.04, "{} -> {}", at(&before, 101), at(&img, 101));
+    assert!(at(&img, 101) - at(&before, 101) <= cap + 1e-4);
+    for x in band + 101..w {
+        assert_eq!(at(&img, x).to_bits(), at(&before, x).to_bits(), "column {x}");
+    }
+    // What it changed goes back as it was.
+    relit.put_back(&mut img, 1);
+    assert!(img.iter().zip(&before).all(|(a, b)| a.to_bits() == b.to_bits()));
+    // A textured edge (a checkerboard 0.2 apart) keeps its pixels.
+    let mut tex: Vec<f32> = (0..w * h).map(|i| if hole[i] { 0.0 } else { sky(i % w) + if (i % w + i / w) % 2 == 0 { 0.1 } else { -0.1 } }).collect();
+    let tex0 = tex.clone();
+    super::seams::relight(&mut tex, &px, (w, h, 1), &vec![false; w * h], radius, band, cap);
+    assert!(tex.iter().zip(&tex0).all(|(a, b)| (a - b).abs() < 1e-3));
+}
+
+/// The sky rule ([`super::sky::SkyRule`]): a cloud the hole's edge cuts goes on into the hole;
+/// over one whose top only grazes the edge, and over sky, the fill copies no cloud. Clear or
+/// mostly cloudy skies have no rule.
+#[test]
+fn a_cut_cloud_goes_on_and_a_grazing_one_gets_sky_above_it() {
+    let (w, h, ch, horizon) = (96usize, 96usize, 3usize, 70usize);
+    let (sky, cloud, ground) = ([0.2f32, 0.27, 0.42], [0.82f32, 0.82, 0.84], [0.35f32, 0.3, 0.25]);
+    let scene = |cut: bool, disc: bool| -> Vec<f32> {
+        (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = ((i % w) as f32, (i / w) as f32);
+                if i / w >= horizon {
+                    ground
+                } else if (cut && x < 20.0 && y < 40.0) || (disc && (x - 60.0).powi(2) + (y - 30.0).powi(2) <= 24.0 * 24.0) {
+                    cloud
+                } else {
+                    sky
+                }
+            })
+            .collect()
+    };
+    // The hole: a strip along the top, rows 0..6 (the disc's top touches it at row 6).
+    let px: Vec<Px> = (0..w * h).map(|i| if i / w < 6 { Px::Hole } else { Px::Source }).collect();
+    let img = scene(true, true);
+    let k = super::sky::SkyRule::new(&img, &px, w, h, ch, |_| horizon as i32, 1).expect("a sky rule");
+    assert!(k.allows((8, 4), (10, 20), w), "over the cut cloud, the cloud goes on");
+    assert!(!k.allows((4, 3), (92, 60), w), "with cloud, not sky");
+    assert!(!k.allows((60, 3), (60, 30), w), "over the grazing cloud, no cloud");
+    assert!(k.allows((60, 3), (92, 60), w), "but sky");
+    assert!(!k.allows((90, 3), (10, 20), w), "over sky, no cloud");
+    assert!(super::sky::SkyRule::new(&scene(false, false), &px, w, h, ch, |_| horizon as i32, 1).is_none(), "a clear sky has no rule");
+    // A sky that is mostly cloud, with a few gaps of blue: no rule (its gaps are too small to copy).
+    let overcast: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            if i / w >= horizon {
+                ground
+            } else if (i % w) % 16 < 3 {
+                sky
+            } else {
+                cloud
+            }
+        })
+        .collect();
+    assert!(super::sky::SkyRule::new(&overcast, &px, w, h, ch, |_| horizon as i32, 1).is_none(), "a mostly cloudy sky has no rule");
 }

@@ -304,7 +304,10 @@ mod presets;
 mod purge;
 
 pub(crate) use content_aware::channel_mask;
-pub use content_aware::{CafPlan, FillEdit, MAX_CAF_EDITS, MAX_CAF_POINTS, SelOp, content_aware_plan, content_aware_plan_with};
+pub use content_aware::{
+    CafPlan, FillEdit, FillModel, MAX_CAF_EDITS, MAX_CAF_POINTS, MODEL_SIDE, ModelGuide, SelOp, caf_fill, content_aware_plan, content_aware_plan_with,
+    model_guide,
+};
 use content_aware::{can_caf, content_aware_fill, delete_and_fill};
 pub use content_aware_scale::ContentAwareScalePreview;
 use content_aware_scale::content_aware_scale;
@@ -340,7 +343,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Content-Aware Fill…",
             ["Edit"],
             None,
-            r##"{"sampling":"auto|rectangular|custom","margin":px?,"area":[x,y,w,h]?,"channel":index|name?,"samplingStrokes":[{"mode":"add|subtract","size":px,"points":[[x,y],…]}]? (the workspace's Sampling Brush, after the sampling option's area; added strokes may lie outside the window),"fillEdits":[{"op":"new|add|subtract|intersect","points":[[x,y],…]}|{"op":"expand|contract","by":px}]? (the workspace's lasso edits of the fill area, in order),"sampleAllLayers":bool=false,"colorAdaptation":"default|none|high|veryHigh","rotationAdaptation":"none|low|medium|high|full","scale":bool=false,"mirror":bool=false,"output":"current|new|duplicate","layer":id|name?=active (the layer filled and sampled),"seed":u64=1}"##,
+            r##"{"sampling":"auto|rectangular|custom","margin":px?,"area":[x,y,w,h]?,"channel":index|name?,"samplingStrokes":[{"mode":"add|subtract","size":px,"points":[[x,y],…]}]? (the workspace's Sampling Brush, after the sampling option's area; added strokes may lie outside the window),"fillEdits":[{"op":"new|add|subtract|intersect","points":[[x,y],…]}|{"op":"expand|contract","by":px}]? (the workspace's lasso edits of the fill area, in order),"sampleAllLayers":bool=false,"colorAdaptation":"default|none|high|veryHigh","rotationAdaptation":"none|low|medium|high|full","scale":bool=false,"mirror":bool=false,"output":"current|new|duplicate","layer":id|name?=active (the layer filled and sampled),"method":"classic|classicDepth|lama|migan|mix"="classic" (PhotoCraft: Classic + Depth copies from the same depth; the models are not on the web),"stamp":bool=false (a model only lays the hole out and Classic fills, copying from nearby),"matchDepth":bool=false (stamp: from the same depth),"detail":bool=true (a model without stamp: rebuild the detail from the photo),"edgeGrow":px=0,"edgeFeather":px=0 (PhotoCraft: the fill blends into the picture over a band grown, then feathered, past the selection),"seed":u64=1}"##,
             can_caf,
             content_aware_fill
         ),

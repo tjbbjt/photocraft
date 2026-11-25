@@ -45,9 +45,37 @@ fn every_contents_option_fills() {
     fill(&mut app, json!({"contents": "color", "color": "#336699"}));
     app.run("select.rect", json!({"x": 15, "y": 10, "width": 6, "height": 6})).unwrap();
     fill(&mut app, json!({"contents": "white"}));
-    fill(&mut app, json!({"contents": "contentAware", "colorAdaptation": false}));
+    fill(&mut app, json!({"contents": "contentAware", "colorAdaptation": false, "fillMode": "parity"}));
     assert!(close(px(&app, 17, 12), [0.2, 0.4, 0.6, 1.0]), "{:?}", px(&app, 17, 12));
     assert_eq!(app.session.active().unwrap().history.past_len(), 7);
+}
+
+/// Content-Aware the PhotoCraft way runs the Content-Aware Fill command with Fill's sampling, the
+/// method and the edge band; Parity, other contents and masks run Fill itself.
+#[test]
+fn photocraft_content_aware_runs_the_content_aware_fill_command() {
+    let mut f = defaults([1.0, 0.0, 0.0], None);
+    let pixels = json!({"target": "pixels", "layer": 7});
+    assert_eq!(f.text("fillMode"), Some("photocraft"));
+    assert_eq!(photocraft_params(&f, &pixels), None, "Foreground is Fill's");
+    f.set("contents", "contentAware");
+    f.set("method", "lama");
+    f.set("edgeFeather", 12.4);
+    f.set("colorAdaptation", false);
+    let p = photocraft_params(&f, &pixels).expect("PhotoCraft content-aware");
+    assert_eq!(p["sampling"], "rectangular");
+    assert_eq!(p["colorAdaptation"], "none");
+    assert_eq!(p["method"], "lama");
+    assert_eq!(p["layer"], 7);
+    assert_eq!(p["stamp"], true, "a model stamps with Classic unless told not to");
+    assert_eq!(p["matchDepth"], true, "at the same depth unless told not to");
+    assert_eq!(p["edgeGrow"], json!(EDGE_GROW));
+    assert_eq!(p["edgeFeather"], json!(12.0));
+    f.set("stamp", false);
+    assert_eq!(photocraft_params(&f, &pixels).unwrap()["stamp"], false);
+    assert_eq!(photocraft_params(&f, &json!({"target": "mask"})), None, "a mask is Fill's (which refuses it)");
+    f.set("fillMode", "parity");
+    assert_eq!(photocraft_params(&f, &pixels), None, "Parity is Fill's");
 }
 
 /// The Blend row's ids reach the engine, and opacity and Preserve Transparency apply.

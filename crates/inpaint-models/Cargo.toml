@@ -1,0 +1,16 @@
+[package]
+name = "photocraft-inpaint-models"
+description = "Fill models for Content-Aware Fill (LaMa, MI-GAN) on rten, read from the publishers' ONNX files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+photocraft-raster = { workspace = true }
+# Pure Rust, no C or C++: the engine craft-ai-integrations uses, reading the .onnx files as they are.
+rten = { version = "=0.28.0", default-features = false, features = ["onnx_format"] }
+rten-tensor = "=0.28.0"
