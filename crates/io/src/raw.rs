@@ -65,7 +65,7 @@ fn shrink_rgba8(rgba: &[u8], w: u32, h: u32, max_side: u32) -> (u32, u32, Vec<u8
     let (w, h) = (w as usize, h as usize);
     let (tw, th) = (w.div_ceil(k), h.div_ceil(k));
     let mut acc = vec![[0u32; 5]; tw * th];
-    for (i, px) in rgba.chunks_exact(4).take(w * h).enumerate() {
+    for (i, px) in rgba.as_chunks::<4>().0.iter().take(w * h).enumerate() {
         let a = &mut acc[(i / w / k) * tw + (i % w) / k];
         for c in 0..4 {
             a[c] += u32::from(px[c]);
