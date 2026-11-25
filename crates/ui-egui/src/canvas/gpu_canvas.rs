@@ -883,6 +883,7 @@ impl GpuCanvas {
                 out.composite_ms = now_ms() - t0;
                 out.uploads = stats.tiles_uploaded as u64;
                 out.gpu = stats.gpu_time;
+                log_slow_composite(out.px, out.composite_ms, &stats);
                 return out;
             }
             Err(e) => {
@@ -1114,3 +1115,35 @@ mod sharp_gpu_tests;
 
 #[cfg(test)]
 mod tests;
+
+/// A wgpu refresh of [`SLOW_COMPOSITE_MS`] or more: where its time went on the CPU (planning,
+/// effect maps, recording the chunks with their uploads, submitting and waiting for the GPU
+/// between batches) and how much work it was, to tell what limits a very large canvas.
+const SLOW_COMPOSITE_MS: f64 = 500.0;
+
+fn log_slow_composite(px: u64, ms: f64, s: &photocraft_gpu::Stats) {
+    if ms < SLOW_COMPOSITE_MS {
+        return;
+    }
+    let other = ms - f64::from(s.plan_ms + s.fx_ms + s.cells_ms + s.wait_ms);
+    log::info!(
+        "gpu composite: {:.0} MP in {ms:.0} ms: plan {:.0}, effect maps {:.0} ({} programs, {:.0} MP), chunks {:.0} ({} cells, {} chunks, {} passes, {} batched layers, {} prefix hits), submit and wait {:.0} ({} flushes), other {other:.0}; uploads {} tiles ({} MB), {} shared, {} evicted",
+        px as f64 / 1e6,
+        s.plan_ms,
+        s.fx_ms,
+        s.fx_programs,
+        s.fx_pixels as f64 / 1e6,
+        s.cells_ms,
+        s.cells,
+        s.chunks,
+        s.passes,
+        s.layers_batched,
+        s.prefix_hits,
+        s.wait_ms,
+        s.flushes,
+        s.tiles_uploaded,
+        s.bytes_uploaded >> 20,
+        s.tiles_shared,
+        s.evicted,
+    );
+}
