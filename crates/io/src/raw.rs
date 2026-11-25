@@ -223,6 +223,12 @@ impl std::fmt::Debug for RawDecode {
 }
 
 impl RawDecode {
+    /// The memory its sensor data takes, in bytes.
+    fn memory(&self) -> u64 {
+        let s = &self.sensor;
+        (s.data.len() * 2 + s.float_data.as_ref().map_or(0, |f| f.len() * 4)) as u64
+    }
+
     /// Decodes `bytes` and fits its look, as a default open does.
     pub fn new(bytes: &[u8]) -> Result<RawDecode, IoError> {
         let sensor = decode_sensor(bytes, &limits())?;
@@ -291,11 +297,23 @@ impl Fingerprint {
 }
 
 /// The decodes of the last opens that await their Camera Raw dialog (see
-/// [`ImportOptions::keep_raw`](crate::ImportOptions::keep_raw)): at most two, so several raws
-/// opened at once each find theirs, and the oldest goes first. The dialog takes its own out.
+/// [`ImportOptions::keep_raw`](crate::ImportOptions::keep_raw)), so a set of raws opened at once
+/// each find theirs and the dialog switches between them without decoding a file again (that took
+/// seconds a raw). As many as fit in [`kept_budget`], at least [`KEPT_MIN`]; the oldest goes
+/// first. The dialog takes its own out.
 static KEPT: Mutex<Vec<Arc<RawDecode>>> = Mutex::new(Vec::new());
 
-const KEPT_MAX: usize = 2;
+/// Decodes kept whatever their size.
+const KEPT_MIN: usize = 2;
+/// And at most this many.
+const KEPT_MAX: usize = 64;
+
+/// The memory the kept decodes may take: a quarter of what is available, at most 8 GiB (2 GiB
+/// when it can't be measured).
+fn kept_budget() -> u64 {
+    const GIB: u64 = 1 << 30;
+    crate::memory::available().map_or(2 * GIB, |a| (a / 4).min(8 * GIB))
+}
 
 fn kept() -> std::sync::MutexGuard<'static, Vec<Arc<RawDecode>>> {
     KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -308,6 +326,11 @@ pub fn take_kept_decode(bytes: &[u8]) -> Option<Arc<RawDecode>> {
     let mut kept = kept();
     let at = kept.iter().position(|d| d.fingerprint == want)?;
     Some(kept.remove(at))
+}
+
+/// Frees every kept decode (the Camera Raw dialog they waited for has closed).
+pub fn drop_kept_decodes() {
+    kept().clear();
 }
 
 /// A fitted look's tone curve as knots for [`photocraft_raw::retone`] (which reads them
@@ -490,11 +513,13 @@ fn import_raw_with_inner(name: &str, bytes: &[u8], opts: &DevelopOptions, keep: 
     match develop_fitted(bytes, opts, keep) {
         Ok((dev, kept_parts)) => {
             if let Some((sensor, look)) = kept_parts {
+                let decode = Arc::new(RawDecode::from_parts(bytes, sensor, look));
+                let budget = kept_budget();
                 let mut kept = kept();
-                if kept.len() == KEPT_MAX {
+                kept.push(decode);
+                while kept.len() > KEPT_MIN && (kept.len() > KEPT_MAX || kept.iter().map(|d| d.memory()).sum::<u64>() > budget) {
                     kept.remove(0);
                 }
-                kept.push(Arc::new(RawDecode::from_parts(bytes, sensor, look)));
             }
             let summary = format!("{DEVELOPED_NOTE} ({} demosaic, as-shot white balance)", opts.demosaic.id());
             developed_document(name, bytes, format, dev, &summary)

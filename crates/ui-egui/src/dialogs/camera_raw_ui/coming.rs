@@ -160,6 +160,8 @@ pub(super) fn stop_the_rest(app: &mut PhotocraftApp) {
 fn forget_tiles(app: &mut PhotocraftApp) {
     app.raw_coming.tiles.clear();
     app.raw_coming.wanted = None;
+    // The decodes the set's opens kept for the dialog (up to a quarter of the memory) go with it.
+    photocraft_io::raw::drop_kept_decodes();
 }
 
 /// Where the open-time dialog's filmstrip tiles come from.
