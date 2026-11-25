@@ -22,7 +22,10 @@ fn is_dng(path: &str) -> bool {
 pub(super) fn read_sidecar(path: &str) -> Option<(CameraRaw, photocraft_io::camera_raw_xmp::LoadReport, String)> {
     let sidecar = sidecar_path(path);
     let Some(bytes) = read_bounded(&sidecar) else {
-        log::warn!("{sidecar}: not a readable sidecar of at most {} bytes, ignored", photocraft_io::camera_raw_xmp::MAX_XMP_BYTES);
+        // No sidecar at all is the usual case (most raws have none), not worth a warning.
+        if std::path::Path::new(&sidecar).exists() {
+            log::warn!("{sidecar}: not a readable sidecar of at most {} bytes, ignored", photocraft_io::camera_raw_xmp::MAX_XMP_BYTES);
+        }
         return None;
     };
     let mut params = CameraRaw::default();

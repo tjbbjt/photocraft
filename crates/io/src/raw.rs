@@ -48,6 +48,34 @@ fn upright_preview(raw: &[u8], jpeg: &[u8], limits: &photocraft_raw::Limits) -> 
     Ok(img.oriented(o)?)
 }
 
+/// A small picture of a raw for a filmstrip tile, from the camera's embedded JPEG: upright, as
+/// 8-bit RGBA in the preview's own colours, box-shrunk to at most `max_side` pixels on its long
+/// side. Decodes the smallest preview at least `max_side` long, so it takes a fraction of the
+/// time developing the raw does. `None` when the file has no JPEG preview that decodes.
+pub fn tile_preview(raw: &[u8], max_side: u32) -> Option<(u32, u32, Vec<u8>)> {
+    let jpeg = photocraft_raw::embedded_jpeg_preview_covering(raw, max_side).or_else(|| photocraft_raw::embedded_jpeg_preview(raw))?;
+    let img = upright_preview(raw, &jpeg, &limits()).ok()?;
+    let (w, h) = img.dimensions();
+    Some(shrink_rgba8(&img.to_rgba8(), w, h, max_side.max(1)))
+}
+
+/// `rgba` (`w`×`h`, 8-bit RGBA) box-averaged down to at most `max_side` pixels on its long side.
+fn shrink_rgba8(rgba: &[u8], w: u32, h: u32, max_side: u32) -> (u32, u32, Vec<u8>) {
+    let k = w.max(h).div_ceil(max_side).max(1) as usize;
+    let (w, h) = (w as usize, h as usize);
+    let (tw, th) = (w.div_ceil(k), h.div_ceil(k));
+    let mut acc = vec![[0u32; 5]; tw * th];
+    for (i, px) in rgba.as_chunks::<4>().0.iter().take(w * h).enumerate() {
+        let a = &mut acc[(i / w / k) * tw + (i % w) / k];
+        for c in 0..4 {
+            a[c] += u32::from(px[c]);
+        }
+        a[4] += 1;
+    }
+    let out = acc.iter().flat_map(|a| (0..4).map(move |c| (a[c] + a[4] / 2).checked_div(a[4]).unwrap_or(0) as u8)).collect();
+    (tw as u32, th as u32, out)
+}
+
 /// Camera Raw's Temperature, Tint, Exposure, Shadows, Highlights, Clarity, Texture and Dehaze,
 /// applied while developing the sensor data (the open-time Camera Raw dialog) instead of to the
 /// developed RGB pixels, the demosaic method, and the crop.
@@ -195,6 +223,12 @@ impl std::fmt::Debug for RawDecode {
 }
 
 impl RawDecode {
+    /// The memory its sensor data takes, in bytes.
+    fn memory(&self) -> u64 {
+        let s = &self.sensor;
+        (s.data.len() * 2 + s.float_data.as_ref().map_or(0, |f| f.len() * 4)) as u64
+    }
+
     /// Decodes `bytes` and fits its look, as a default open does.
     pub fn new(bytes: &[u8]) -> Result<RawDecode, IoError> {
         let sensor = decode_sensor(bytes, &limits())?;
@@ -263,11 +297,23 @@ impl Fingerprint {
 }
 
 /// The decodes of the last opens that await their Camera Raw dialog (see
-/// [`ImportOptions::keep_raw`](crate::ImportOptions::keep_raw)): at most two, so several raws
-/// opened at once each find theirs, and the oldest goes first. The dialog takes its own out.
+/// [`ImportOptions::keep_raw`](crate::ImportOptions::keep_raw)), so a set of raws opened at once
+/// each find theirs and the dialog switches between them without decoding a file again (that took
+/// seconds a raw). As many as fit in [`kept_budget`], at least [`KEPT_MIN`]; the oldest goes
+/// first. The dialog takes its own out.
 static KEPT: Mutex<Vec<Arc<RawDecode>>> = Mutex::new(Vec::new());
 
-const KEPT_MAX: usize = 2;
+/// Decodes kept whatever their size.
+const KEPT_MIN: usize = 2;
+/// And at most this many.
+const KEPT_MAX: usize = 64;
+
+/// The memory the kept decodes may take: a quarter of what is available, at most 8 GiB (2 GiB
+/// when it can't be measured).
+fn kept_budget() -> u64 {
+    const GIB: u64 = 1 << 30;
+    crate::memory::available().map_or(2 * GIB, |a| (a / 4).min(8 * GIB))
+}
 
 fn kept() -> std::sync::MutexGuard<'static, Vec<Arc<RawDecode>>> {
     KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -280,6 +326,11 @@ pub fn take_kept_decode(bytes: &[u8]) -> Option<Arc<RawDecode>> {
     let mut kept = kept();
     let at = kept.iter().position(|d| d.fingerprint == want)?;
     Some(kept.remove(at))
+}
+
+/// Frees every kept decode (the Camera Raw dialog they waited for has closed).
+pub fn drop_kept_decodes() {
+    kept().clear();
 }
 
 /// A fitted look's tone curve as knots for [`photocraft_raw::retone`] (which reads them
@@ -462,11 +513,13 @@ fn import_raw_with_inner(name: &str, bytes: &[u8], opts: &DevelopOptions, keep: 
     match develop_fitted(bytes, opts, keep) {
         Ok((dev, kept_parts)) => {
             if let Some((sensor, look)) = kept_parts {
+                let decode = Arc::new(RawDecode::from_parts(bytes, sensor, look));
+                let budget = kept_budget();
                 let mut kept = kept();
-                if kept.len() == KEPT_MAX {
+                kept.push(decode);
+                while kept.len() > KEPT_MIN && (kept.len() > KEPT_MAX || kept.iter().map(|d| d.memory()).sum::<u64>() > budget) {
                     kept.remove(0);
                 }
-                kept.push(Arc::new(RawDecode::from_parts(bytes, sensor, look)));
             }
             let summary = format!("{DEVELOPED_NOTE} ({} demosaic, as-shot white balance)", opts.demosaic.id());
             developed_document(name, bytes, format, dev, &summary)
@@ -535,6 +588,15 @@ fn jxl_preview_image(raw: &[u8], p: photocraft_raw::DecodedPreview) -> Result<Im
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tile_preview_is_shrunk_to_its_long_side() {
+        let rgba: Vec<u8> = (0..10 * 4).flat_map(|i| [(i % 256) as u8, 7, 9, 255]).collect();
+        let (w, h, px) = shrink_rgba8(&rgba, 10, 4, 5);
+        assert_eq!((w, h, px.len()), (5, 2, 5 * 2 * 4));
+        assert_eq!(&px[4..8], &[8, 7, 9, 255][..]);
+        assert!(tile_preview(b"not a raw file", 240).is_none());
+    }
 
     /// A caller's tighter limits hold for the sensor decode, not only for the develop after it (#9462).
     #[test]

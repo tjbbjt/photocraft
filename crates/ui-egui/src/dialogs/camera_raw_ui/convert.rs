@@ -128,10 +128,17 @@ fn tone_curve(raw: &RawOpen) -> Option<Arc<Vec<[f32; 2]>>> {
     raw.decoded.as_ref().map(|d| Arc::new(d.tone_curve().to_vec()))
 }
 
-/// The filmstrip tiles of the open-time dialog (one per queued raw) and the one shown.
+/// The filmstrip tiles of the open-time dialog (one per raw of the set, developed or not, and per
+/// other queued raw) and the one shown.
 fn film_items(app: &PhotocraftApp, raw: &RawOpen) -> (Vec<RawFilmItem>, usize) {
-    let mut items: Vec<RawFilmItem> = app.raw_shelf.iter().map(|h| RawFilmItem::new(h.raw.name.clone())).collect();
-    let current = match app.raw_shelf.iter().position(|h| h.raw.document == raw.document) {
+    use super::coming::TileRef;
+    let order = super::coming::tile_order(app);
+    let name = |r: &TileRef| match *r {
+        TileRef::Ready(s) => app.raw_shelf[s].raw.name.clone(),
+        TileRef::Coming(i) => app.raw_coming.tiles[i].name.clone(),
+    };
+    let mut items: Vec<RawFilmItem> = order.iter().map(|r| RawFilmItem::new(name(r))).collect();
+    let current = match order.iter().position(|r| matches!(*r, TileRef::Ready(s) if app.raw_shelf[s].raw.document == raw.document)) {
         Some(i) => i,
         None => {
             items.push(RawFilmItem::new(raw.name.clone()));

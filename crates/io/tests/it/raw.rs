@@ -820,3 +820,25 @@ fn raw_open_camera_wb_legacy_baseline_pixels() {
         )
     );
 }
+
+/// A set of raws opened together for the Camera Raw dialog all keep their decodes (as many as fit
+/// in a quarter of the memory), not only the last two, so the dialog switches between them
+/// without decoding again.
+#[test]
+fn a_set_of_raws_keeps_every_decode_until_the_dialog_closes() {
+    use photocraft_io::raw::{Demosaic, import_raw_demosaic_keeping, take_kept_decode};
+    let raws: Vec<Vec<u8>> = (0..4)
+        .map(|i| {
+            let (w, h) = (40 + 8 * i, 24);
+            let mut dng = DngSpec::cfa(w, h, mosaic(&scene(w, h), w, [0, 1, 1, 2], 0, 65535));
+            dng.as_shot_neutral = Some([0.6, 1.0, 0.8]);
+            dng.build()
+        })
+        .collect();
+    for (i, bytes) in raws.iter().enumerate() {
+        import_raw_demosaic_keeping(&format!("set-{i}.dng"), bytes, Demosaic::default()).unwrap();
+    }
+    for (i, bytes) in raws.iter().enumerate() {
+        assert!(take_kept_decode(bytes).is_some(), "raw {i} of the set kept its decode");
+    }
+}

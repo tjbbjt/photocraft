@@ -1462,3 +1462,109 @@ fn done_keeps_the_raws_open_when_a_sidecar_write_fails() {
     assert!(app.raw.is_none() && !app.ui.status_error, "{}", app.ui.status);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Polls the background jobs, lets the dialog take the raws that landed and runs a frame, until
+/// `done` holds (at most 15 s); whether it did. A test frame doesn't poll the jobs itself.
+fn frames_until(app: &mut PhotocraftApp, done: impl Fn(&PhotocraftApp) -> bool) -> bool {
+    let ctx = app.ctx().clone();
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_secs(15) {
+        crate::jobs_ui::tick(app, &ctx);
+        take(app, &ctx);
+        frame(app);
+        if done(app) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
+/// Nothing is opening any more.
+fn settled(app: &PhotocraftApp) -> bool {
+    app.jobs.opens.is_empty() && app.jobs.waiting_opens.is_empty() && !app.session.has_jobs()
+}
+
+/// Eight raws opened together, in the background.
+fn open_a_set_of_raws(app: &mut PhotocraftApp, dng: &[u8]) -> Vec<String> {
+    app.background_jobs = true;
+    let paths: Vec<String> = (0..8).map(|i| format!("/tmp/photocraft-test/set-{i}.dng")).collect();
+    for p in &paths {
+        app.open_file(p, dng).unwrap();
+    }
+    paths
+}
+
+/// As in Photoshop's Camera Raw, raws opened together are all in the filmstrip from the start,
+/// not only those developed so far, and a tile picked before its raw is developed goes first and
+/// is shown when it lands.
+#[test]
+fn a_set_of_raws_has_every_tile_at_once_and_a_picked_one_is_developed_next() {
+    let (mut app, dng) = raw_app();
+    let ctx = app.ctx().clone();
+    let paths = open_a_set_of_raws(&mut app, &dng);
+    assert_eq!(app.raw_coming.tiles.len(), 8, "a tile per raw before any is developed");
+    assert!(!app.jobs.waiting_opens.is_empty(), "some wait their turn");
+    assert!(frames_until(&mut app, |a| a.raw.is_some()), "the dialog opens on the first raw developed");
+    let order = coming::tile_order(&app);
+    assert_eq!(order.len(), 8, "the filmstrip has every raw of the set: {order:?}");
+    assert!(matches!(order[7], coming::TileRef::Coming(_)), "the last is not developed yet: {order:?}");
+    filmstrip::show_raw(&mut app, &ctx, 7).unwrap();
+    assert_eq!(app.raw_coming.wanted.as_deref(), Some(paths[7].as_str()));
+    assert!(app.ui.status.contains("set-7.dng"), "{}", app.ui.status);
+    assert!(frames_until(&mut app, |a| a.raw_coming.wanted.is_none()), "the picked raw lands");
+    assert_eq!(describe(&app)["openingRaw"]["name"], "set-7.dng", "and is shown");
+    assert!(frames_until(&mut app, settled));
+    assert_eq!(coming::tile_order(&app).len(), 8);
+    menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"cancel": true}})).unwrap().unwrap();
+    assert!(app.raw.is_none() && app.raw_shelf.is_empty() && app.raw_coming.tiles.is_empty());
+    assert_eq!(app.session.documents().len(), 0, "Cancel closes the whole set");
+}
+
+/// Open with raws of the set still being developed opens those with their defaults when they
+/// land; Cancel stops them, and one that lands anyway closes again.
+#[test]
+fn raws_still_developing_when_the_dialog_closes_follow_its_open_or_cancel() {
+    for (ui, kept) in [(json!({"commit": true}), 8), (json!({"cancel": true}), 0)] {
+        let (mut app, dng) = raw_app();
+        let ctx = app.ctx().clone();
+        open_a_set_of_raws(&mut app, &dng);
+        assert!(frames_until(&mut app, |a| a.raw.is_some()));
+        assert!(!settled(&app), "some raws are still on their way");
+        menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": ui})).unwrap().unwrap();
+        assert!(frames_until(&mut app, |a| settled(a) && a.raw_redevelop.is_empty()));
+        frame(&mut app);
+        assert!(app.raw.is_none(), "{ui}: the dialog does not come back for them");
+        assert_eq!(app.session.documents().len(), kept, "{ui}");
+        assert!(app.raw_shelf.is_empty() && app.raw_coming.tiles.is_empty());
+    }
+}
+
+#[test]
+fn only_raw_file_names_get_a_tile_before_they_open() {
+    assert!(coming::is_raw_name("/photos/IMG_0001.CR3") && coming::is_raw_name("a.dng"));
+    assert!(!coming::is_raw_name("/photos/IMG_0001.jpg") && !coming::is_raw_name("dng"));
+}
+
+/// Camera Raw comes first, as in Photoshop: a file opened with the raws whose profile doesn't
+/// match waits to ask about it until the Camera Raw dialog has closed, instead of putting its
+/// prompt over the dialog (which blocked picking another raw).
+#[test]
+fn other_files_prompts_wait_for_the_camera_raw_dialog() {
+    use photocraft_doc::{Color, ColorMode, Document, SampleType, Size};
+    let mismatch = |a: &PhotocraftApp| a.framework.dialogs.is_open::<craft::color_ui::ui::ProfileMismatchDialog>();
+    let (mut app, dng) = raw_app();
+    let ctx = app.ctx().clone();
+    app.run("edit.colorSettings", json!({"askOnMismatch": true, "policyRgb": "preserve"})).unwrap();
+    let mut d = Document::with_background("t", Size::new(8, 8), ColorMode::Rgb, SampleType::U8, Color::rgba(0.2, 0.6, 0.9, 1.0));
+    d.icc_profile = Some(craft::cms::Builtin::from_id("adobe-rgb-compat").unwrap().profile().to_bytes());
+    let png = photocraft_io::export(&d, "t.png", &Default::default()).unwrap().bytes;
+    app.background_jobs = true;
+    app.open_file("/tmp/photocraft-test/tagged.png", &png).unwrap();
+    app.open_file("/tmp/photocraft-test/first.dng", &dng).unwrap();
+    assert!(frames_until(&mut app, |a| a.raw.is_some() && settled(a)), "Camera Raw opens");
+    frame(&mut app);
+    assert!(!mismatch(&app), "no prompt over Camera Raw");
+    menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"cancel": true}})).unwrap().unwrap();
+    assert!(frames_until(&mut app, mismatch), "the prompt comes once Camera Raw has closed");
+}
