@@ -43,6 +43,7 @@ use crate::dialogs::camera_raw_detail_ui::DetailPreview;
 use crate::dialogs::camera_raw_scope_ui as scope_ui;
 use crate::dialogs::shared_picture::SharedPicture;
 
+mod coming;
 mod convert;
 mod filmstrip;
 mod menu;
@@ -50,6 +51,8 @@ mod open;
 pub(crate) mod proxy;
 mod sidecar;
 
+pub use coming::RawComing;
+pub(crate) use coming::{AfterDialog, after_dialog, expect_raw, open_ended};
 pub use filmstrip::HeldRaw;
 pub use menu::menu;
 pub use open::{
@@ -578,8 +581,15 @@ pub(crate) fn take_with(app: &mut PhotocraftApp, ctx: &egui::Context) -> Option<
     }
     let mut reply = None;
     // PLAN: raws queued with `queue_open_dialog` after the workspace opened are not in its filmstrip: the workspace has no call to add a tile
-    // (owner: dialogs-w17).
+    // (owner: dialogs-w17). The raws of one File › Open have their tiles from the start (`coming`), so this only leaves out later opens.
     if app.raw.as_ref().is_some_and(|s| s.target == Target::OpenRaw) {
+        // A tile picked before its raw was developed shows once it is.
+        if let Some(at) = coming::take_wanted(app)
+            && let Err(e) = filmstrip::show_raw(app, ctx, at)
+        {
+            app.ui.status = e;
+            app.ui.status_error = true;
+        }
         filmstrip::sync_pictures(app, ctx);
     }
     if let Some(result) = hosted_mut(app).and_then(Hosted::take_ok) {

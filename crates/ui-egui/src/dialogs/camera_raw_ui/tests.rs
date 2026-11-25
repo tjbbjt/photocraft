@@ -1462,3 +1462,82 @@ fn done_keeps_the_raws_open_when_a_sidecar_write_fails() {
     assert!(app.raw.is_none() && !app.ui.status_error, "{}", app.ui.status);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Runs frames until `done` holds (at most 15 s); whether it did.
+fn frames_until(app: &mut PhotocraftApp, done: impl Fn(&PhotocraftApp) -> bool) -> bool {
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_secs(15) {
+        frame(app);
+        if done(app) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    false
+}
+
+/// Nothing is opening any more.
+fn settled(app: &PhotocraftApp) -> bool {
+    app.jobs.opens.is_empty() && app.jobs.waiting_opens.is_empty() && !app.session.has_jobs()
+}
+
+/// Eight raws opened together, in the background.
+fn open_a_set_of_raws(app: &mut PhotocraftApp, dng: &[u8]) -> Vec<String> {
+    app.background_jobs = true;
+    let paths: Vec<String> = (0..8).map(|i| format!("/tmp/photocraft-test/set-{i}.dng")).collect();
+    for p in &paths {
+        app.open_file(p, dng).unwrap();
+    }
+    paths
+}
+
+/// As in Photoshop's Camera Raw, raws opened together are all in the filmstrip from the start,
+/// not only those developed so far, and a tile picked before its raw is developed goes first and
+/// is shown when it lands.
+#[test]
+fn a_set_of_raws_has_every_tile_at_once_and_a_picked_one_is_developed_next() {
+    let (mut app, dng) = raw_app();
+    let ctx = app.ctx().clone();
+    let paths = open_a_set_of_raws(&mut app, &dng);
+    assert_eq!(app.raw_coming.tiles.len(), 8, "a tile per raw before any is developed");
+    assert!(!app.jobs.waiting_opens.is_empty(), "some wait their turn");
+    assert!(frames_until(&mut app, |a| a.raw.is_some()), "the dialog opens on the first raw developed");
+    let order = coming::tile_order(&app);
+    assert_eq!(order.len(), 8, "the filmstrip has every raw of the set: {order:?}");
+    assert!(matches!(order[7], coming::TileRef::Coming(_)), "the last is not developed yet: {order:?}");
+    filmstrip::show_raw(&mut app, &ctx, 7).unwrap();
+    assert_eq!(app.raw_coming.wanted.as_deref(), Some(paths[7].as_str()));
+    assert!(app.ui.status.contains("set-7.dng"), "{}", app.ui.status);
+    assert!(frames_until(&mut app, |a| a.raw_coming.wanted.is_none()), "the picked raw lands");
+    assert_eq!(describe(&app)["openingRaw"]["name"], "set-7.dng", "and is shown");
+    assert!(frames_until(&mut app, settled));
+    assert_eq!(coming::tile_order(&app).len(), 8);
+    menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"cancel": true}})).unwrap().unwrap();
+    assert!(app.raw.is_none() && app.raw_shelf.is_empty() && app.raw_coming.tiles.is_empty());
+    assert_eq!(app.session.documents().len(), 0, "Cancel closes the whole set");
+}
+
+/// Open with raws of the set still being developed opens those with their defaults when they
+/// land; Cancel stops them, and one that lands anyway closes again.
+#[test]
+fn raws_still_developing_when_the_dialog_closes_follow_its_open_or_cancel() {
+    for (ui, kept) in [(json!({"commit": true}), 8), (json!({"cancel": true}), 0)] {
+        let (mut app, dng) = raw_app();
+        let ctx = app.ctx().clone();
+        open_a_set_of_raws(&mut app, &dng);
+        assert!(frames_until(&mut app, |a| a.raw.is_some()));
+        assert!(!settled(&app), "some raws are still on their way");
+        menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": ui})).unwrap().unwrap();
+        assert!(frames_until(&mut app, |a| settled(a) && a.raw_redevelop.is_empty()));
+        frame(&mut app);
+        assert!(app.raw.is_none(), "{ui}: the dialog does not come back for them");
+        assert_eq!(app.session.documents().len(), kept, "{ui}");
+        assert!(app.raw_shelf.is_empty() && app.raw_coming.tiles.is_empty());
+    }
+}
+
+#[test]
+fn only_raw_file_names_get_a_tile_before_they_open() {
+    assert!(coming::is_raw_name("/photos/IMG_0001.CR3") && coming::is_raw_name("a.dng"));
+    assert!(!coming::is_raw_name("/photos/IMG_0001.jpg") && !coming::is_raw_name("dng"));
+}

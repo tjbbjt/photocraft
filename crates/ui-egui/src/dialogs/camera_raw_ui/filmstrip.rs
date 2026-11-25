@@ -3,6 +3,7 @@
 //! shown, Open develops every one and Cancel closes every one. The framework's `RawFilmstrip`
 //! draws the tiles; this module holds the raws and their thumbnails.
 
+use super::coming::TileRef;
 use super::open::{Target, commit_open_raw, open_raw_with, return_on_failure};
 use super::sidecar::read_sidecar;
 use super::{CameraRaw, PhotocraftApp, RawOpen, Rect, Value, hosted, image, json, workspace_demosaic};
@@ -80,16 +81,29 @@ pub(super) fn sync_pictures(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let current = app.raw.as_ref().and_then(|s| s.raw_open.as_ref()).map(|r| r.document);
     let Some(shown) = hosted(app) else { return };
     let current_edited = !shown.workspace().session().is_identity();
-    // The shelf is a field beside the dialog host, so both are borrowed at once.
-    let shelf = &mut app.raw_shelf;
-    let Some(workspace) = app.framework.dialogs.get_mut::<super::Hosted>() else { return };
-    for (i, held) in shelf.iter_mut().enumerate() {
-        if let Some(img) = held.thumb.take() {
-            held.tex = Some(ctx.load_texture(format!("camera-raw-thumb-{}", held.raw.document.0), img, egui::TextureOptions::LINEAR));
+    let mut pictures = Vec::new();
+    for (at, tile) in super::coming::tile_order(app).into_iter().enumerate() {
+        match tile {
+            TileRef::Ready(s) => {
+                let held = &mut app.raw_shelf[s];
+                if let Some(img) = held.thumb.take() {
+                    held.tex = Some(ctx.load_texture(format!("camera-raw-thumb-{}", held.raw.document.0), img, egui::TextureOptions::LINEAR));
+                }
+                let Some(tex) = &held.tex else { continue };
+                let edited = if Some(held.raw.document) == current { current_edited } else { held.kept.as_ref().is_some_and(|(p, _)| !p.is_identity()) };
+                pictures.push((at, egui::load::SizedTexture::from_handle(tex), edited));
+            }
+            // Not developed yet: the camera's embedded preview.
+            TileRef::Coming(i) => {
+                if let Some(tex) = super::coming::preview_texture(app, ctx, i) {
+                    pictures.push((at, tex, false));
+                }
+            }
         }
-        let Some(tex) = &held.tex else { continue };
-        let edited = if Some(held.raw.document) == current { current_edited } else { held.kept.as_ref().is_some_and(|(p, _)| !p.is_identity()) };
-        workspace.workspace_mut().set_item_picture(i, egui::load::SizedTexture::from_handle(tex), edited);
+    }
+    let Some(workspace) = app.framework.dialogs.get_mut::<super::Hosted>() else { return };
+    for (at, tex, edited) in pictures {
+        workspace.workspace_mut().set_item_picture(at, tex, edited);
     }
 }
 
@@ -101,12 +115,22 @@ pub(super) fn open_held(app: &mut PhotocraftApp, ctx: &egui::Context, i: usize) 
     open_raw_with(app, ctx, raw, kept)
 }
 
-/// Shows raw `to` of the filmstrip; the one being left keeps its settings, and its thumbnail
-/// shows them.
+/// Shows the raw of filmstrip tile `to`; the one being left keeps its settings, and its thumbnail
+/// shows them. A raw not developed yet is developed next and shown when it is.
 pub(super) fn show_raw(app: &mut PhotocraftApp, ctx: &egui::Context, to: usize) -> Result<(), String> {
     let Some(session) = app.raw.as_ref() else { return Ok(()) };
+    if session.target != Target::OpenRaw {
+        return Ok(());
+    }
     let current = session.raw_open.as_ref().map(|r| r.document);
-    if session.target != Target::OpenRaw || app.raw_shelf.get(to).is_none_or(|h| Some(h.raw.document) == current) {
+    let to = match super::coming::tile_order(app).get(to).copied() {
+        Some(TileRef::Ready(s)) => s,
+        Some(TileRef::Coming(i)) => return super::coming::want(app, i),
+        None => return Ok(()),
+    };
+    // Picking a developed raw drops an earlier wish for one that wasn't.
+    app.raw_coming.wanted = None;
+    if app.raw_shelf.get(to).is_none_or(|h| Some(h.raw.document) == current) {
         return Ok(());
     }
     keep_settings(app);
@@ -184,6 +208,9 @@ pub(super) fn open_all(app: &mut PhotocraftApp, params: &CameraRaw, raw: &RawOpe
         app.raw_shelf.retain(|h| h.raw.document != raw.document);
     }
     if others.is_empty() {
+        if first.is_ok() {
+            super::coming::open_the_rest_plain(app);
+        }
         return first;
     }
     let mut opened = Vec::new();
@@ -215,6 +242,7 @@ pub(super) fn open_all(app: &mut PhotocraftApp, params: &CameraRaw, raw: &RawOpe
         }
         crate::notices::error(app, e);
     }
+    super::coming::open_the_rest_plain(app);
     Ok(json!({"opened": opened}))
 }
 
@@ -248,6 +276,7 @@ pub(super) fn done(app: &mut PhotocraftApp, settings: &CameraRaw) -> Value {
     };
     app.ui.status_error = saved.is_empty() && stored.contains(&Stored::Skipped);
     let saved = json!(saved);
+    super::coming::stop_the_rest(app);
     app.raw_shelf.clear();
     for (raw, _) in &raws {
         if let Some(index) = super::open::document_index(app, raw.document) {

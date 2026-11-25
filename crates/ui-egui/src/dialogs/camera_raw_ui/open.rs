@@ -85,6 +85,9 @@ pub fn queue_open_dialog(
     };
     let held = super::filmstrip::HeldRaw::new(app, raw);
     app.raw_shelf.push(held);
+    if let Some(path) = path {
+        super::coming::landed(app, path, document);
+    }
     Ok(())
 }
 
@@ -515,6 +518,7 @@ pub fn on_redevelop_event(app: &mut PhotocraftApp, e: &photocraft_engine::jobs::
 pub(super) fn cancel(app: &mut PhotocraftApp) {
     let Some(d) = app.raw.take() else { return };
     if let (Target::OpenRaw, Some(raw)) = (d.target, &d.raw_open) {
+        super::coming::stop_the_rest(app);
         let mut opening: Vec<_> = std::mem::take(&mut app.raw_shelf).into_iter().map(|h| h.raw.document).collect();
         opening.push(raw.document);
         for id in opening {

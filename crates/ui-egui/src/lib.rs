@@ -569,6 +569,8 @@ pub struct PhotocraftApp {
     /// Raws just opened interactively, waiting in the open-time Camera Raw dialog (shown on the
     /// next frame, which has the egui context); several share it in a filmstrip.
     pub(crate) raw_shelf: Vec<camera_raw_ui::HeldRaw>,
+    /// The filmstrip tiles of the raws of one File › Open, developed or not yet.
+    pub(crate) raw_coming: camera_raw_ui::RawComing,
     /// The open-time re-develops (or their Camera Raw steps) running in the background, one per
     /// raw being opened.
     pub(crate) raw_redevelop: Vec<camera_raw_ui::Redevelop>,

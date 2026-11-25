@@ -295,6 +295,10 @@ pub fn start_open(
     slot: Option<usize>,
     order: Option<OpenOrder>,
 ) -> Result<(), String> {
+    // A raw gets its tile in the open-time Camera Raw dialog's filmstrip before it is developed.
+    if let Some(p) = &path {
+        crate::camera_raw_ui::expect_raw(app, name, p);
+    }
     // More files than the background job cap (16 in 0.24) wait for a job to end instead of
     // failing with "too many background jobs": selecting 40 photos in File › Open opens them all.
     if app.background_jobs && (!app.jobs.waiting_opens.is_empty() || !room_to_open(app)) {
@@ -362,19 +366,56 @@ fn room_to_open(app: &mut PhotocraftApp) -> bool {
 pub(crate) fn start_waiting_opens(app: &mut PhotocraftApp) {
     while !app.jobs.waiting_opens.is_empty() && room_to_open(app) {
         let Some(w) = app.jobs.waiting_opens.pop_front() else { break };
-        let name = app.open_name(&w.name);
-        let started = match app.session.start_open_for_user_with_background(&name, w.source, app.background_jobs) {
-            Ok(Started::Done(v)) => finish_open(app, &name, w.path.as_deref(), &v, w.slot, w.order),
-            Ok(Started::Job(job)) => {
-                track_open(app, OpenTab { job, name: name.clone(), path: w.path, slot: w.slot, order: w.order });
-                Ok(())
-            }
-            Err(e) => Err(e.to_string()),
-        };
-        if let Err(e) = started {
-            app.open_failed(&name, &e);
+        start_waiting(app, w);
+    }
+}
+
+/// Starts waiting open `w` now.
+fn start_waiting(app: &mut PhotocraftApp, w: WaitingOpen) {
+    let name = app.open_name(&w.name);
+    let path = w.path.clone();
+    let started = match app.session.start_open_for_user_with_background(&name, w.source, app.background_jobs) {
+        Ok(Started::Done(v)) => finish_open(app, &name, w.path.as_deref(), &v, w.slot, w.order),
+        Ok(Started::Job(job)) => {
+            track_open(app, OpenTab { job, name: name.clone(), path: w.path, slot: w.slot, order: w.order });
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(e) = started {
+        app.open_failed(&name, &e);
+        if let Some(p) = &path {
+            crate::camera_raw_ui::open_ended(app, p);
         }
     }
+}
+
+/// The file at `path` is wanted first (its tile was picked in the Camera Raw filmstrip): if it
+/// is waiting, it starts now when a background job slot is free, past the opens-at-once limit,
+/// else it goes to the front of the queue.
+pub(crate) fn hurry_open(app: &mut PhotocraftApp, path: &str) {
+    let Some(at) = app.jobs.waiting_opens.iter().position(|w| w.path.as_deref() == Some(path)) else { return };
+    let Some(w) = app.jobs.waiting_opens.remove(at) else { return };
+    if app.session.has_room_for_a_job() {
+        start_waiting(app, w);
+    } else {
+        app.jobs.waiting_opens.push_front(w);
+    }
+}
+
+/// Stops the open of the file at `path`: true when it was still waiting (it never opens), false
+/// when it was already decoding (it is asked to stop, and may still land).
+pub(crate) fn cancel_open(app: &mut PhotocraftApp, path: &str) -> bool {
+    let before = app.jobs.waiting_opens.len();
+    app.jobs.waiting_opens.retain(|w| w.path.as_deref() != Some(path));
+    if app.jobs.waiting_opens.len() != before {
+        end_batch(app);
+        return true;
+    }
+    if let Some(job) = app.jobs.opens.iter().find(|o| o.path.as_deref() == Some(path)).map(|o| o.job) {
+        app.session.cancel_job(job);
+    }
+    false
 }
 
 /// Start a set of files opened together: the `batch` of their [`OpenOrder`]s. Its tabs follow the
@@ -704,6 +745,9 @@ fn on_event(app: &mut PhotocraftApp, ctx: &egui::Context, e: JobEvent) {
                 app.ui.status_error = false;
             }
         }
+        if let Some(p) = &tab.path {
+            crate::camera_raw_ui::open_ended(app, p);
+        }
         end_batch(app);
         return;
     }
@@ -834,8 +878,19 @@ pub(crate) fn after_open(
     let opened = crate::i18n::fmt(tl!("Opened {name}"), &[("name", name)]);
     app.ui.status = opened.clone();
     app.ui.status_error = false;
+    // A raw of a set whose Camera Raw dialog closed while it was being developed: Cancel or Done
+    // closes it, Open keeps it as developed with its defaults.
+    let after_dialog = crate::camera_raw_ui::after_dialog(app, path);
+    if after_dialog == Some(crate::camera_raw_ui::AfterDialog::Close) {
+        if let Some(i) = app.session.documents().iter().position(|st| st.doc.id == document) {
+            app.session.close(i);
+        }
+        app.sync_views();
+        app.ui.status = crate::i18n::fmt(tl!("Canceled opening {name}"), &[("name", name)]);
+        return Ok(());
+    }
     // A raw opens in Camera Raw first; the dialog says how it was developed.
-    if crate::camera_raw_ui::wants_open_dialog(app, warnings) {
+    if after_dialog.is_none() && crate::camera_raw_ui::wants_open_dialog(app, warnings) {
         crate::camera_raw_ui::queue_open_dialog(app, document, name, path, bytes, warnings)?;
         notices::io_warnings(app, &opened, &crate::camera_raw_ui::without_develop_note(warnings));
     } else {
