@@ -104,10 +104,13 @@ pub(super) fn landed(app: &mut PhotocraftApp, path: &str, document: DocId) {
 
 /// The open of `path` ended: a tile still without its raw won't get one.
 pub(crate) fn open_ended(app: &mut PhotocraftApp, path: &str) {
+    let mut gone = false;
     for tile in app.raw_coming.tiles.iter_mut().filter(|t| t.path == path && t.document.is_none()) {
         tile.gone = true;
+        gone = true;
     }
-    if app.raw_coming.wanted.as_deref() == Some(path) {
+    // A wanted raw that landed is shown by the dialog's next frame; one that won't land isn't.
+    if gone && app.raw_coming.wanted.as_deref() == Some(path) {
         app.raw_coming.wanted = None;
     }
     // An open stopped after its dialog closed has nothing left to close.
