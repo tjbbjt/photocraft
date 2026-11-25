@@ -167,8 +167,10 @@ pub fn advance(app: &mut PhotocraftApp) {
         return;
     }
     // Camera Raw comes first, as in Photoshop: the other files' prompts wait until its dialog
-    // has closed, so none sits over it while raws are being looked at.
+    // has closed, so none sits over it while raws are being looked at. Files that need no
+    // answer (the raws themselves among them) open meanwhile.
     if crate::camera_raw_ui::holds_prompts(app) {
+        open_unasked(app);
         return;
     }
     loop {
@@ -205,6 +207,27 @@ pub fn advance(app: &mut PhotocraftApp) {
                     return;
                 }
             }
+        }
+    }
+}
+
+/// Opens the queued files that need no prompt, wherever they are in the queue, leaving the ones
+/// that do (in their order) for when prompts may show again.
+fn open_unasked(app: &mut PhotocraftApp) {
+    let mut k = 0;
+    while k < app.held_opens.len() {
+        if app.held_opens[k].damage_pending || app.held_opens[k].question.is_some() {
+            k += 1;
+            continue;
+        }
+        let Some(held) = app.held_opens.remove(k) else { break };
+        // The k-th open in the prompt order is this file's.
+        if let Some(at) = app.prompt_order.iter().enumerate().filter(|(_, p)| matches!(p, PromptKind::Open)).nth(k).map(|(i, _)| i) {
+            app.prompt_order.remove(at);
+        }
+        let _ = open(app, held, None);
+        if has_open_dialog(app) {
+            return;
         }
     }
 }
