@@ -394,7 +394,7 @@ mod tests {
 
     /// A document of `width` × `height` with layers "a" and "b" over the Background, and the
     /// drop of "a" above "b" as the Layers panel sends it.
-    fn reorder_app(width: u32, height: u32) -> (PhotocraftApp, serde_json::Value) {
+    fn reorder_app(width: u32, height: u32) -> (Box<PhotocraftApp>, serde_json::Value) {
         let mut session = photocraft_engine::Session::new();
         session.execute("file.new", json!({"width": width, "height": height})).unwrap();
         let a = session.execute("layer.new.layer", json!({"name": "a"})).unwrap()["layer"].as_u64().unwrap();
