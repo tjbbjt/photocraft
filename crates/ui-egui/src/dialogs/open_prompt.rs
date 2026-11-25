@@ -166,6 +166,11 @@ pub fn advance(app: &mut PhotocraftApp) {
     if has_open_dialog(app) {
         return;
     }
+    // Camera Raw comes first, as in Photoshop: the other files' prompts wait until its dialog
+    // has closed, so none sits over it while raws are being looked at.
+    if crate::camera_raw_ui::holds_prompts(app) {
+        return;
+    }
     loop {
         match app.prompt_order.front() {
             None => return,

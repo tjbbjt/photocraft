@@ -48,6 +48,12 @@ pub struct RawComing {
     after: Vec<(String, AfterDialog)>,
 }
 
+/// Whether the open-time Camera Raw dialog is up, or about to be (a raw of the set is waiting
+/// for it or still being developed): the other files' open prompts wait until it has closed.
+pub(crate) fn holds_prompts(app: &PhotocraftApp) -> bool {
+    app.raw.as_ref().is_some_and(|s| s.target == Target::OpenRaw) || !app.raw_shelf.is_empty() || app.raw_coming.tiles.iter().any(|t| t.document.is_none() && !t.gone)
+}
+
 /// Is `path` named like a raw file?
 pub(crate) fn is_raw_name(path: &str) -> bool {
     std::path::Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|e| RAW_EXTENSIONS.iter().any(|r| e.eq_ignore_ascii_case(r)))

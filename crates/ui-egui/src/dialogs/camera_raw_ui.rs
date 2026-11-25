@@ -52,7 +52,7 @@ pub(crate) mod proxy;
 mod sidecar;
 
 pub use coming::RawComing;
-pub(crate) use coming::{AfterDialog, after_dialog, expect_raw, open_ended};
+pub(crate) use coming::{AfterDialog, after_dialog, expect_raw, holds_prompts, open_ended};
 pub use filmstrip::HeldRaw;
 pub use menu::menu;
 pub use open::{

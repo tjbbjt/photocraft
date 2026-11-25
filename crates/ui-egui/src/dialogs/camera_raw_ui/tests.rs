@@ -1545,3 +1545,26 @@ fn only_raw_file_names_get_a_tile_before_they_open() {
     assert!(coming::is_raw_name("/photos/IMG_0001.CR3") && coming::is_raw_name("a.dng"));
     assert!(!coming::is_raw_name("/photos/IMG_0001.jpg") && !coming::is_raw_name("dng"));
 }
+
+/// Camera Raw comes first, as in Photoshop: a file opened with the raws whose profile doesn't
+/// match waits to ask about it until the Camera Raw dialog has closed, instead of putting its
+/// prompt over the dialog (which blocked picking another raw).
+#[test]
+fn other_files_prompts_wait_for_the_camera_raw_dialog() {
+    use photocraft_doc::{Color, ColorMode, Document, SampleType, Size};
+    let mismatch = |a: &PhotocraftApp| a.framework.dialogs.is_open::<craft::color_ui::ui::ProfileMismatchDialog>();
+    let (mut app, dng) = raw_app();
+    let ctx = app.ctx().clone();
+    app.run("edit.colorSettings", json!({"askOnMismatch": true, "policyRgb": "preserve"})).unwrap();
+    let mut d = Document::with_background("t", Size::new(8, 8), ColorMode::Rgb, SampleType::U8, Color::rgba(0.2, 0.6, 0.9, 1.0));
+    d.icc_profile = Some(craft::cms::Builtin::from_id("adobe-rgb-compat").unwrap().profile().to_bytes());
+    let png = photocraft_io::export(&d, "t.png", &Default::default()).unwrap().bytes;
+    app.background_jobs = true;
+    app.open_file("/tmp/photocraft-test/tagged.png", &png).unwrap();
+    app.open_file("/tmp/photocraft-test/first.dng", &dng).unwrap();
+    assert!(frames_until(&mut app, |a| a.raw.is_some() && settled(a)), "Camera Raw opens");
+    frame(&mut app);
+    assert!(!mismatch(&app), "no prompt over Camera Raw");
+    menu(&mut app, &ctx, "filter.cameraRaw", &json!({"ui": {"cancel": true}})).unwrap().unwrap();
+    assert!(frames_until(&mut app, mismatch), "the prompt comes once Camera Raw has closed");
+}
