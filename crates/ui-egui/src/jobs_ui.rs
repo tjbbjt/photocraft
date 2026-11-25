@@ -297,7 +297,7 @@ pub fn start_open(
 ) -> Result<(), String> {
     // More files than the background job cap (16 in 0.24) wait for a job to end instead of
     // failing with "too many background jobs": selecting 40 photos in File › Open opens them all.
-    if app.background_jobs && (!app.jobs.waiting_opens.is_empty() || !app.session.has_room_for_a_job()) {
+    if app.background_jobs && (!app.jobs.waiting_opens.is_empty() || !room_to_open(app)) {
         app.ui.status = crate::i18n::fmt(tl!("Waiting to open {name}…"), &[("name", name)]);
         app.ui.status_error = false;
         app.jobs.waiting_opens.push_back(WaitingOpen { name: name.to_string(), path, source, slot, order });
@@ -346,10 +346,21 @@ pub(crate) fn start_open_as_smart_object(app: &mut PhotocraftApp, path: &str, or
     }
 }
 
+/// Files decoded at once. Sixteen large raws opened together took 43 s each and pushed the
+/// process to 20 GB and the scratch disk; a few at a time each finish in a few seconds, their tabs
+/// fill in as they go, and the set takes no longer.
+const OPENS_AT_ONCE: usize = 4;
+
+/// Whether another file can start opening now: fewer than [`OPENS_AT_ONCE`] are opening, and the
+/// session has a background job slot free.
+fn room_to_open(app: &mut PhotocraftApp) -> bool {
+    app.jobs.opens.len() < OPENS_AT_ONCE && app.session.has_room_for_a_job()
+}
+
 /// Starts the opens waiting for a job slot ([`JobsUi::waiting_opens`]), in order, while there is
 /// room. A file that fails to start is reported as File › Open reports it.
 pub(crate) fn start_waiting_opens(app: &mut PhotocraftApp) {
-    while !app.jobs.waiting_opens.is_empty() && app.session.has_room_for_a_job() {
+    while !app.jobs.waiting_opens.is_empty() && room_to_open(app) {
         let Some(w) = app.jobs.waiting_opens.pop_front() else { break };
         let name = app.open_name(&w.name);
         let started = match app.session.start_open_for_user_with_background(&name, w.source, app.background_jobs) {

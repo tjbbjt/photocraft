@@ -481,7 +481,7 @@ impl PhotocraftApp {
     /// Open one dropped file; with `slot`, its tab goes there (at once, or when a held prompt is
     /// answered). True when it took the slot.
     fn open_dropped_file(&mut self, f: &OsFile, name: &str, slot: Option<usize>) -> Result<bool, String> {
-        let (docs, opens) = (self.session.documents().len(), self.jobs.opens.len());
+        let (docs, opens) = (self.session.documents().len(), self.jobs.opens.len() + self.jobs.waiting_opens.len());
         let held = self.held_opens.len() + self.held_memory_prompts.len();
         // The slot travels with the open through the inline document, a background tab and a
         // memory/profile prompt, so no separate move here can land on another document.
@@ -495,7 +495,9 @@ impl PhotocraftApp {
         if slot.is_none() {
             return Ok(false);
         }
-        let took = self.jobs.opens.len() > opens || self.session.documents().len() > docs || self.held_opens.len() + self.held_memory_prompts.len() > held;
+        let took = self.jobs.opens.len() + self.jobs.waiting_opens.len() > opens
+            || self.session.documents().len() > docs
+            || self.held_opens.len() + self.held_memory_prompts.len() > held;
         Ok(took)
     }
 
