@@ -71,7 +71,7 @@ pub(super) fn layers(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     }
     // Preview on Canvas When Reordering Layers: the move the release would make.
     match out.drop_preview.as_ref().filter(|_| app.ui.layers_settings.options.preview_on_canvas_when_reordering) {
-        Some(mv) => crate::layers_panel_ui::preview_reorder(app, &super::layers_events::move_params(mv)),
+        Some(mv) => crate::layers_panel_ui::preview_reorder(app, &ctx, &super::layers_events::move_params(mv)),
         None => app.reorder_preview = None,
     }
     super::layers_events::apply_layers_events(app, &ctx, out.events);

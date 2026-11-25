@@ -379,6 +379,13 @@ pub struct PhotocraftApp {
     pub(crate) reorder_preview: Option<layers_panel_ui::ReorderPreview>,
     /// Whether the currently dragged layer is over a valid destination this frame.
     pub(crate) reorder_preview_hit: bool,
+    /// The drop target the pointer is over and since when (`gpu_canvas::now_ms`): on a large
+    /// canvas its preview waits until the pointer rests there (`layers_panel_ui::preview_reorder`).
+    pub(crate) reorder_hover: Option<(u64, f64)>,
+    /// The last Layers-panel drop preview built (document, revision, key, preview), kept after the
+    /// drag ends: the canvas shows it until the drop lands or the drag is cancelled
+    /// (`layers_panel_ui::reorder_damage`).
+    pub(crate) reorder_shown: Option<(DocId, u64, u64, std::sync::Arc<Document>)>,
     /// Patch Tool drag: the healed document at the pointer (`patch_preview`).
     pub(crate) patch_preview: Option<patch_preview::PatchPreview>,
     /// Content-Aware Move drag or box shown with its result (`cam_preview`).
