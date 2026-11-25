@@ -1482,6 +1482,7 @@ fn background_admission_counts_cancelled_workers_until_they_finish() {
             )
             .unwrap()));
     }
+    assert!(!s.has_room_for_a_job(), "the cap is reached");
     let rejected = s.start_job("test.extra", json!({}), "extra", false, |_| -> Result<()> { panic!("over-limit worker ran") }, |_, ()| Ok(Value::Null));
     assert!(rejected.unwrap_err().to_string().contains("too many background jobs"));
     for id in ids {
@@ -1494,6 +1495,7 @@ fn background_admission_counts_cancelled_workers_until_they_finish() {
     assert!(rejected.unwrap_err().to_string().contains("too many background jobs"));
     drop(gates);
     s.join_cancelled_jobs();
+    assert!(s.has_room_for_a_job(), "the cancelled workers have finished");
     let id = job(s.start_job("test.resumed", json!({}), "resumed", false, |_| Ok(()), |_, ()| Ok(json!("resumed"))).unwrap());
     assert_eq!(s.wait_job(id).unwrap(), json!("resumed"));
 }

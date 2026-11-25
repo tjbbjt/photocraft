@@ -183,6 +183,18 @@ pub struct JobsUi {
     /// The file being placed in the background, if any. One at a time: files dropped meanwhile
     /// wait in the app's drop queue.
     pub place: Option<PlaceJob>,
+    /// Files opened while the background job cap was reached: each starts, in order, as soon as a
+    /// job ends ([`start_waiting_opens`]), instead of being refused.
+    pub(crate) waiting_opens: std::collections::VecDeque<WaitingOpen>,
+}
+
+/// A background open held until a job ends: [`start_open`]'s arguments.
+pub(crate) struct WaitingOpen {
+    name: String,
+    path: Option<String>,
+    source: OpenSource,
+    slot: Option<usize>,
+    order: Option<OpenOrder>,
 }
 
 /// Run command `id`: in the background when background jobs are on and the command is a job
@@ -283,6 +295,14 @@ pub fn start_open(
     slot: Option<usize>,
     order: Option<OpenOrder>,
 ) -> Result<(), String> {
+    // More files than the background job cap (16 in 0.24) wait for a job to end instead of
+    // failing with "too many background jobs": selecting 40 photos in File › Open opens them all.
+    if app.background_jobs && (!app.jobs.waiting_opens.is_empty() || !app.session.has_room_for_a_job()) {
+        app.ui.status = crate::i18n::fmt(tl!("Waiting to open {name}…"), &[("name", name)]);
+        app.ui.status_error = false;
+        app.jobs.waiting_opens.push_back(WaitingOpen { name: name.to_string(), path, source, slot, order });
+        return Ok(());
+    }
     let name = &app.open_name(name);
     match app.session.start_open_for_user_with_background(name, source, app.background_jobs).map_err(|e| e.to_string())? {
         // Inline (wasm, or background jobs off): finish now, like a background open that ended at
@@ -326,6 +346,26 @@ pub(crate) fn start_open_as_smart_object(app: &mut PhotocraftApp, path: &str, or
     }
 }
 
+/// Starts the opens waiting for a job slot ([`JobsUi::waiting_opens`]), in order, while there is
+/// room. A file that fails to start is reported as File › Open reports it.
+pub(crate) fn start_waiting_opens(app: &mut PhotocraftApp) {
+    while !app.jobs.waiting_opens.is_empty() && app.session.has_room_for_a_job() {
+        let Some(w) = app.jobs.waiting_opens.pop_front() else { break };
+        let name = app.open_name(&w.name);
+        let started = match app.session.start_open_for_user_with_background(&name, w.source, app.background_jobs) {
+            Ok(Started::Done(v)) => finish_open(app, &name, w.path.as_deref(), &v, w.slot, w.order),
+            Ok(Started::Job(job)) => {
+                track_open(app, OpenTab { job, name: name.clone(), path: w.path, slot: w.slot, order: w.order });
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = started {
+            app.open_failed(&name, &e);
+        }
+    }
+}
+
 /// Start a set of files opened together: the `batch` of their [`OpenOrder`]s. Its tabs follow the
 /// documents and opens already there. Call [`end_batch`] once every member has been started.
 pub(crate) fn begin_batch(app: &mut PhotocraftApp) -> u64 {
@@ -350,8 +390,11 @@ pub(crate) fn opened_in_order(jobs: &mut JobsUi, order: OpenOrder) {
 pub(crate) fn end_batch(app: &mut PhotocraftApp) {
     let waiting: Vec<u64> =
         app.held_memory_prompts.iter().filter_map(|m| m.order.map(|o| o.batch)).chain(app.held_opens.iter().filter_map(|h| h.order.map(|o| o.batch))).collect();
-    let JobsUi { opens, batches, .. } = &mut app.jobs;
-    batches.retain(|b| opens.iter().any(|o| o.order.is_some_and(|x| x.batch == b.id)) || waiting.contains(&b.id));
+    let JobsUi { opens, batches, waiting_opens, .. } = &mut app.jobs;
+    batches.retain(|b| {
+        let has = |o: &Option<OpenOrder>| o.is_some_and(|x| x.batch == b.id);
+        opens.iter().any(|o| has(&o.order)) || waiting_opens.iter().any(|w| has(&w.order)) || waiting.contains(&b.id)
+    });
 }
 
 /// The tab position for a member of a set that just opened: after the members before it that
@@ -496,6 +539,8 @@ pub fn tick(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if app.jobs.focus.is_some_and(|j| !app.jobs.opens.iter().any(|o| o.job == j)) {
         app.jobs.focus = app.jobs.opens.last().map(|o| o.job);
     }
+    // Files held at the job cap start as the jobs that just ended free their slots.
+    start_waiting_opens(app);
     close_after_saves(app, ctx);
     if app.saving() || app.printing() {
         // Keep checking on a cancelled save's worker until it returns.

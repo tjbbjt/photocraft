@@ -316,6 +316,27 @@ fn files_open_in_the_background_with_a_tab_and_cancel_closes_it() {
     assert!(h.state().jobs.focus.is_none());
 }
 
+/// More files than the background job cap: the rest wait for a job to end and then open, instead
+/// of each failing with "too many background jobs".
+#[test]
+fn files_past_the_job_cap_wait_and_then_open() {
+    let mut h = app_harness();
+    let bytes = psd_bytes();
+    let before = h.state().session.documents().len();
+    for i in 0..20 {
+        h.state_mut().open_file(&format!("/tmp/photocraft-test/many-{i:02}.psd"), &bytes).unwrap();
+    }
+    assert!(h.state().jobs.opens.len() <= 16, "at most the cap runs at once");
+    assert_eq!(h.state().jobs.opens.len() + h.state().jobs.waiting_opens.len(), 20, "none is refused");
+    let t = Instant::now();
+    while (!h.state().jobs.opens.is_empty() || !h.state().jobs.waiting_opens.is_empty()) && t.elapsed() < Duration::from_secs(60) {
+        h.step();
+    }
+    h.run_steps(2);
+    assert_eq!(h.state().session.documents().len(), before + 20, "every file opened");
+    assert!(!h.state().ui.notices.iter().any(|n| n.title.contains("too many background jobs")));
+}
+
 #[test]
 fn templates_open_untitled_in_the_background() {
     let mut h = app_harness();
