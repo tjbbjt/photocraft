@@ -1537,6 +1537,18 @@ impl Session {
         std::mem::take(&mut self.jobs.events)
     }
 
+    /// Whether a background job can start now: fewer than the cap are running or still winding
+    /// down after a cancel. File › Open with more files than that holds the rest until a job ends,
+    /// instead of refusing them.
+    pub fn has_room_for_a_job(&mut self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.reap_draining_jobs();
+        let admitted = self.jobs.running.len();
+        #[cfg(not(target_arch = "wasm32"))]
+        let admitted = admitted.saturating_add(self.jobs.draining.len());
+        admitted < MAX_BACKGROUND_JOBS
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn reap_draining_jobs(&mut self) {
         if reap_draining(&mut self.jobs.draining) {
