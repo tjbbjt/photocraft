@@ -265,6 +265,14 @@ pub(crate) mod params {
         then_ok: bool,
     }
 
+    /// Dialogs to OK on the next pass: a Save dialog started by their OK answered.
+    #[derive(Clone, Default)]
+    struct Oks(Vec<DialogId>);
+
+    fn oks_id() -> egui::Id {
+        egui::Id::unique("pc-param-oks")
+    }
+
     fn picks_id() -> egui::Id {
         egui::Id::unique("pc-param-picks")
     }
@@ -356,6 +364,12 @@ pub(crate) mod params {
         ctx.data_mut(|data| data.get_temp_mut_or_default::<Picks>(picks_id()).0.push((ticket, id, request.key, after)));
     }
 
+    /// Whether a Save dialog started by OK of dialog `id` ([`save_pick_then_ok`]) is still waiting
+    /// for its answer.
+    pub(crate) fn ok_pick_waiting(app: &PhotocraftApp, id: DialogId) -> bool {
+        app.ctx().data(|data| data.get_temp::<Picks>(picks_id()).is_some_and(|p| p.0.iter().any(|(_, d, _, after)| *d == id && after.then_ok)))
+    }
+
     /// Asks with the Save dialog where the path row `key` of dialog `id` should write, suggesting
     /// `path` (a file that is already there: the Save dialog asks whether to replace it, or another
     /// name is picked). The answer fills the row and OKs the dialog; Cancel leaves it as it was.
@@ -376,6 +390,12 @@ pub(crate) mod params {
     /// Hands each answered pick to its dialog. A cancelled or unavailable picker answers nothing; a pick of a dialog that
     /// closed is forgotten.
     fn settle_picks(app: &mut PhotocraftApp, ctx: &egui::Context) {
+        let ready = ctx.data_mut(|data| std::mem::take(&mut data.get_temp_mut_or_default::<Oks>(oks_id()).0));
+        for id in ready {
+            if dialog_mut(app, id).is_some() {
+                let _ = super::confirm(app, ctx, id);
+            }
+        }
         let waiting = ctx.data_mut(|data| std::mem::take(&mut data.get_temp_mut_or_default::<Picks>(picks_id()).0));
         if waiting.is_empty() {
             return;
@@ -407,9 +427,8 @@ pub(crate) mod params {
         ctx.data_mut(|data| {
             data.get_temp_mut_or_default::<Picks>(picks_id()).0.splice(0..0, still);
         });
-        for id in oks {
-            let _ = super::confirm(app, ctx, id);
-        }
+        // OK on the next pass, once the dialog has taken the path it was answered.
+        ctx.data_mut(|data| data.insert_temp(oks_id(), Oks(oks)));
     }
 
     /// Forgets the picks of the dialog `id`, which closed.

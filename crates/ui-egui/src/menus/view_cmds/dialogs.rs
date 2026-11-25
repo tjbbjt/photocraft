@@ -63,7 +63,10 @@ pub(crate) fn check_form(app: &mut PhotocraftApp, result: &ParamResult) -> Resul
     // another name answers, and OKs the dialog with the file picked (Cancel keeps it open).
     let approved = REPLACE_OK.with(|a| a.borrow().as_deref() == Some(dest.as_str()));
     if std::path::Path::new(&dest).exists() && !approved {
-        crate::dialogs::params::save_pick_then_ok(app, result.id, "path", &dest);
+        // One Save dialog at a time: an OK pressed again while it is up asks nothing more.
+        if !crate::dialogs::params::ok_pick_waiting(app, result.id) {
+            crate::dialogs::params::save_pick_then_ok(app, result.id, "path", &dest);
+        }
         let file = std::path::Path::new(&dest).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dest.clone());
         return Err(Label::from(crate::i18n::fmt(tl!("“{file}” already exists: replace it or choose another name in the Save dialog."), &[("file", &file)])));
     }
