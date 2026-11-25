@@ -378,6 +378,32 @@ struct Level {
     right: Vec<f32>,
     down: Vec<f32>,
     unknowns: usize,
+    /// Per row, the runs of solved cells (start, end): the sweeps skip the rest, which on a
+    /// panorama's border fill is most of the box.
+    spans: Vec<Vec<(usize, usize)>>,
+}
+
+/// Per row of `solve` (`w` × `h`), its runs of set cells as (start, end).
+fn spans_of(solve: &[bool], w: usize, h: usize) -> Vec<Vec<(usize, usize)>> {
+    (0..h)
+        .map(|y| {
+            let row = &solve[y * w..(y + 1) * w];
+            let mut runs = Vec::new();
+            let mut x = 0;
+            while x < w {
+                if row[x] {
+                    let s = x;
+                    while x < w && row[x] {
+                        x += 1;
+                    }
+                    runs.push((s, x));
+                } else {
+                    x += 1;
+                }
+            }
+            runs
+        })
+        .collect()
 }
 
 impl Level {
@@ -406,7 +432,8 @@ impl Level {
             }
         }
         let unknowns = solve.iter().filter(|s| **s).count();
-        Level { w, h, solve, diag, right, down, unknowns }
+        let spans = spans_of(&solve, w, h);
+        Level { w, h, solve, diag, right, down, unknowns, spans }
     }
 
     fn coarser(&self) -> Level {
@@ -440,7 +467,8 @@ impl Level {
             }
         }
         let unknowns = solve.iter().filter(|s| **s).count();
-        Level { w, h, solve, diag, right, down, unknowns }
+        let spans = spans_of(&solve, w, h);
+        Level { w, h, solve, diag, right, down, unknowns, spans }
     }
 
     fn nbr_sum(&self, x: usize, y: usize, v: &[f32]) -> f32 {
@@ -465,8 +493,9 @@ impl Level {
     fn residual(&self, v: &[f32], b: &[f32]) -> f32 {
         let par = self.w * self.h >= PAR_MIN;
         par::map(self.h, par, |y| {
-            (0..self.w)
-                .filter(|x| self.solve[y * self.w + x])
+            self.spans[y]
+                .iter()
+                .flat_map(|&(a, b)| a..b)
                 .map(|x| {
                     let p = y * self.w + x;
                     (b[p] - (self.diag[p] * v[p] - self.nbr_sum(x, y, v))).abs()
@@ -479,14 +508,17 @@ impl Level {
 
     /// Red-black Gauss–Seidel sweeps of `diag·v − Σ links·neighbours = b`, each half written
     /// into the other of two buffers (so rows run in parallel without sharing what they write).
+    /// Only solved cells are visited: `v` is 0 everywhere else, in both buffers.
     fn smooth(&self, v: &mut [f32], b: &[f32], sweeps: usize) {
         let par = self.w * self.h >= PAR_MIN;
         let mut other = vec![0.0f32; v.len()];
         let half = |src: &[f32], dst: &mut [f32], parity: usize| {
             par::chunks_mut(dst, self.w, par, |y, row| {
-                for (x, out) in row.iter_mut().enumerate() {
-                    let p = y * self.w + x;
-                    *out = if self.solve[p] && (x + y) % 2 == parity { (b[p] + self.nbr_sum(x, y, src)) / self.diag[p] } else { src[p] };
+                for &(a, e) in &self.spans[y] {
+                    for x in a..e {
+                        let p = y * self.w + x;
+                        row[x] = if (x + y) % 2 == parity { (b[p] + self.nbr_sum(x, y, src)) / self.diag[p] } else { src[p] };
+                    }
                 }
             });
         };
@@ -511,11 +543,9 @@ fn v_cycle(levels: &[Level], v: &mut [f32], b: &[f32]) {
     let cb: Vec<f32> = par::map(c.h, par, |cy| {
         let mut row = vec![0.0f32; c.w];
         for y in (2 * cy)..(2 * cy + 2).min(l.h) {
-            for x in 0..l.w {
+            for x in l.spans[y].iter().flat_map(|&(a, e)| a..e) {
                 let p = y * l.w + x;
-                if l.solve[p] {
-                    row[x / 2] += b[p] - (l.diag[p] * v[p] - l.nbr_sum(x, y, v));
-                }
+                row[x / 2] += b[p] - (l.diag[p] * v[p] - l.nbr_sum(x, y, v));
             }
         }
         row
@@ -524,10 +554,8 @@ fn v_cycle(levels: &[Level], v: &mut [f32], b: &[f32]) {
     let mut cv = vec![0.0f32; c.w * c.h];
     v_cycle(&levels[1..], &mut cv, &cb);
     par::chunks_mut(v, l.w, par, |y, row| {
-        for (x, vp) in row.iter_mut().enumerate() {
-            if l.solve[y * l.w + x] {
-                *vp += cv[(y / 2) * c.w + x / 2];
-            }
+        for x in l.spans[y].iter().flat_map(|&(a, e)| a..e) {
+            row[x] += cv[(y / 2) * c.w + x / 2];
         }
     });
     l.smooth(v, b, SMOOTH);
@@ -772,31 +800,53 @@ pub(super) fn relight(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
     let (bw, bh) = ((x1 - x0 + 1).div_ceil(s), (y1 - y0 + 1).div_ceil(s));
     let n = bw * bh;
     // Per block: the picture's sum, sum of squares and count; the fill's (with the picture) sum
-    // and count; whether any of it is hole.
-    let (mut psum, mut psq, mut pcount) = (vec![0.0f64; n * ch], vec![0.0f64; n], vec![0u32; n]);
-    let (mut asum, mut acount, mut holes) = (vec![0.0f64; n * ch], vec![0u32; n], vec![false; n]);
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let (p, b) = (y * w + x, ((y - y0) / s) * bw + (x - x0) / s);
-            let v = &img[p * ch..(p + 1) * ch];
-            let pic = matches!(px[p], Px::Source | Px::Known);
-            if px[p] == Px::Hole {
-                holes[b] = true;
-            }
-            if pic {
-                for c in 0..ch {
-                    psum[b * ch + c] += f64::from(v[c]);
-                    psq[b] += f64::from(v[c]) * f64::from(v[c]);
+    // and count; whether any of it is hole. Each row of blocks on its own thread.
+    struct Sums {
+        psum: Vec<f64>,
+        psq: Vec<f64>,
+        pcount: Vec<u32>,
+        asum: Vec<f64>,
+        acount: Vec<u32>,
+        holes: Vec<bool>,
+    }
+    let par = (x1 - x0 + 1) * (y1 - y0 + 1) >= PAR_MIN;
+    let rows: Vec<Sums> = par::map(bh, par, |by| {
+        let mut r =
+            Sums { psum: vec![0.0; bw * ch], psq: vec![0.0; bw], pcount: vec![0; bw], asum: vec![0.0; bw * ch], acount: vec![0; bw], holes: vec![false; bw] };
+        for y in (y0 + by * s)..=(y0 + by * s + s - 1).min(y1) {
+            for x in x0..=x1 {
+                let (p, b) = (y * w + x, (x - x0) / s);
+                let v = &img[p * ch..(p + 1) * ch];
+                let pic = matches!(px[p], Px::Source | Px::Known);
+                if px[p] == Px::Hole {
+                    r.holes[b] = true;
                 }
-                pcount[b] += 1;
-            }
-            if pic || active[p] {
-                for c in 0..ch {
-                    asum[b * ch + c] += f64::from(v[c]);
+                if pic {
+                    for c in 0..ch {
+                        r.psum[b * ch + c] += f64::from(v[c]);
+                        r.psq[b] += f64::from(v[c]) * f64::from(v[c]);
+                    }
+                    r.pcount[b] += 1;
                 }
-                acount[b] += 1;
+                if pic || active[p] {
+                    for c in 0..ch {
+                        r.asum[b * ch + c] += f64::from(v[c]);
+                    }
+                    r.acount[b] += 1;
+                }
             }
         }
+        r
+    });
+    let (mut psum, mut psq, mut pcount) = (Vec::with_capacity(n * ch), Vec::with_capacity(n), Vec::with_capacity(n));
+    let (mut asum, mut acount, mut holes) = (Vec::with_capacity(n * ch), Vec::with_capacity(n), Vec::with_capacity(n));
+    for r in rows {
+        psum.extend(r.psum);
+        psq.extend(r.psq);
+        pcount.extend(r.pcount);
+        asum.extend(r.asum);
+        acount.extend(r.acount);
+        holes.extend(r.holes);
     }
     let mean = |sum: &[f64], count: &[u32]| -> Vec<f32> {
         (0..n * ch).map(|i| if count[i / ch] > 0 { (sum[i] / f64::from(count[i / ch])) as f32 } else { 0.0 }).collect()
@@ -863,26 +913,50 @@ pub(super) fn relight(img: &mut [f32], px: &[Px], dims: (usize, usize, usize), a
         let g = |bx: usize, by: usize| corr[(by * bw + bx) * ch + c];
         (g(ix, iy) * (1.0 - tx) + g(jx, iy) * tx) * (1.0 - ty) + (g(ix, jy) * (1.0 - tx) + g(jx, jy) * tx) * ty
     };
+    // Which correction a pixel takes, if any.
+    let which = |x: usize, y: usize| -> Option<&[f32]> {
+        let p = y * w + x;
+        if active[p] {
+            Some(&fill_corr[..])
+        } else if !fill && matches!(px[p], Px::Source | Px::Known) && dist[((y - y0) / s) * bw + (x - x0) / s] < (band + s) as f32 {
+            Some(&band_corr[..])
+        } else {
+            None
+        }
+    };
+    // The picture pixels about to change, as they were (row by row, in parallel).
     let mut changed = Relit::default();
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            let p = y * w + x;
-            let corr = if active[p] {
-                &fill_corr
-            } else if !fill && matches!(px[p], Px::Source | Px::Known) && dist[((y - y0) / s) * bw + (x - x0) / s] < (band + s) as f32 {
-                &band_corr
-            } else {
-                continue;
-            };
-            if !active[p] {
-                changed.pixels.push(p);
-                changed.was.extend_from_slice(&img[p * ch..(p + 1) * ch]);
+    if !fill {
+        let img_r = &*img;
+        let rows = par::map(y1 - y0 + 1, par, |dy| {
+            let y = y0 + dy;
+            let mut r = Relit::default();
+            for x in x0..=x1 {
+                let p = y * w + x;
+                if !active[p] && which(x, y).is_some() {
+                    r.pixels.push(p);
+                    r.was.extend_from_slice(&img_r[p * ch..(p + 1) * ch]);
+                }
             }
-            for c in 0..ch {
-                img[p * ch + c] += sample(corr, x, y, c);
-            }
+            r
+        });
+        for r in rows {
+            changed.pixels.extend(r.pixels);
+            changed.was.extend(r.was);
         }
     }
+    par::chunks_mut(img, w * ch, par, |y, row| {
+        if y < y0 || y > y1 {
+            return;
+        }
+        for x in x0..=x1 {
+            if let Some(corr) = which(x, y) {
+                for c in 0..ch {
+                    row[x * ch + c] += sample(corr, x, y, c);
+                }
+            }
+        }
+    });
     changed
 }
 
