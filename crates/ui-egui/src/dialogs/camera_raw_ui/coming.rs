@@ -51,7 +51,9 @@ pub struct RawComing {
 /// Whether the open-time Camera Raw dialog is up, or about to be (a raw of the set is waiting
 /// for it or still being developed): the other files' open prompts wait until it has closed.
 pub(crate) fn holds_prompts(app: &PhotocraftApp) -> bool {
-    app.raw.as_ref().is_some_and(|s| s.target == Target::OpenRaw) || !app.raw_shelf.is_empty() || app.raw_coming.tiles.iter().any(|t| t.document.is_none() && !t.gone)
+    app.raw.as_ref().is_some_and(|s| s.target == Target::OpenRaw)
+        || !app.raw_shelf.is_empty()
+        || app.raw_coming.tiles.iter().any(|t| t.document.is_none() && !t.gone)
 }
 
 /// Is `path` named like a raw file?
