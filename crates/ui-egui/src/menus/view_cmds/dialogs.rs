@@ -58,23 +58,28 @@ pub(crate) fn check_form(app: &mut PhotocraftApp, result: &ParamResult) -> Resul
     let path = result.fields.text("path").unwrap_or_default();
     let name = app.session.active().map(|st| st.doc.name.clone()).unwrap_or_default();
     let dest = photocraft_engine::artboard_cmds::pdf_destination(path, &name).map_err(|e| Label::from(e.to_string()))?;
-    // A PDF that is already there is replaced only once asked: the first OK says so and keeps the
-    // dialog open, OK again on the same file goes ahead (a typed or remembered path never passes
-    // through a Save dialog that would ask).
-    let asked = PDF_REPLACE_ASKED.with(|a| a.borrow().as_deref() == Some(dest.as_str()));
-    if std::path::Path::new(&dest).exists() && !asked {
+    // A PDF that is already there is replaced only once the Save dialog has asked: a typed or
+    // remembered path never passed through it, so OK opens it on that file, where Replace or
+    // another name answers, and OKs the dialog with the file picked (Cancel keeps it open).
+    let approved = REPLACE_OK.with(|a| a.borrow().as_deref() == Some(dest.as_str()));
+    if std::path::Path::new(&dest).exists() && !approved {
+        crate::dialogs::params::save_pick_then_ok(app, result.id, "path", &dest);
         let file = std::path::Path::new(&dest).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dest.clone());
-        PDF_REPLACE_ASKED.with(|a| *a.borrow_mut() = Some(dest));
-        return Err(Label::from(crate::i18n::fmt(tl!("“{file}” already exists. Click OK again to replace it."), &[("file", &file)])));
+        return Err(Label::from(crate::i18n::fmt(tl!("“{file}” already exists: replace it or choose another name in the Save dialog."), &[("file", &file)])));
     }
-    PDF_REPLACE_ASKED.with(|a| *a.borrow_mut() = None);
+    REPLACE_OK.with(|a| *a.borrow_mut() = None);
     Ok(())
 }
 
+/// A file picked in a Save dialog, which asked before it could be replaced: OK may write over it.
+pub(crate) fn may_replace(path: &str) {
+    REPLACE_OK.with(|a| *a.borrow_mut() = Some(path.to_owned()));
+}
+
 thread_local! {
-    /// The Artboards to PDF file the user was just told exists ([`check_form`]): OK again on it
-    /// replaces it.
-    static PDF_REPLACE_ASKED: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The last file picked in a Save dialog ([`may_replace`]): [`check_form`] writes over it
+    /// without asking again.
+    static REPLACE_OK: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The reply of a command that opened a dialog.

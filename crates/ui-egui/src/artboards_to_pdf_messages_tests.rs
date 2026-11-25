@@ -77,19 +77,57 @@ fn a_finished_export_says_it_was_successful_with_the_path() {
     assert_eq!(alert_message(&h), Some(format!("Artboards To PDF was successful.\n{path}")));
 }
 
-/// A PDF that is already there: the first OK keeps the dialog open and leaves the file alone, OK
-/// again replaces it.
+/// [`harness`] whose file service answers the Save dialog with `answers`.
+fn harness_answering(answers: Vec<craft::host::Picked>) -> (H, std::sync::Arc<craft::host::ScriptedFiles>) {
+    let files = std::sync::Arc::new(craft::host::ScriptedFiles::answering(answers));
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services { files: Some(files.clone()), ..Default::default() });
+    app.run("file.new", json!({"width": 64, "height": 64})).unwrap();
+    app.run("layer.new.artboard", json!({"rect": [0, 0, 64, 64]})).unwrap();
+    app.sync_views();
+    let h = Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .with_max_steps(64)
+        .with_context(app.ctx().clone())
+        .build_ui_state(|ui, app: &mut Box<PhotocraftApp>| crate::dialogs::run(app, ui), app);
+    PhotocraftApp::setup_context(&h.ctx, Default::default());
+    (h, files)
+}
+
+/// A PDF that is already there: OK opens the Save dialog on it (as Photoshop's file dialog asks
+/// before replacing), and the file it answers with is written: the same one replaced, or another
+/// name, leaving the old file alone.
 #[test]
-fn an_existing_pdf_is_replaced_only_on_a_second_ok() {
+fn an_existing_pdf_asks_in_the_save_dialog() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boards.pdf").to_string_lossy().into_owned();
+    let other = dir.path().join("boards 2.pdf").to_string_lossy().into_owned();
+    for (answer, written) in [(&path, &path), (&other, &other)] {
+        std::fs::write(&path, b"old").unwrap();
+        let (mut h, files) = harness_answering(vec![craft::host::Picked::Paths(vec![answer.into()])]);
+        let d = open(&mut h, &path);
+        confirm(&mut h, d);
+        h.run_steps(8);
+        let asked = files.requests();
+        assert_eq!(asked.len(), 1, "OK opened the Save dialog");
+        assert_eq!(asked[0].kind, craft::host::PickKind::Save);
+        assert!(!is_open(&h, d), "the file picked is exported");
+        assert!(std::fs::read(written).unwrap().starts_with(b"%PDF"), "{written} is written");
+        if written != &path {
+            assert_eq!(std::fs::read(&path).unwrap(), b"old", "the old file is left alone");
+        }
+    }
+}
+
+/// Cancel in the Save dialog keeps Artboards to PDF open and the file as it was.
+#[test]
+fn cancelling_the_save_dialog_keeps_the_pdf() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("boards.pdf").to_string_lossy().into_owned();
     std::fs::write(&path, b"old").unwrap();
-    let mut h = harness();
+    let (mut h, _files) = harness_answering(vec![craft::host::Picked::Cancelled]);
     let d = open(&mut h, &path);
     confirm(&mut h, d);
-    assert!(is_open(&h, d), "the dialog stays open and says the file exists");
+    h.run_steps(8);
+    assert!(is_open(&h, d), "the dialog stays open");
     assert_eq!(std::fs::read(&path).unwrap(), b"old", "the file is untouched");
-    confirm(&mut h, d);
-    assert!(!is_open(&h, d), "OK again goes ahead");
-    assert!(std::fs::read(&path).unwrap().starts_with(b"%PDF"), "the file is replaced");
 }

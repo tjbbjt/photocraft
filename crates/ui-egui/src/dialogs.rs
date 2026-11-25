@@ -254,7 +254,16 @@ pub(crate) mod params {
 
     /// The file pickers started for a dialog and not answered yet, in the frame's memory: a pick answers on a later pass.
     #[derive(Clone, Default)]
-    struct Picks(Vec<(PickId, DialogId, String)>);
+    struct Picks(Vec<(PickId, DialogId, String, AfterPick)>);
+
+    /// What a dialog's pick does besides filling its row.
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    struct AfterPick {
+        /// A Save dialog: the file picked may be replaced (the dialog asked).
+        save: bool,
+        /// OK the dialog with the file picked (a pick started by OK itself).
+        then_ok: bool,
+    }
 
     fn picks_id() -> egui::Id {
         egui::Id::unique("pc-param-picks")
@@ -343,7 +352,25 @@ pub(crate) mod params {
             pick = pick.directory(dir);
         }
         let ticket = app.framework.host().files().pick(pick);
-        ctx.data_mut(|data| data.get_temp_mut_or_default::<Picks>(picks_id()).0.push((ticket, id, request.key)));
+        let after = AfterPick { save: matches!(request.kind, PathKind::SaveFile), then_ok: false };
+        ctx.data_mut(|data| data.get_temp_mut_or_default::<Picks>(picks_id()).0.push((ticket, id, request.key, after)));
+    }
+
+    /// Asks with the Save dialog where the path row `key` of dialog `id` should write, suggesting
+    /// `path` (a file that is already there: the Save dialog asks whether to replace it, or another
+    /// name is picked). The answer fills the row and OKs the dialog; Cancel leaves it as it was.
+    pub(crate) fn save_pick_then_ok(app: &mut PhotocraftApp, id: DialogId, key: &str, path: &str) {
+        let path = Path::new(path);
+        let mut pick = PickRequest::save("dialog").filter("PDF", &["pdf"]);
+        if let Some(name) = path.file_name() {
+            pick = pick.file_name(name.to_string_lossy().into_owned());
+        }
+        if let Some(dir) = path.parent().filter(|dir| dir.is_dir()) {
+            pick = pick.directory(dir.to_path_buf());
+        }
+        let ticket = app.framework.host().files().pick(pick);
+        let after = AfterPick { save: true, then_ok: true };
+        app.ctx().clone().data_mut(|data| data.get_temp_mut_or_default::<Picks>(picks_id()).0.push((ticket, id, key.to_owned(), after)));
     }
 
     /// Hands each answered pick to its dialog. A cancelled or unavailable picker answers nothing; a pick of a dialog that
@@ -355,16 +382,24 @@ pub(crate) mod params {
         }
         let host = app.framework.host().clone();
         let mut still = Vec::new();
-        for (ticket, id, key) in waiting {
+        let mut oks = Vec::new();
+        for (ticket, id, key, after) in waiting {
             if dialog_mut(app, id).is_none() {
                 host.files().forget(ticket);
                 continue;
             }
             match host.files().take_answer(ticket) {
-                None => still.push((ticket, id, key)),
+                None => still.push((ticket, id, key, after)),
                 Some(picked) => {
-                    if let (Some(path), Some(dialog)) = (picked.first_path(), dialog_mut(app, id)) {
+                    let Some(path) = picked.first_path() else { continue };
+                    if after.save {
+                        crate::view_cmds::dialogs::may_replace(&path.to_string_lossy());
+                    }
+                    if let Some(dialog) = dialog_mut(app, id) {
                         dialog.answer_path(key, path);
+                    }
+                    if after.then_ok {
+                        oks.push(id);
                     }
                 }
             }
@@ -372,6 +407,9 @@ pub(crate) mod params {
         ctx.data_mut(|data| {
             data.get_temp_mut_or_default::<Picks>(picks_id()).0.splice(0..0, still);
         });
+        for id in oks {
+            let _ = super::confirm(app, ctx, id);
+        }
     }
 
     /// Forgets the picks of the dialog `id`, which closed.
@@ -381,7 +419,7 @@ pub(crate) mod params {
             return;
         }
         let host = app.framework.host().clone();
-        let (closed, kept): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|(_, dialog, _)| *dialog == id);
+        let (closed, kept): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|(_, dialog, _, _)| *dialog == id);
         for (ticket, ..) in closed {
             host.files().forget(ticket);
         }
