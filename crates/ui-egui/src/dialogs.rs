@@ -103,7 +103,11 @@ pub(crate) mod params {
             cancel: Some(filter_dialog::cancel),
             ..ParamFamily::new(|key| key == image_processor_ui::COMMAND, filter_dialog::run)
         },
-        ParamFamily { cancel: Some(filter_dialog::cancel), ..ParamFamily::new(crate::view_cmds::dialogs::is_form, filter_dialog::run) },
+        ParamFamily {
+            check: Some(crate::view_cmds::dialogs::check_form),
+            cancel: Some(filter_dialog::cancel),
+            ..ParamFamily::new(crate::view_cmds::dialogs::is_form, filter_dialog::run)
+        },
         crate::prefs_ui::PRESETS_FAMILY,
         ParamFamily { check: Some(crate::crop_presets::check), ..ParamFamily::new(crate::crop_presets::owns, crate::crop_presets::run) },
         crate::actions::dialogs::NEW_SET_FAMILY,
@@ -777,6 +781,16 @@ mod tests;
 pub mod tiff_options_ui;
 pub mod vp_ui;
 pub mod wide_angle_ui;
+
+/// The alert a finished Artboards to PDF shows (#13657): "Artboards To PDF was successful." with
+/// the PDF's path on a second line, titled after the command. `result` is the command's; a job
+/// reports it when it lands (`jobs_ui`), and a result without a `path` (a job still running, or
+/// Document Per Artboard) shows nothing.
+pub(crate) fn artboards_to_pdf_done(app: &mut PhotocraftApp, result: &Value) {
+    let Some(path) = result.get("path").and_then(Value::as_str) else { return };
+    let message = format!("{}\n{path}", tl!("Artboards To PDF was successful."));
+    alerts::show(app, craft::ui::dialog::Alert::new("Artboards To PDF", message));
+}
 
 /// Confirm and cancel a dialog from a test, on the app's own context.
 #[cfg(test)]

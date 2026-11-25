@@ -4,7 +4,7 @@ use crate::dialogs::image_processor_ui;
 use craft::ui::choice::Checkbox;
 use craft::ui::contract::{Bind, Outcome as _, Props as _, Show as _};
 use craft::ui::dialog::DialogId;
-use craft::ui::patterns::form_dialogs::{DialogFields, FieldValue, Param, ParamDialog, ParamKind};
+use craft::ui::patterns::form_dialogs::{DialogFields, FieldValue, Param, ParamDialog, ParamKind, ParamResult};
 use craft::ui::runtime::env::Label;
 use craft::ui::runtime::requests::PathKind;
 
@@ -46,6 +46,18 @@ const FORM_COMMANDS: [&str; 21] = [
 /// Whether `key` is the command id of a form this file opens.
 pub(crate) fn is_form(key: &str) -> bool {
     FORM_COMMANDS.contains(&key)
+}
+
+/// OK of a form, before it closes. Artboards to PDF with a destination folder that doesn't exist
+/// stays open with its values and says so, as the reference application does (#13657); the
+/// engine refuses it too, for scripts.
+pub(crate) fn check_form(app: &mut PhotocraftApp, result: &ParamResult) -> Result<(), Label> {
+    if result.key != "file.export.artboardsToPdf" || result.fields.text("mode") == Some("perArtboard") {
+        return Ok(());
+    }
+    let path = result.fields.text("path").unwrap_or_default();
+    let name = app.session.active().map(|st| st.doc.name.clone()).unwrap_or_default();
+    photocraft_engine::artboard_cmds::pdf_destination(path, &name).map(|_| ()).map_err(|e| Label::from(e.to_string()))
 }
 
 /// The reply of a command that opened a dialog.
@@ -341,8 +353,13 @@ pub(super) fn params_for(app: &mut PhotocraftApp, id: &str) -> Option<(Vec<Param
         }
         "file.export.artboardsToPdf" => {
             let (_, _, name) = doc?;
+            // Where the last export went, as the Save dialog starts (#10192): a document opened
+            // through the desktop portal sits in a temporary folder that takes no new files.
+            let last = app.session.prefs().export.last_folder.clone();
+            let folder = if !last.is_empty() && std::path::Path::new(&last).is_dir() { last } else { dir.clone() };
             plain(vec![
-                Param::new("path", tl!("File"), ParamKind::text(format!("{dir}/{}.pdf", stem(&name)))),
+                // Browse… picks the file to write with the Save dialog.
+                Param::new("path", tl!("File"), ParamKind::text(format!("{folder}/{}.pdf", stem(&name)))).browse(PathKind::SaveFile),
                 export_selected_artboards(selected_artboards(app)),
                 // Include Overlapping Areas / Artboard Content Only, below Export Selected Artboards, with no caption (#13646).
                 Param::new(
