@@ -76,3 +76,20 @@ fn a_finished_export_says_it_was_successful_with_the_path() {
     assert!(std::fs::read(&path).unwrap().starts_with(b"%PDF"));
     assert_eq!(alert_message(&h), Some(format!("Artboards To PDF was successful.\n{path}")));
 }
+
+/// A PDF that is already there: the first OK keeps the dialog open and leaves the file alone, OK
+/// again replaces it.
+#[test]
+fn an_existing_pdf_is_replaced_only_on_a_second_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("boards.pdf").to_string_lossy().into_owned();
+    std::fs::write(&path, b"old").unwrap();
+    let mut h = harness();
+    let d = open(&mut h, &path);
+    confirm(&mut h, d);
+    assert!(is_open(&h, d), "the dialog stays open and says the file exists");
+    assert_eq!(std::fs::read(&path).unwrap(), b"old", "the file is untouched");
+    confirm(&mut h, d);
+    assert!(!is_open(&h, d), "OK again goes ahead");
+    assert!(std::fs::read(&path).unwrap().starts_with(b"%PDF"), "the file is replaced");
+}
