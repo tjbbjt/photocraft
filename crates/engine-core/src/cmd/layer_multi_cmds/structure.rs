@@ -152,70 +152,95 @@ pub fn group_layers(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "layer": gid.0 }))
 }
 
+/// Layer › Merge Layers (⌘E). The selected layers are composited on a worker from the desktop
+/// app ([`Session::start`]), with the document locked, as Merge Down and Merge Group are: on a
+/// 1.1-gigapixel storyboard each took up to 1.7 s on the UI thread.
 pub(super) fn merge_layers(s: &mut Session) -> Result<Value> {
     let sel = selected(s);
     if sel.len() < 2 {
-        // ⌘E on a lone group is Photoshop's Merge Group (#3832); on a layer, Merge Down.
+        // ⌘E on a lone group is Photoshop's Merge Group (#3832); on a layer, Merge Down. Called
+        // here rather than run as commands of their own, so they composite on a worker too.
         if let Some(&id) = sel.first()
             && s.active().and_then(|d| d.doc.layer(id)).is_some_and(|l| matches!(l.content, LayerContent::Group(_)))
         {
-            return s.execute("layer.mergeGroup", json!({ "layer": id.0 }));
+            return super::super::ops::merge_group(s, id);
         }
-        return s.execute("layer.mergeDown", json!({}));
+        let id = crate::commands::layer_param(s, &json!({}))?;
+        return super::super::ops::merge_down(s, id);
     }
-    let mid = s.edit("Merge Layers", |doc, active| {
-        let ids = top_level(doc, &sel);
-        let lowest_id = *ids.first().ok_or_else(|| EngineError::Other("Merge Layers needs two or more layers".into()))?;
-        let is_background = doc.is_background(lowest_id);
-
-        let mut solo = doc.clone();
-        solo.layers = ids.iter().filter_map(|id| doc.layer(*id)).filter(|l| l.visible).cloned().collect();
-        if solo.layers.is_empty() {
-            return Err(EngineError::Other("the selected layers are all hidden".into()));
-        }
-
-        if is_background {
-            let base = doc.layer(lowest_id).ok_or(EngineError::NoLayer(lowest_id))?.clone();
+    let doc = s.active().ok_or(EngineError::NoDocument)?.doc.clone();
+    let ids = top_level(&doc, &sel);
+    let lowest_id = *ids.first().ok_or_else(|| EngineError::Other("Merge Layers needs two or more layers".into()))?;
+    let top_id = *ids.last().ok_or_else(|| EngineError::Other("Merge Layers needs two or more layers".into()))?;
+    if !ids.iter().filter_map(|id| doc.layer(*id)).any(|l| l.visible) {
+        return Err(EngineError::Other("the selected layers are all hidden".into()));
+    }
+    let is_background = doc.is_background(lowest_id);
+    let label = "Merge Layers";
+    let merged_ids = ids.clone();
+    crate::jobs::run(
+        s,
+        label,
+        true,
+        move |ctx| {
+            ctx.progress(0.0, label);
+            let mut solo = (*doc).clone();
+            solo.layers = merged_ids.iter().filter_map(|id| doc.layer(*id)).filter(|l| l.visible).cloned().collect();
             let fmt = doc.pixel_format();
-            let mut merged = Layer::raster(base.name.clone(), fmt);
-            merged.locks = base.locks;
-            merged.label = base.label;
-            merged.id = lowest_id;
-            merged.blend = base.blend;
-            merged.opacity = 1.0;
-            *crate::pixels_mut(&mut merged)? = crate::pixels::composite_layers(&solo, fmt, None);
-            for id in &ids[1..] {
-                doc.remove(*id);
-            }
-            *doc.layer_mut(lowest_id).ok_or(EngineError::NoLayer(lowest_id))? = merged;
-            *active = Some(lowest_id);
-            Ok(lowest_id)
-        } else {
-            let top_id = *ids.last().ok_or_else(|| EngineError::Other("Merge Layers needs two or more layers".into()))?;
-            let top = doc.layer(top_id).ok_or(EngineError::NoLayer(top_id))?.clone();
-            let fmt = doc.pixel_format();
-            let fmt = PixelFormat::new(fmt.mode, fmt.sample, true);
-            let mut merged = Layer::raster(top.name.clone(), fmt);
-            merged.locks = top.locks;
-            merged.label = top.label;
-            // Clipped layers of one chain merge into a layer still clipped to their base. Clipped
-            // layers of different chains don't: the result, at the top one's slot, would clip the
-            // lower chain's pixels to the upper chain's base.
-            let base = crate::clip_group::base_of(doc, top_id);
-            merged.clipped = base.is_some() && solo.layers.iter().all(|l| l.clipped && crate::clip_group::base_of(doc, l.id) == base);
-            *crate::pixels_mut(&mut merged)? = crate::pixels::composite_layers_uncropped(&solo, fmt);
-            let mid = merged.id;
-            // Hidden selected layers are discarded, as in Photoshop.
-            for id in &ids[..ids.len() - 1] {
-                doc.remove(*id);
-            }
-            *doc.layer_mut(top_id).ok_or(EngineError::NoLayer(top_id))? = merged;
-            *active = Some(mid);
-            Ok(mid)
-        }
-    })?;
-    reselect(s, vec![mid], Some(mid));
-    Ok(json!({ "layer": mid.0 }))
+            Ok(if is_background {
+                crate::pixels::composite_layers(&solo, fmt, None)
+            } else {
+                crate::pixels::composite_layers_uncropped(&solo, PixelFormat::new(fmt.mode, fmt.sample, true))
+            })
+        },
+        move |s, pixels| {
+            let mid = s.edit(label, |doc, active| {
+                // The document was locked while the job ran, so the layers are the ones merged.
+                if top_level(doc, &sel) != ids {
+                    return Err(EngineError::Other("the layers changed while they were merged".into()));
+                }
+                if is_background {
+                    let base = doc.layer(lowest_id).ok_or(EngineError::NoLayer(lowest_id))?.clone();
+                    let mut merged = Layer::raster(base.name.clone(), doc.pixel_format());
+                    merged.locks = base.locks;
+                    merged.label = base.label;
+                    merged.id = lowest_id;
+                    merged.blend = base.blend;
+                    merged.opacity = 1.0;
+                    *crate::pixels_mut(&mut merged)? = pixels;
+                    for id in &ids[1..] {
+                        doc.remove(*id);
+                    }
+                    *doc.layer_mut(lowest_id).ok_or(EngineError::NoLayer(lowest_id))? = merged;
+                    *active = Some(lowest_id);
+                    Ok(lowest_id)
+                } else {
+                    let top = doc.layer(top_id).ok_or(EngineError::NoLayer(top_id))?.clone();
+                    let fmt = doc.pixel_format();
+                    let mut merged = Layer::raster(top.name.clone(), PixelFormat::new(fmt.mode, fmt.sample, true));
+                    merged.locks = top.locks;
+                    merged.label = top.label;
+                    // Clipped layers of one chain merge into a layer still clipped to their base. Clipped
+                    // layers of different chains don't: the result, at the top one's slot, would clip the
+                    // lower chain's pixels to the upper chain's base.
+                    let base = crate::clip_group::base_of(doc, top_id);
+                    merged.clipped = base.is_some()
+                        && ids.iter().filter_map(|id| doc.layer(*id)).filter(|l| l.visible).all(|l| l.clipped && crate::clip_group::base_of(doc, l.id) == base);
+                    *crate::pixels_mut(&mut merged)? = pixels;
+                    let mid = merged.id;
+                    // Hidden selected layers are discarded, as in Photoshop.
+                    for id in &ids[..ids.len() - 1] {
+                        doc.remove(*id);
+                    }
+                    *doc.layer_mut(top_id).ok_or(EngineError::NoLayer(top_id))? = merged;
+                    *active = Some(mid);
+                    Ok(mid)
+                }
+            })?;
+            reselect(s, vec![mid], Some(mid));
+            Ok(json!({ "layer": mid.0 }))
+        },
+    )
 }
 
 /// Next visible layer row below the deleted target, then rows above in reverse order.

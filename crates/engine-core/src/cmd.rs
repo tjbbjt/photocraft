@@ -153,7 +153,7 @@ pub use layer_params::selection_mask;
 pub(crate) use layer_params::{NEW_LAYER_PATH, layer_listing, layer_panel_option, mask_new_layer};
 pub(crate) use layer_references::{recorded_drop, recorded_layer};
 pub use ops::translate_layer;
-use ops::{arrange, merge_group, move_mask, set_mask, set_mask_and_deselect};
+use ops::{arrange, merge_down, merge_group, move_mask, set_mask, set_mask_and_deselect};
 pub(crate) use ops::{layer_copy, translate_layer_wrapped};
 pub use params::cmyk_param;
 pub use params::color_param;
