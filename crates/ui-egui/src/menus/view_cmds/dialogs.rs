@@ -48,6 +48,43 @@ pub(crate) fn is_form(key: &str) -> bool {
     FORM_COMMANDS.contains(&key)
 }
 
+/// OK of a form, before it closes. Artboards to PDF with a destination folder that doesn't exist
+/// stays open with its values and says so, as the reference application does (#13657); the
+/// engine refuses it too, for scripts.
+pub(crate) fn check_form(app: &mut PhotocraftApp, result: &ParamResult) -> Result<(), Label> {
+    if result.key != "file.export.artboardsToPdf" || result.fields.text("mode") == Some("perArtboard") {
+        return Ok(());
+    }
+    let path = result.fields.text("path").unwrap_or_default();
+    let name = app.session.active().map(|st| st.doc.name.clone()).unwrap_or_default();
+    let dest = photocraft_engine::artboard_cmds::pdf_destination(path, &name).map_err(|e| Label::from(e.to_string()))?;
+    // A PDF that is already there is replaced only once the Save dialog has asked: a typed or
+    // remembered path never passed through it, so OK opens it on that file, where Replace or
+    // another name answers, and OKs the dialog with the file picked (Cancel keeps it open).
+    let approved = REPLACE_OK.with(|a| a.borrow().as_deref() == Some(dest.as_str()));
+    if std::path::Path::new(&dest).exists() && !approved {
+        // One Save dialog at a time: an OK pressed again while it is up asks nothing more.
+        if !crate::dialogs::params::ok_pick_waiting(app, result.id) {
+            crate::dialogs::params::save_pick_then_ok(app, result.id, "path", &dest);
+        }
+        let file = std::path::Path::new(&dest).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dest.clone());
+        return Err(Label::from(crate::i18n::fmt(tl!("“{file}” already exists: replace it or choose another name in the Save dialog."), &[("file", &file)])));
+    }
+    REPLACE_OK.with(|a| *a.borrow_mut() = None);
+    Ok(())
+}
+
+/// A file picked in a Save dialog, which asked before it could be replaced: OK may write over it.
+pub(crate) fn may_replace(path: &str) {
+    REPLACE_OK.with(|a| *a.borrow_mut() = Some(path.to_owned()));
+}
+
+thread_local! {
+    /// The last file picked in a Save dialog ([`may_replace`]): [`check_form`] writes over it
+    /// without asking again.
+    static REPLACE_OK: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 /// The reply of a command that opened a dialog.
 fn opened(id: DialogId) -> Value {
     json!({"dialog": id.value().to_string()})
@@ -351,8 +388,13 @@ pub(super) fn params_for(app: &mut PhotocraftApp, id: &str) -> Option<(Vec<Param
         }
         "file.export.artboardsToPdf" => {
             let (_, _, name) = doc?;
+            // Where the last export went, as the Save dialog starts (#10192): a document opened
+            // through the desktop portal sits in a temporary folder that takes no new files.
+            let last = app.session.prefs().export.last_folder.clone();
+            let folder = if !last.is_empty() && std::path::Path::new(&last).is_dir() { last } else { dir.clone() };
             plain(vec![
-                Param::new("path", tl!("File"), ParamKind::text(format!("{dir}/{}.pdf", stem(&name)))),
+                // Browse… picks the file to write with the Save dialog.
+                Param::new("path", tl!("File"), ParamKind::text(format!("{folder}/{}.pdf", stem(&name)))).browse(PathKind::SaveFile),
                 export_selected_artboards(selected_artboards(app)),
                 // Include Overlapping Areas / Artboard Content Only, below Export Selected Artboards, with no caption (#13646).
                 Param::new(

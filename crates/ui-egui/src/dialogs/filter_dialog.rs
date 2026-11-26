@@ -1080,6 +1080,10 @@ fn finish(
     let outcome = crate::actions::run_step_dialog(app, result.id, &cmd, params.clone());
     if let Ok(r) = &outcome {
         report_file_errors(app, command, r);
+        // Run on this thread (no background jobs): the export is over.
+        if command == "file.export.artboardsToPdf" {
+            crate::dialogs::artboards_to_pdf_done(app, r);
+        }
     }
     // A filter that runs as a background job keeps its preview on screen until the job
     // lands (`canvas::committed_filter_preview`) instead of flashing the unfiltered image.
