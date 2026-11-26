@@ -1039,9 +1039,14 @@ fn collision_key(stem: &str) -> String {
 /// File › Export › Artboards to Files: one `<prefix><artboard name>.<format>` per board, named by
 /// [`artboard_file_stems`] (`abfiles-testRed-Board.png`, `abfiles-testRed Board.psd`), or for PDF one
 /// `<prefix>.pdf`.
+///
+/// From the desktop app ([`Session::start`]) the boards are flattened and written on a worker:
+/// on a storyboard of large boards that took over a minute, and a frame that long on the UI
+/// thread got the window closed by the compositor.
 fn artboards_to_files(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "file.export.artboardsToFiles";
-    let dir = str_param(p, "dir", cmd).or_else(|_| str_param(p, "output", cmd))?.to_string();
+    let dir = expand_home(str_param(p, "dir", cmd).or_else(|_| str_param(p, "output", cmd))?);
+    check_folder(&dir)?;
     let format = p.get("format").and_then(Value::as_str).unwrap_or("png").trim_start_matches('.').to_ascii_lowercase();
     let (save, board) = export_options::parse(s, p, cmd)?;
     let border = name_border_param(p, cmd)?.filter(|_| !keeps_layers(&format));
@@ -1049,67 +1054,81 @@ fn artboards_to_files(s: &mut Session, p: &Value) -> Result<Value> {
     let prefix = p.get("prefix").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| stem(&d.doc.name));
     let overlapping = overlapping_param(p, cmd)?;
     let doc = d.doc.clone();
-    let guard = ScratchGuard::new(&doc)?;
-    let mut boards = chosen_documents(&doc, p, overlapping)?;
-    if boards.is_empty() {
-        return Err(bad(cmd, "no matching artboards"));
-    }
-    let file_type = FileType::of(&format, cmd)?;
-    // Include Background in Export unticked (#13631): each board's white fill is left out of the
-    // files that keep transparency, before the name border extends the canvas.
-    if !includes_background(p, &file_type) {
-        for one in &mut boards {
-            drop_white_fill(one);
-        }
-    }
-    if let Some(o) = &border {
-        for one in &mut boards {
-            add_name_border(one, o, cmd)?;
-        }
-    }
-    let truecolour = matches!(file_type, FileType::Png24);
-    let ext = match file_type {
-        FileType::Pdf => {
-            // The reference application's Multi-Page Document: the bottom artboard is page 1, and
-            // each page is the board's pixel size at 72 ppi.
-            let mut pages = Vec::new();
-            for one in boards.iter().rev() {
-                pages.push((one.size.width, one.size.height, 72.0, jpeg_page(one, save.quality.or(Some(10.0)), cmd)?));
+    let p = p.clone();
+    crate::jobs::run(
+        s,
+        "Artboards to Files",
+        false,
+        move |ctx| {
+            ctx.progress(0.0, "Artboards to Files");
+            let guard = ScratchGuard::new(&doc)?;
+            let mut boards = chosen_documents(&doc, &p, overlapping)?;
+            if boards.is_empty() {
+                return Err(bad(cmd, "no matching artboards"));
             }
-            let name = if prefix.is_empty() { stem(&doc.name) } else { prefix };
-            let path = join(&dir, &format!("{}.pdf", sanitize(&name)));
-            guard.check()?;
-            write_file(&path, &raster_pdf(&pages))?;
-            return Ok(json!({"files": [path], "warnings": []}));
-        }
-        FileType::Png8 => None,
-        FileType::Png24 => Some("png".to_string()),
-        FileType::Save(ext) => Some(ext),
-    };
-    let extension = ext.as_deref().unwrap_or("png");
-    let names: Vec<&str> = boards.iter().map(|one| one.name.as_str()).collect();
-    let stems = artboard_file_stems(&prefix, &names, HYPHENATED_FORMATS.contains(&extension));
-    let mut files = Vec::new();
-    let mut warnings = Vec::new();
-    for (mut one, name) in boards.into_iter().zip(stems) {
-        // Export Options of the file type (#13636): PNG-8 and PNG-24 take PNG's.
-        board.apply(&mut one, extension);
-        let path = join(&dir, &format!("{name}.{extension}"));
-        let (bytes, warned) = match &ext {
-            Some(_) if truecolour && one.mode != ColorMode::Rgb => encode(&rgb_copy(&one)?, &path, save)?,
-            Some(_) => encode(&one, &path, save)?,
-            // The PNG-8 writer does not interlace; say so, as the palette PNG path of a save does.
-            None if save.png_interlaced == Some(true) => {
-                (png8(&one, cmd)?, vec!["written without interlacing: the PNG-8 exporter does not interlace".to_owned()])
+            let file_type = FileType::of(&format, cmd)?;
+            // Include Background in Export unticked (#13631): each board's white fill is left out of the
+            // files that keep transparency, before the name border extends the canvas.
+            if !includes_background(&p, &file_type) {
+                for one in &mut boards {
+                    drop_white_fill(one);
+                }
             }
-            None => (png8(&one, cmd)?, Vec::new()),
-        };
-        guard.check()?;
-        write_file(&path, &bytes)?;
-        warnings.extend(warned.into_iter().map(|w| format!("{name}.{extension}: {w}")));
-        files.push(path);
-    }
-    Ok(json!({"files": files, "warnings": warnings}))
+            if let Some(o) = &border {
+                for one in &mut boards {
+                    add_name_border(one, o, cmd)?;
+                }
+            }
+            let truecolour = matches!(file_type, FileType::Png24);
+            let ext = match file_type {
+                FileType::Pdf => {
+                    // The reference application's Multi-Page Document: the bottom artboard is page 1, and
+                    // each page is the board's pixel size at 72 ppi.
+                    let mut pages = Vec::new();
+                    for one in boards.iter().rev() {
+                        ctx.check()?;
+                        pages.push((one.size.width, one.size.height, 72.0, jpeg_page(one, save.quality.or(Some(10.0)), cmd)?));
+                    }
+                    let name = if prefix.is_empty() { stem(&doc.name) } else { prefix };
+                    let path = join(&dir, &format!("{}.pdf", sanitize(&name)));
+                    guard.check()?;
+                    write_file(&path, &raster_pdf(&pages))?;
+                    return Ok(json!({"files": [path], "warnings": []}));
+                }
+                FileType::Png8 => None,
+                FileType::Png24 => Some("png".to_string()),
+                FileType::Save(ext) => Some(ext),
+            };
+            let extension = ext.as_deref().unwrap_or("png");
+            let names: Vec<&str> = boards.iter().map(|one| one.name.as_str()).collect();
+            let stems = artboard_file_stems(&prefix, &names, HYPHENATED_FORMATS.contains(&extension));
+            let mut files = Vec::new();
+            let mut warnings = Vec::new();
+            let n = boards.len();
+            for (i, (mut one, name)) in boards.into_iter().zip(stems).enumerate() {
+                ctx.check()?;
+                ctx.progress(i as f32 / n as f32, &format!("Artboard {} of {n}", i + 1));
+                // Export Options of the file type (#13636): PNG-8 and PNG-24 take PNG's.
+                board.apply(&mut one, extension);
+                let path = join(&dir, &format!("{name}.{extension}"));
+                let (bytes, warned) = match &ext {
+                    Some(_) if truecolour && one.mode != ColorMode::Rgb => encode(&rgb_copy(&one)?, &path, save)?,
+                    Some(_) => encode(&one, &path, save)?,
+                    // The PNG-8 writer does not interlace; say so, as the palette PNG path of a save does.
+                    None if save.png_interlaced == Some(true) => {
+                        (png8(&one, cmd)?, vec!["written without interlacing: the PNG-8 exporter does not interlace".to_owned()])
+                    }
+                    None => (png8(&one, cmd)?, Vec::new()),
+                };
+                guard.check()?;
+                write_file(&path, &bytes)?;
+                warnings.extend(warned.into_iter().map(|w| format!("{name}.{extension}: {w}")));
+                files.push(path);
+            }
+            Ok(json!({"files": files, "warnings": warnings}))
+        },
+        |_, v| Ok(v),
+    )
 }
 
 /// The scratch state an artboard export starts from. Building the boards copies their pixels
@@ -1306,15 +1325,21 @@ fn artboards_to_pdf(s: &mut Session, p: &Value) -> Result<Value> {
         Some(Value::String(m)) if m == "perArtboard" => true,
         Some(other) => return Err(bad(cmd, format!("\"mode\" must be \"multiPage\" or \"perArtboard\", not {other}"))),
     };
-    let path = if per_artboard { p.get("path").and_then(Value::as_str).unwrap_or_default().to_string() } else { str_param(p, "path", cmd)?.to_string() };
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    // `~` expanded, and a folder gets `<document name>.pdf` ([`pdf_destination`]).
+    let path = if per_artboard {
+        expand_home(p.get("path").and_then(Value::as_str).unwrap_or_default())
+    } else {
+        pdf_destination(str_param(p, "path", cmd)?, &d.doc.name)?
+    };
     // Document Per Artboard: the folder and prefix default to those of `path` (the dialog's
     // `<folder>/<document name>.pdf`), so `<folder>/<document name><artboard name>.pdf`.
     let dir = match p.get("dir").and_then(Value::as_str).filter(|d| !d.is_empty()) {
-        Some(d) => d.to_string(),
+        Some(d) => expand_home(d),
         None if per_artboard && path.is_empty() => return Err(bad(cmd, "missing \"dir\" or \"path\"")),
         None => folder_of(&path),
     };
-    let d = s.active().ok_or(EngineError::NoDocument)?;
+    check_folder(&dir)?;
     let doc = d.doc.clone();
     let prefix = match p.get("prefix").and_then(Value::as_str) {
         Some(prefix) => prefix.to_string(),
@@ -1329,39 +1354,100 @@ fn artboards_to_pdf(s: &mut Session, p: &Value) -> Result<Value> {
         Some(v) => v.as_bool().ok_or_else(|| bad(cmd, "`reversePageOrder` must be true or false"))?,
     };
     let overlapping = overlapping_param(p, cmd)?;
-    let guard = ScratchGuard::new(&doc)?;
-    let mut pages = Vec::new();
-    let mut names = Vec::new();
-    // Pages go bottom artboard of the Layers panel first, as in the reference application (#13643);
-    // `chosen_board_documents` lists them top first, the order Artboards to Files keeps.
-    for (id, mut one) in chosen_board_documents(&doc, p, overlapping)?.into_iter().rev() {
-        // A hidden board was not measured and keeps today's opaque page. `artboard_document`
-        // shows the board, so its visibility is read from the source.
-        let visible = doc.layer(id).is_some_and(|l| l.visible);
-        let masked = !background && visible && drop_white_fill(&mut one);
-        let (jpeg, mask) = jpeg_page_masked(&one, quality, masked, cmd)?;
-        pages.push((one.size.width, one.size.height, doc.resolution_dpi, jpeg, mask));
-        names.push(one.name);
+    let p = p.clone();
+    crate::jobs::run(
+        s,
+        "Artboards to PDF",
+        false,
+        move |ctx| {
+            ctx.progress(0.0, "Artboards to PDF");
+            let guard = ScratchGuard::new(&doc)?;
+            let mut pages = Vec::new();
+            let mut names = Vec::new();
+            // Pages go bottom artboard of the Layers panel first, as in the reference application (#13643);
+            // `chosen_board_documents` lists them top first, the order Artboards to Files keeps.
+            for (id, mut one) in chosen_board_documents(&doc, &p, overlapping)?.into_iter().rev() {
+                ctx.check()?;
+                // A hidden board was not measured and keeps today's opaque page. `artboard_document`
+                // shows the board, so its visibility is read from the source.
+                let visible = doc.layer(id).is_some_and(|l| l.visible);
+                let masked = !background && visible && drop_white_fill(&mut one);
+                let (jpeg, mask) = jpeg_page_masked(&one, quality, masked, cmd)?;
+                pages.push((one.size.width, one.size.height, doc.resolution_dpi, jpeg, mask));
+                names.push(one.name);
+            }
+            if pages.is_empty() {
+                return Err(bad(cmd, "no matching artboards"));
+            }
+            if reverse {
+                pages.reverse();
+                names.reverse();
+            }
+            guard.check()?;
+            if !per_artboard {
+                write_file(&path, &raster_pdf_masked(&pages))?;
+                return Ok(json!({"path": path, "pages": pages.len(), "files": [path]}));
+            }
+            let mut files = Vec::new();
+            for (page, name) in pages.iter().zip(pdf_file_stems(&prefix, &names)) {
+                let file = join(&dir, &format!("{name}.pdf"));
+                write_file(&file, &raster_pdf_masked(std::slice::from_ref(page)))?;
+                files.push(file);
+            }
+            Ok(json!({"pages": pages.len(), "files": files}))
+        },
+        |_, v| Ok(v),
+    )
+}
+
+/// A path typed into an export dialog with a leading `~` (`~/boards.pdf`): the home folder.
+/// Nothing else expands it, so the PDF went to a folder named `~` under the working directory,
+/// or failed once every page was made.
+#[cfg(not(target_arch = "wasm32"))]
+fn expand_home(path: &str) -> String {
+    let rest = path.strip_prefix('~').filter(|r| r.is_empty() || r.starts_with('/') || (cfg!(windows) && r.starts_with('\\')));
+    if let Some(rest) = rest
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+    {
+        return format!("{}{rest}", home.to_string_lossy());
     }
-    if pages.is_empty() {
-        return Err(bad(cmd, "no matching artboards"));
+    path.to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn expand_home(path: &str) -> String {
+    path.to_string()
+}
+
+/// An export's destination folder must exist and be a folder: checked before any board is
+/// flattened, so a mistyped folder (or a file in its place) fails at once instead of after the
+/// whole export. Other filesystem errors (permissions, say) are left to the write.
+#[cfg(not(target_arch = "wasm32"))]
+fn check_folder(dir: &str) -> Result<()> {
+    if dir.is_empty() {
+        return Ok(());
     }
-    if reverse {
-        pages.reverse();
-        names.reverse();
+    match std::fs::metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(EngineError::Other(format!("Destination does not exist: {dir}"))),
+        Ok(m) if !m.is_dir() => Err(EngineError::Other(format!("Destination is not a folder: {dir}"))),
+        _ => Ok(()),
     }
-    guard.check()?;
-    if !per_artboard {
-        write_file(&path, &raster_pdf_masked(&pages))?;
-        return Ok(json!({"path": path, "pages": pages.len(), "files": [path]}));
-    }
-    let mut files = Vec::new();
-    for (page, name) in pages.iter().zip(pdf_file_stems(&prefix, &names)) {
-        let file = join(&dir, &format!("{name}.pdf"));
-        write_file(&file, &raster_pdf_masked(std::slice::from_ref(page)))?;
-        files.push(file);
-    }
-    Ok(json!({"pages": pages.len(), "files": files}))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn check_folder(_: &str) -> Result<()> {
+    Ok(())
+}
+
+/// Where Artboards to PDF writes `path`: `~` expanded, and `<document name>.pdf` inside it when it
+/// names a folder (`~/`). Its folder must exist ([`check_folder`]).
+pub fn pdf_destination(path: &str, doc_name: &str) -> Result<String> {
+    let path = expand_home(path);
+    let folder = path.ends_with(['/', '\\']) || (cfg!(not(target_arch = "wasm32")) && std::path::Path::new(&path).is_dir());
+    let path = if folder { join(&path, &format!("{}.pdf", stem(doc_name))) } else { path };
+    let parent = std::path::Path::new(&path).parent().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    check_folder(&parent)?;
+    Ok(path)
 }
 
 /// The folder part of `path`: `""` for a bare file name, and the root itself for a file at
@@ -1503,6 +1589,9 @@ mod from_group_hidden_bounds_tests;
 #[cfg(test)]
 #[path = "artboard_cmds/overlapping_areas_tests.rs"]
 mod overlapping_areas_tests;
+#[cfg(test)]
+#[path = "artboard_cmds/pdf_destination_tests.rs"]
+mod pdf_destination_tests;
 #[cfg(test)]
 #[path = "artboard_cmds/pdf_document_per_artboard_tests.rs"]
 mod pdf_document_per_artboard_tests;
