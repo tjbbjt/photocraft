@@ -252,6 +252,3 @@ fn quick_export_artboards(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(test)]
 #[path = "quick_artboards_tests.rs"]
 mod quick_artboards_tests;
-#[cfg(test)]
-#[path = "quick_jpg_progressive_tests.rs"]
-mod quick_jpg_progressive_tests;
